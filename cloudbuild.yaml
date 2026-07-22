@@ -1,0 +1,63 @@
+# Cloud Build pipeline — builds, tags, pushes to Artifact Registry, deploys to Cloud Run Worker Pool.
+#
+# Trigger on push to main branch (tag name sets the API_TAG_VERSION env var).
+# Required substitutions (set in Cloud Build trigger):
+#   _REGION   — Artifact Registry / Cloud Run region, e.g. us-central1
+#   _AR_REPO  — Artifact Registry repository name, e.g. rgmc-docker
+#   _SA       — Worker Pool service account email
+
+steps:
+  # ── 1. Build Docker image ───────────────────────────────────────────────────
+  - name: 'gcr.io/cloud-builders/docker'
+    id: build
+    args:
+      - build
+      - '--tag=$_AR_IMAGE:$SHORT_SHA'
+      - '--tag=$_AR_IMAGE:$TAG_NAME'
+      - '--tag=$_AR_IMAGE:latest'
+      - '--label=commit=$SHORT_SHA'
+      - '--label=tag=$TAG_NAME'
+      - '--label=build=$BUILD_ID'
+      - '.'
+
+  # ── 2. Push all tags to Artifact Registry ──────────────────────────────────
+  - name: 'gcr.io/cloud-builders/docker'
+    id: push
+    args:
+      - push
+      - '--all-tags'
+      - '$_AR_IMAGE'
+    waitFor: ['build']
+
+  # ── 3. Deploy to Cloud Run Worker Pool ────────────────────────────────────
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: deploy
+    entrypoint: gcloud
+    args:
+      - run
+      - worker-pools
+      - deploy
+      - rgmc-worker-pool
+      - '--image=$_AR_IMAGE:$SHORT_SHA'
+      - '--region=$_REGION'
+      - '--service-account=$_SA'
+      - '--update-env-vars=API_TAG_VERSION=$TAG_NAME'
+      - '--project=$PROJECT_ID'
+    waitFor: ['push']
+
+# Report the image digest back to Cloud Build so it appears in the build summary
+images:
+  - '$_AR_IMAGE:$SHORT_SHA'
+  - '$_AR_IMAGE:$TAG_NAME'
+  - '$_AR_IMAGE:latest'
+
+substitutions:
+  _REGION: us-central1
+  _AR_REPO: rgmc-docker
+  _AR_IMAGE: ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/rgmc-worker-pool
+  _SA: rgmc-worker-pool@${PROJECT_ID}.iam.gserviceaccount.com
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  # Substitute $TAG_NAME with "dev" if the build was not triggered by a tag push
+  substitution_option: ALLOW_LOOSE
