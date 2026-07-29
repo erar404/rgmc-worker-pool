@@ -40,6 +40,67 @@ def _headers_collection() -> str:
     return f"price_list_headers_{_env_slug()}"
 
 
+def get_prices_from_firestore(
+    company: str,
+    family_code: str | None = None,
+    product_no: str | None = None,
+    product_nos: list | None = None,
+    price_list_code: str | None = None,
+    include_blocked: bool = False,
+) -> list:
+    """Return item prices from Firestore for the given company and current GCP_ENV.
+
+    All filters are applied in Python after a single company-scoped query — avoids
+    composite index requirements. Returns [] when the collection is empty or filters
+    match nothing.
+    """
+    collection = _prices_collection()
+    db = _firestore()
+    docs = db.collection(collection).where("company", "==", company).stream()
+    nos_set = set(product_nos) if product_nos else None
+    results = []
+    for doc in docs:
+        data = doc.to_dict()
+        if not include_blocked and data.get("blocked"):
+            continue
+        if family_code and data.get("familyCode") != family_code:
+            continue
+        if product_no and data.get("productNo") != product_no:
+            continue
+        if nos_set is not None and data.get("productNo") not in nos_set:
+            continue
+        if price_list_code and data.get("priceListCode") != price_list_code:
+            continue
+        results.append(data)
+    return results
+
+
+def get_price_list_headers_from_firestore(
+    company: str,
+    status: str | None = None,
+    item_family_code: str | None = None,
+    price_type: str | None = None,
+) -> list:
+    """Return price list headers from Firestore for the given company and current GCP_ENV.
+
+    Filters are applied in Python after a single company-scoped query.
+    """
+    collection = _headers_collection()
+    db = _firestore()
+    docs = db.collection(collection).where("company", "==", company).stream()
+    results = []
+    for doc in docs:
+        data = doc.to_dict()
+        if status and data.get("status") != status:
+            continue
+        if item_family_code and data.get("itemFamilyCode") != item_family_code:
+            continue
+        if price_type and data.get("priceType") != price_type:
+            continue
+        results.append(data)
+    return results
+
+
 def sync_prices_to_firestore(records: list, company: str, on_date: str) -> int:
     """Upsert item price records into Firestore. Returns the count of records written."""
     collection = _prices_collection()

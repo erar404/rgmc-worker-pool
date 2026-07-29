@@ -34,10 +34,11 @@ steps:
     id: deploy
     entrypoint: gcloud
     args:
+      - beta
       - run
       - worker-pools
       - deploy
-      - rgmc-worker-pool
+      - '$_WORKER_POOL'
       - '--image=$_AR_IMAGE:$SHORT_SHA'
       - '--region=$_REGION'
       - '--service-account=$_SA'
@@ -56,6 +57,7 @@ substitutions:
   _AR_REPO: rgmc-docker
   _AR_IMAGE: ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/rgmc-worker-pool
   _SA: rgmc-worker-pool@${PROJECT_ID}.iam.gserviceaccount.com
+  _WORKER_POOL: rgmc-worker-pool
 
 options:
   logging: CLOUD_LOGGING_ONLY
