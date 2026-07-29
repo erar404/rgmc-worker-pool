@@ -13,8 +13,11 @@ Message formats (JSON):
   Single company price list headers:
     { "type": "sync-price-list-headers", "company": "RGMC" }
 
+  Connectivity test (bc-api → worker pool):
+    { "type": "ping", "sent_at": "ISO8601", "sent_by": "bc-api", "note": "optional" }
+
 Cloud Scheduler publishes { "type": "routine-sync" } to the rgmc-sync topic on a cron schedule.
-The main API can publish any of the above to trigger targeted syncs.
+The main API can publish any of the above to trigger targeted syncs or test connectivity.
 """
 import datetime
 import json
@@ -108,6 +111,20 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                 title=f"Price List Headers Sync Complete — {company}",
                 detail=f"Company: {company}\n{written} headers written to Firestore",
             )
+
+        elif msg_type == "ping":
+            sent_at = data.get("sent_at", "unknown")
+            sent_by = data.get("sent_by", "unknown")
+            note = data.get("note", "")
+            detail = f"Ping received from {sent_by}.\nSent at: {sent_at}"
+            if note:
+                detail += f"\nNote: {note}"
+            notify_success(
+                title="Worker Pool Ping ACK",
+                detail=detail,
+                context=f"subscription={config.PUBSUB_SYNC_SUBSCRIPTION}",
+            )
+            logger.info(f"Ping ACK — sent_by={sent_by!r} sent_at={sent_at!r}")
 
         else:
             logger.warning(f"Unknown sync message type: {msg_type!r} — acking to discard")
