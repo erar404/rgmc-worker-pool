@@ -8,17 +8,21 @@
 
 steps:
   # ── 1. Build Docker image ───────────────────────────────────────────────────
+  # Uses bash entrypoint so the $TAG_NAME tag is only added when non-empty
+  # (TAG_NAME is empty on branch pushes; only set on git tag pushes).
   - name: 'gcr.io/cloud-builders/docker'
     id: build
+    entrypoint: bash
     args:
-      - build
-      - '--tag=$_AR_IMAGE:$SHORT_SHA'
-      - '--tag=$_AR_IMAGE:$TAG_NAME'
-      - '--tag=$_AR_IMAGE:latest'
-      - '--label=commit=$SHORT_SHA'
-      - '--label=tag=$TAG_NAME'
-      - '--label=build=$BUILD_ID'
-      - '.'
+      - -c
+      - |
+        TAGS="--tag=$_AR_IMAGE:$SHORT_SHA --tag=$_AR_IMAGE:latest"
+        [[ -n "$TAG_NAME" ]] && TAGS="$$TAGS --tag=$_AR_IMAGE:$TAG_NAME"
+        docker build $$TAGS \
+          --label=commit=$SHORT_SHA \
+          --label=tag=$TAG_NAME \
+          --label=build=$BUILD_ID \
+          .
 
   # ── 2. Push all tags to Artifact Registry ──────────────────────────────────
   - name: 'gcr.io/cloud-builders/docker'
@@ -46,10 +50,10 @@ steps:
       - '--project=$PROJECT_ID'
     waitFor: ['push']
 
-# Report the image digest back to Cloud Build so it appears in the build summary
+# Only report the always-valid tags — $TAG_NAME is omitted here because it is
+# empty on branch pushes and would make Cloud Build reject the build before it starts.
 images:
   - '$_AR_IMAGE:$SHORT_SHA'
-  - '$_AR_IMAGE:$TAG_NAME'
   - '$_AR_IMAGE:latest'
 
 substitutions:
@@ -61,5 +65,4 @@ substitutions:
 
 options:
   logging: CLOUD_LOGGING_ONLY
-  # Substitute $TAG_NAME with "dev" if the build was not triggered by a tag push
   substitution_option: ALLOW_LOOSE
