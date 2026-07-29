@@ -324,6 +324,20 @@ def fetch_price_list_headers(company_name: str, odata_filter: str | None = None)
     return _fetch_all_pages(url)
 
 
+def fetch_price_list_headers_with_lines(company_name: str) -> list:
+    """Fetch all priceListHeaders with embedded priceListLines via OData $expand.
+
+    Returns headers as dicts; each includes a 'priceListLines' key with the line
+    items for that price list. A single BC call fetches all headers and their lines.
+    """
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/priceListHeaders?$expand=priceListLines"
+    )
+    return _fetch_all_pages(url)
+
+
 # ---------------------------------------------------------------------------
 # Order CRUD — v1 (RGMC custom v1.0) and v2 (RGMC custom v2.0)
 # ---------------------------------------------------------------------------

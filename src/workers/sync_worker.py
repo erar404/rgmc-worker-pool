@@ -13,6 +13,9 @@ Message formats (JSON):
   Single company price list headers:
     { "type": "sync-price-list-headers", "company": "RGMC" }
 
+  Single company price list items (omit price_list_code to sync all codes):
+    { "type": "sync-price-list-items", "company": "RGMC", "price_list_code": "PLH001" }
+
   Connectivity test (bc-api → worker pool):
     { "type": "ping", "sent_at": "ISO8601", "sent_by": "bc-api", "note": "optional" }
 
@@ -26,10 +29,15 @@ import logging
 from google.cloud import pubsub_v1
 
 from src import config
-from src.services.bc_client import fetch_price_list_headers, fetch_v3_catalog
+from src.services.bc_client import (
+    fetch_price_list_headers,
+    fetch_price_list_headers_with_lines,
+    fetch_v3_catalog,
+)
 from src.services.gcs_catalog import save_catalog
 from src.services.price_firestore_service import (
     sync_price_list_headers_to_firestore,
+    sync_price_list_items_to_firestore,
     sync_prices_to_firestore,
 )
 from src.services.send_mail import notify_error, notify_success
@@ -42,11 +50,22 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
     logger.info(f"[{company}] sync started — on_date={on_date!r}")
 
     try:
-        headers = fetch_price_list_headers(company)
+        headers_with_lines = fetch_price_list_headers_with_lines(company)
+        headers = [{k: v for k, v in h.items() if k != "priceListLines"} for h in headers_with_lines]
         written = sync_price_list_headers_to_firestore(headers, company)
         logger.info(f"[{company}] {written} price list headers written")
+        total_items = 0
+        for header in headers_with_lines:
+            code = header.get("code") or ""
+            lines = header.get("priceListLines") or []
+            if not (code and lines):
+                continue
+            written_items = sync_price_list_items_to_firestore(lines, company, code)
+            total_items += written_items
+            logger.info(f"[{company}] price list items [{code}]: {written_items} written")
+        logger.info(f"[{company}] {total_items} price list items written total")
     except Exception as e:
-        logger.error(f"[{company}] price list headers failed — {e}")
+        logger.error(f"[{company}] price list headers/items failed — {e}")
 
     try:
         records = fetch_v3_catalog(company, on_date)
@@ -104,12 +123,35 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
 
         elif msg_type == "sync-price-list-headers":
             company = data.get("company") or config.BC_COMPANY
-            headers = fetch_price_list_headers(company)
+            headers_with_lines = fetch_price_list_headers_with_lines(company)
+            headers = [{k: v for k, v in h.items() if k != "priceListLines"} for h in headers_with_lines]
             written = sync_price_list_headers_to_firestore(headers, company)
             logger.info(f"[{company}] {written} price list headers written")
             notify_success(
                 title=f"Price List Headers Sync Complete — {company}",
                 detail=f"Company: {company}\n{written} headers written to Firestore",
+            )
+
+        elif msg_type == "sync-price-list-items":
+            company = data.get("company") or config.BC_COMPANY
+            price_list_code = data.get("price_list_code")
+            headers_with_lines = fetch_price_list_headers_with_lines(company)
+            total = 0
+            for header in headers_with_lines:
+                code = header.get("code") or ""
+                lines = header.get("priceListLines") or []
+                if not code:
+                    continue
+                if price_list_code and code != price_list_code:
+                    continue
+                written = sync_price_list_items_to_firestore(lines, company, code)
+                total += written
+                logger.info(f"[{company}] price list items [{code}]: {written} written")
+            logger.info(f"[{company}] {total} price list items written total")
+            notify_success(
+                title=f"Price List Items Sync Complete — {company}",
+                detail=f"Company: {company}\n{total} items written to Firestore",
+                context=f"price_list_code={price_list_code or 'all'}",
             )
 
         elif msg_type == "ping":
