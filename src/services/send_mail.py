@@ -22,7 +22,7 @@ def notify_error(title: str, detail: str, context: str = "") -> None:
         target=_send,
         args=(title, detail, context),
         daemon=True,
-    ).start()
+    ).start() 
 
 
 def notify_success(title: str, detail: str, context: str = "") -> None:
