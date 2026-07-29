@@ -29,7 +29,7 @@ from src.services.price_firestore_service import (
     sync_price_list_headers_to_firestore,
     sync_prices_to_firestore,
 )
-from src.services.send_mail import notify_error
+from src.services.send_mail import notify_error, notify_success
 
 logger = logging.getLogger("worker.sync")
 
@@ -84,16 +84,30 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             ]
             for company in companies:
                 _sync_company(company, on_date, page_size)
+            notify_success(
+                title="Routine Sync Complete",
+                detail="\n".join(companies),
+                context=f"on_date={on_date}",
+            )
 
         elif msg_type == "sync-item-prices":
             company = data.get("company") or config.BC_COMPANY
             _sync_company(company, on_date, page_size)
+            notify_success(
+                title=f"Item Prices Sync Complete — {company}",
+                detail=f"Company: {company}",
+                context=f"on_date={on_date}",
+            )
 
         elif msg_type == "sync-price-list-headers":
             company = data.get("company") or config.BC_COMPANY
             headers = fetch_price_list_headers(company)
             written = sync_price_list_headers_to_firestore(headers, company)
             logger.info(f"[{company}] {written} price list headers written")
+            notify_success(
+                title=f"Price List Headers Sync Complete — {company}",
+                detail=f"Company: {company}\n{written} headers written to Firestore",
+            )
 
         else:
             logger.warning(f"Unknown sync message type: {msg_type!r} — acking to discard")
