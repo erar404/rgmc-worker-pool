@@ -102,7 +102,7 @@ def _send(title: str, detail: str, context: str) -> None:
     try:
         ctx = ssl.create_default_context()
         with smtplib.SMTP(config.smtp_host, config.smtp_port) as server:
-            server.starttls(ctx)
+            server.starttls(context=ctx)
             server.login(config.smtp_user, config.smtp_password)
             server.send_message(msg)
     except Exception as exc:
@@ -171,7 +171,7 @@ def _send_success(title: str, detail: str, context: str) -> None:
     try:
         ctx = ssl.create_default_context()
         with smtplib.SMTP(config.smtp_host, config.smtp_port) as server:
-            server.starttls(ctx)
+            server.starttls(context=ctx)
             server.login(config.smtp_user, config.smtp_password)
             server.send_message(msg)
     except Exception as exc:
