@@ -149,6 +149,7 @@ def _fetch_all_pages(url: str, max_retries: int = 6, extra_headers: dict | None 
     409 (temp-buffer cursor invalidated by a concurrent request) restarts pagination
     from page 1 up to 3 times before giving up.
     """
+    global _active_bc_requests
     _MAX_RESTARTS = 3
     all_records: list = []
     next_url = url
