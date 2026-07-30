@@ -245,10 +245,17 @@ def get_company_id(company_name: str) -> str:
 # v3 Item Price Catalog (Pag50318)
 # ---------------------------------------------------------------------------
 
-def _build_v3_url(company_id: str, on_date: str | None, odata_filter: str | None = None) -> str:
+def _build_v3_url(
+    company_id: str,
+    on_date: str | None,
+    odata_filter: str | None = None,
+    since: str | None = None,
+) -> str:
     filters = []
     if on_date:
         filters.append(f"onDate eq {on_date}")
+    if since:
+        filters.append(f"lastModifiedDateTime gt {since}")
     if odata_filter:
         filters.append(odata_filter)
     params = []
@@ -259,13 +266,16 @@ def _build_v3_url(company_id: str, on_date: str | None, odata_filter: str | None
     return url + "?" + "&".join(params)
 
 
-def fetch_v3_catalog(company_name: str, on_date: str | None = None) -> list:
-    """Fetch the full v3 item price catalog using four parallel productNo range requests.
+def fetch_v3_catalog(company_name: str, on_date: str | None = None, since: str | None = None) -> list:
+    """Fetch the v3 item price catalog using four parallel productNo range requests.
 
     Splits the alphabet into four ranges (A-G, G-M, M-S, S-Z) so BC runs four
     independent OData cursors simultaneously. Results are merged and de-duplicated on
     productNo. Each range fits in a single OData page at maxpagesize=5000 so
     OnOpenPage runs exactly once per range (4× total vs. a single sequential full scan).
+
+    Pass since (UTC ISO string, e.g. "2025-07-30T10:00:00Z") to fetch only records
+    modified after that timestamp — used by incremental sync to skip unchanged prices.
     """
     company_id = get_company_id(company_name)
     effective_date = on_date or datetime.date.today().isoformat()
@@ -284,10 +294,13 @@ def fetch_v3_catalog(company_name: str, on_date: str | None = None) -> list:
         if high:
             parts.append(f"productNo lt '{high}'")
         odata_filter = " and ".join(parts) if parts else None
-        url = _build_v3_url(company_id, effective_date, odata_filter)
+        url = _build_v3_url(company_id, effective_date, odata_filter, since=since)
         return _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
 
-    logger.info(f"v3 catalog parallel fetch (4 ranges) — company={company_name!r} on_date={effective_date!r}")
+    logger.info(
+        f"v3 catalog parallel fetch (4 ranges) — company={company_name!r} "
+        f"on_date={effective_date!r} since={since!r}"
+    )
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(_fetch_range, low, high) for low, high in ranges]
         results = [f.result() for f in as_completed(futures)]
@@ -324,17 +337,24 @@ def fetch_price_list_headers(company_name: str, odata_filter: str | None = None)
     return _fetch_all_pages(url)
 
 
-def fetch_price_list_headers_with_lines(company_name: str) -> list:
-    """Fetch all priceListHeaders with embedded priceListLines via OData $expand.
+def fetch_price_list_headers_with_lines(company_name: str, since: str | None = None) -> list:
+    """Fetch priceListHeaders with embedded priceListLines via OData $expand.
 
-    Returns headers as dicts; each includes a 'priceListLines' key with the line
-    items for that price list. A single BC call fetches all headers and their lines.
+    Pass since (UTC ISO string) to fetch only headers modified after that timestamp.
+    Lines are embedded in their parent header — so a header change brings all its
+    current lines. If only a line changes without touching its header, pass since=None
+    for a full sync to pick it up.
     """
     company_id = get_company_id(company_name)
-    url = (
+    base = (
         f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
-        f"/companies({company_id})/priceListHeaders?$expand=priceListLines"
+        f"/companies({company_id})/priceListHeaders"
     )
+    if since:
+        url = f"{base}?$expand=priceListLines&$filter=lastModifiedDateTime gt {since}"
+    else:
+        url = f"{base}?$expand=priceListLines"
+    logger.info(f"fetch_price_list_headers_with_lines — company={company_name!r} since={since!r}")
     return _fetch_all_pages(url)
 
 

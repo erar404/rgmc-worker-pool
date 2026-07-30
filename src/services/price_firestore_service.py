@@ -46,6 +46,30 @@ def _items_collection() -> str:
     return f"price_list_items_{_env_slug()}"
 
 
+def _state_collection() -> str:
+    return f"sync_state_{_env_slug()}"
+
+
+def get_sync_state(company: str, collection_type: str) -> str | None:
+    """Return the UTC ISO timestamp of the last successful sync for (company, collection_type), or None."""
+    db = _firestore()
+    doc = db.collection(_state_collection()).document(f"{company}_{collection_type}").get()
+    if not doc.exists:
+        return None
+    return doc.to_dict().get("lastSyncAt")
+
+
+def set_sync_state(company: str, collection_type: str, timestamp: str) -> None:
+    """Record the last successful sync timestamp for (company, collection_type)."""
+    db = _firestore()
+    db.collection(_state_collection()).document(f"{company}_{collection_type}").set({
+        "company": company,
+        "collectionType": collection_type,
+        "lastSyncAt": timestamp,
+        "env": GCP_ENV,
+    })
+
+
 def get_prices_from_firestore(
     company: str,
     family_code: str | None = None,
