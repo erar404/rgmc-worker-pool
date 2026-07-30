@@ -190,8 +190,8 @@ def start() -> pubsub_v1.subscriber.futures.StreamingPullFuture:
         config.GCP_PROJECT_ID,
         config.PUBSUB_SYNC_SUBSCRIPTION,
     )
-    # max_messages=2: sync jobs are heavy (BC + Firestore), limit concurrency
-    flow_control = pubsub_v1.types.FlowControl(max_messages=2)
+    # max_messages=1: sync jobs hold large BC payloads in memory; no concurrent syncs
+    flow_control = pubsub_v1.types.FlowControl(max_messages=1)
     future = subscriber.subscribe(
         subscription_path,
         callback=_process,
