@@ -266,26 +266,11 @@ def _build_v3_url(
     return url + "?" + "&".join(params)
 
 
-def fetch_v3_catalog(company_name: str, on_date: str | None = None, since: str | None = None) -> list:
-    """Fetch the v3 item price catalog using four parallel productNo range requests.
-
-    Splits the alphabet into four ranges (A-G, G-M, M-S, S-Z) so BC runs four
-    independent OData cursors simultaneously. Results are merged and de-duplicated on
-    productNo. Each range fits in a single OData page at maxpagesize=5000 so
-    OnOpenPage runs exactly once per range (4× total vs. a single sequential full scan).
-
-    Pass since (UTC ISO string, e.g. "2025-07-30T10:00:00Z") to fetch only records
-    modified after that timestamp — used by incremental sync to skip unchanged prices.
-    """
-    company_id = get_company_id(company_name)
-    effective_date = on_date or datetime.date.today().isoformat()
-
-    ranges = [
-        ("", "G"),
-        ("G", "M"),
-        ("M", "S"),
-        ("S", ""),
-    ]
+def _fetch_v3_catalog_for_date(
+    company_id: str, company_name: str, effective_date: str, since: str | None = None
+) -> list:
+    """Run the 4-range parallel fetch for a specific effective_date."""
+    ranges = [("", "G"), ("G", "M"), ("M", "S"), ("S", "")]
 
     def _fetch_range(low: str, high: str) -> list:
         parts = []
@@ -314,8 +299,48 @@ def fetch_v3_catalog(company_name: str, on_date: str | None = None, since: str |
                 seen.add(key)
                 merged.append(record)
 
-    logger.info(f"v3 catalog fetch complete: {len(merged)} records for {company_name!r}")
+    logger.info(f"v3 catalog fetch complete ({effective_date!r}): {len(merged)} records for {company_name!r}")
     return merged
+
+
+def fetch_v3_catalog(company_name: str, on_date: str | None = None, since: str | None = None) -> list:
+    """Fetch the v3 item price catalog using four parallel productNo range requests.
+
+    Splits the alphabet into four ranges (A-G, G-M, M-S, S-Z) so BC runs four
+    independent OData cursors simultaneously. Results are merged and de-duplicated on
+    productNo.
+
+    For full fetches (since=None): tries on_date first; if BC returns no active
+    (non-blocked) prices, falls back one day at a time up to 30 days to find the
+    nearest valid price date. This handles expired price list end dates gracefully.
+
+    For incremental fetches (since set): fetches only records modified after that
+    timestamp on the given date — no date fallback (partial delta, not a full re-sync).
+    """
+    company_id = get_company_id(company_name)
+    start_date = datetime.date.fromisoformat(on_date) if on_date else datetime.date.today()
+
+    if since is not None:
+        # Incremental: just fetch the delta for the given date, no fallback needed
+        return _fetch_v3_catalog_for_date(company_id, company_name, start_date.isoformat(), since=since)
+
+    # Full fetch: try today then fall back to find a date with active prices
+    for days_back in range(31):
+        effective_date = (start_date - datetime.timedelta(days=days_back)).isoformat()
+        records = _fetch_v3_catalog_for_date(company_id, company_name, effective_date)
+        if any(not r.get("blocked") for r in records):
+            if days_back > 0:
+                logger.info(
+                    f"v3 catalog: no active prices on {start_date.isoformat()!r}; "
+                    f"using {effective_date!r} ({days_back}d back) — {len(records)} records for {company_name!r}"
+                )
+            return records
+
+    logger.warning(
+        f"v3 catalog fetch: no active prices in 30-day window for {company_name!r} "
+        f"(checked {start_date.isoformat()!r} to {(start_date - datetime.timedelta(days=30)).isoformat()!r})"
+    )
+    return []
 
 
 # ---------------------------------------------------------------------------
