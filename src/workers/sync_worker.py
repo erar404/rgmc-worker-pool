@@ -13,8 +13,14 @@ Message formats (JSON):
   Single company price list headers:
     { "type": "sync-price-list-headers", "company": "RGMC" }
 
+  Single company price list items (omit price_list_code to sync all codes):
+    { "type": "sync-price-list-items", "company": "RGMC", "price_list_code": "PLH001" }
+
+  Connectivity test (bc-api → worker pool):
+    { "type": "ping", "sent_at": "ISO8601", "sent_by": "bc-api", "note": "optional" }
+
 Cloud Scheduler publishes { "type": "routine-sync" } to the rgmc-sync topic on a cron schedule.
-The main API can publish any of the above to trigger targeted syncs.
+The main API can publish any of the above to trigger targeted syncs or test connectivity.
 """
 import datetime
 import json
@@ -23,31 +29,82 @@ import logging
 from google.cloud import pubsub_v1
 
 from src import config
-from src.services.bc_client import fetch_price_list_headers, fetch_v3_catalog
+from src.services.bc_client import (
+    fetch_price_list_headers,
+    fetch_price_list_headers_with_lines,
+    fetch_v3_catalog,
+)
 from src.services.gcs_catalog import save_catalog
 from src.services.price_firestore_service import (
+    get_sync_state,
+    prices_exist_in_firestore,
+    set_sync_state,
     sync_price_list_headers_to_firestore,
+    sync_price_list_items_to_firestore,
     sync_prices_to_firestore,
 )
-from src.services.send_mail import notify_error
+from src.services.send_mail import notify_error, notify_success
 
 logger = logging.getLogger("worker.sync")
 
 
+def _now_utc() -> str:
+    """Return current UTC time as 'YYYY-MM-DDTHH:MM:SSZ' — used as the sync state timestamp."""
+    return datetime.datetime.utcnow().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
-    """Sync price list headers then full item price catalog for a single company."""
+    """Sync price list headers then item price catalog for a single company.
+
+    Uses lastModifiedDateTime-based incremental sync: only records modified since the
+    last successful sync are fetched from BC and written to Firestore. First run (no
+    stored sync state) falls back to a full fetch.
+    """
     logger.info(f"[{company}] sync started — on_date={on_date!r}")
 
-    try:
-        headers = fetch_price_list_headers(company)
-        written = sync_price_list_headers_to_firestore(headers, company)
-        logger.info(f"[{company}] {written} price list headers written")
-    except Exception as e:
-        logger.error(f"[{company}] price list headers failed — {e}")
+    # Snapshot time before any BC fetch so records modified during the sync window
+    # are picked up on the next run (no gap, small overlap is fine).
+    sync_start = _now_utc()
 
     try:
-        records = fetch_v3_catalog(company, on_date)
-        save_catalog(company, on_date, records)
+        since_headers = get_sync_state(company, "price_list_headers")
+        headers_with_lines = fetch_price_list_headers_with_lines(company, since=since_headers)
+        headers = [{k: v for k, v in h.items() if k != "priceListLines"} for h in headers_with_lines]
+        written = sync_price_list_headers_to_firestore(headers, company)
+        logger.info(
+            f"[{company}] {written} price list headers written "
+            f"(since={since_headers!r})"
+        )
+        total_items = 0
+        for header in headers_with_lines:
+            code = header.get("code") or ""
+            lines = header.get("priceListLines") or []
+            if not (code and lines):
+                continue
+            written_items = sync_price_list_items_to_firestore(lines, company, code)
+            total_items += written_items
+            logger.info(f"[{company}] price list items [{code}]: {written_items} written")
+        if headers_with_lines:
+            set_sync_state(company, "price_list_headers", sync_start)
+        logger.info(f"[{company}] {total_items} price list items written total")
+    except Exception as e:
+        logger.error(f"[{company}] price list headers/items failed — {e}")
+
+    try:
+        since_prices = get_sync_state(company, "item_prices")
+        # If the collection is empty despite a stored sync timestamp, the previous sync
+        # completed (setting the state) but Firestore writes failed or were lost.
+        # Force a full fetch so we actually populate the collection.
+        if since_prices is not None and not prices_exist_in_firestore(company):
+            logger.info(
+                f"[{company}] item_prices collection empty despite stored sync state "
+                f"(since={since_prices!r}) — forcing full fetch"
+            )
+            since_prices = None
+        records = fetch_v3_catalog(company, on_date, since=since_prices)
+        # Only save a full GCS snapshot on full-fetch runs; incremental results are partial.
+        if since_prices is None:
+            save_catalog(company, on_date, records)
         total = 0
         for i in range(0, len(records), page_size):
             chunk = records[i : i + page_size]
@@ -56,7 +113,12 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
                 f"[{company}] item prices page {i // page_size + 1}: "
                 f"{len(chunk)} records (offset={i})"
             )
-        logger.info(f"[{company}] {total} item prices written total")
+        if records:
+            set_sync_state(company, "item_prices", sync_start)
+        logger.info(
+            f"[{company}] {total} item prices written total "
+            f"(since={since_prices!r})"
+        )
     except Exception as e:
         logger.error(f"[{company}] item prices failed — {e}")
 
@@ -84,16 +146,78 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             ]
             for company in companies:
                 _sync_company(company, on_date, page_size)
+            notify_success(
+                title="Routine Sync Complete",
+                detail="\n".join(companies),
+                context=f"on_date={on_date}",
+            )
 
         elif msg_type == "sync-item-prices":
             company = data.get("company") or config.BC_COMPANY
             _sync_company(company, on_date, page_size)
+            notify_success(
+                title=f"Item Prices Sync Complete — {company}",
+                detail=f"Company: {company}",
+                context=f"on_date={on_date}",
+            )
 
         elif msg_type == "sync-price-list-headers":
             company = data.get("company") or config.BC_COMPANY
-            headers = fetch_price_list_headers(company)
+            sync_start = _now_utc()
+            since_headers = get_sync_state(company, "price_list_headers")
+            headers_with_lines = fetch_price_list_headers_with_lines(company, since=since_headers)
+            headers = [{k: v for k, v in h.items() if k != "priceListLines"} for h in headers_with_lines]
             written = sync_price_list_headers_to_firestore(headers, company)
-            logger.info(f"[{company}] {written} price list headers written")
+            if headers_with_lines:
+                set_sync_state(company, "price_list_headers", sync_start)
+            logger.info(f"[{company}] {written} price list headers written (since={since_headers!r})")
+            notify_success(
+                title=f"Price List Headers Sync Complete — {company}",
+                detail=f"Company: {company}\n{written} headers written to Firestore",
+                context=f"since={since_headers or 'full'}",
+            )
+
+        elif msg_type == "sync-price-list-items":
+            company = data.get("company") or config.BC_COMPANY
+            price_list_code = data.get("price_list_code")
+            sync_start = _now_utc()
+            since_headers = get_sync_state(company, "price_list_headers")
+            # Use since only when syncing all codes; targeted single-code sync is always full.
+            effective_since = since_headers if not price_list_code else None
+            headers_with_lines = fetch_price_list_headers_with_lines(company, since=effective_since)
+            total = 0
+            for header in headers_with_lines:
+                code = header.get("code") or ""
+                lines = header.get("priceListLines") or []
+                if not code:
+                    continue
+                if price_list_code and code != price_list_code:
+                    continue
+                written = sync_price_list_items_to_firestore(lines, company, code)
+                total += written
+                logger.info(f"[{company}] price list items [{code}]: {written} written")
+            if headers_with_lines and not price_list_code:
+                set_sync_state(company, "price_list_headers", sync_start)
+            logger.info(f"[{company}] {total} price list items written total")
+            notify_success(
+                title=f"Price List Items Sync Complete — {company}",
+                detail=f"Company: {company}\n{total} items written to Firestore",
+                context=f"price_list_code={price_list_code or 'all'} since={effective_since or 'full'}",
+            )
+
+        elif msg_type == "ping":
+            sent_at = data.get("sent_at", "unknown")
+            sent_by = data.get("sent_by", "unknown")
+            note = data.get("note", "")
+            detail = f"Ping received from {sent_by}.\nSent at: {sent_at}"
+            if note:
+                detail += f"\nNote: {note}"
+            notify_success(
+                title="Worker Pool Ping ACK",
+                detail=detail,
+                context=f"subscription={config.PUBSUB_SYNC_SUBSCRIPTION}",
+            )
+            logger.info(f"Ping ACK — sent_by={sent_by!r} sent_at={sent_at!r}")
 
         else:
             logger.warning(f"Unknown sync message type: {msg_type!r} — acking to discard")
@@ -117,8 +241,8 @@ def start() -> pubsub_v1.subscriber.futures.StreamingPullFuture:
         config.GCP_PROJECT_ID,
         config.PUBSUB_SYNC_SUBSCRIPTION,
     )
-    # max_messages=2: sync jobs are heavy (BC + Firestore), limit concurrency
-    flow_control = pubsub_v1.types.FlowControl(max_messages=2)
+    # max_messages=1: sync jobs hold large BC payloads in memory; no concurrent syncs
+    flow_control = pubsub_v1.types.FlowControl(max_messages=1)
     future = subscriber.subscribe(
         subscription_path,
         callback=_process,

@@ -149,6 +149,7 @@ def _fetch_all_pages(url: str, max_retries: int = 6, extra_headers: dict | None 
     409 (temp-buffer cursor invalidated by a concurrent request) restarts pagination
     from page 1 up to 3 times before giving up.
     """
+    global _active_bc_requests
     _MAX_RESTARTS = 3
     all_records: list = []
     next_url = url
@@ -244,12 +245,28 @@ def get_company_id(company_name: str) -> str:
 # v3 Item Price Catalog (Pag50318)
 # ---------------------------------------------------------------------------
 
-def _build_v3_url(company_id: str, on_date: str | None, odata_filter: str | None = None) -> str:
+_V3_PAGE_SIZE = 5000  # records per BC offset-pagination page
+
+
+def _build_v3_url(
+    company_id: str,
+    on_date: str | None,
+    odata_filter: str | None = None,
+    since: str | None = None,
+    bc_limit: int | None = None,
+    bc_offset: int | None = None,
+) -> str:
     filters = []
     if on_date:
         filters.append(f"onDate eq {on_date}")
+    if since:
+        filters.append(f"lastModifiedDateTime gt {since}")
     if odata_filter:
         filters.append(odata_filter)
+    if bc_limit is not None:
+        filters.append(f"limit eq {bc_limit}")
+    if bc_offset is not None:
+        filters.append(f"offset eq {bc_offset}")
     params = []
     if filters:
         params.append(f"$filter={' and '.join(filters)}")
@@ -258,23 +275,48 @@ def _build_v3_url(company_id: str, on_date: str | None, odata_filter: str | None
     return url + "?" + "&".join(params)
 
 
-def fetch_v3_catalog(company_name: str, on_date: str | None = None) -> list:
-    """Fetch the full v3 item price catalog using four parallel productNo range requests.
+def _fetch_range_with_offset_pagination(
+    company_id: str, on_date: str, odata_filter: str | None, since: str | None
+) -> list:
+    """Fetch all records for a single productNo range using explicit limit/offset pagination.
 
-    Splits the alphabet into four ranges (A-G, G-M, M-S, S-Z) so BC runs four
-    independent OData cursors simultaneously. Results are merged and de-duplicated on
-    productNo. Each range fits in a single OData page at maxpagesize=5000 so
-    OnOpenPage runs exactly once per range (4× total vs. a single sequential full scan).
+    Uses BC's native `limit eq` and `offset eq` OData filter params instead of
+    following @odata.nextLink. This avoids the `aid=FIN` broken nextLink issue where
+    BC returns 400/409 on the second page of certain range+date combos.
     """
-    company_id = get_company_id(company_name)
-    effective_date = on_date or datetime.date.today().isoformat()
+    all_records: list = []
+    offset = 0
+    while True:
+        url = _build_v3_url(
+            company_id, on_date, odata_filter, since=since,
+            bc_limit=_V3_PAGE_SIZE, bc_offset=offset,
+        )
+        resp = _bc_request("get", url, headers=_auth_headers(), timeout=120)
+        resp.raise_for_status()
+        records = resp.json().get("value", [])
+        all_records.extend(records)
+        if len(records) < _V3_PAGE_SIZE:
+            break  # last page
+        offset += _V3_PAGE_SIZE
+    return all_records
 
-    ranges = [
-        ("", "G"),
-        ("G", "M"),
-        ("M", "S"),
-        ("S", ""),
-    ]
+
+def _fetch_v3_catalog_for_date(
+    company_id: str, company_name: str, effective_date: str, since: str | None = None
+) -> list:
+    """Run the per-letter parallel fetch for a specific effective_date.
+
+    Uses 27 single-letter productNo ranges (plus a catch-all for non-alpha product
+    codes) instead of 4 broad ranges. Each letter range has ~10k records → 2 pages of
+    5000 → completes in ~20s, well within BC's Pag50318 temp-buffer TTL (~3 min).
+    The previous 4-range approach produced M-S ranges with >55k records which caused
+    BC to expire the temp buffer mid-pagination and return 409.
+
+    Uses explicit limit/offset pagination instead of @odata.nextLink to avoid the
+    aid=FIN broken nextLink issue on BC's Pag50318 for historical dates.
+    """
+    # 27 ranges: non-alpha (digits/specials before 'A'), one per letter A-Z, plus Z+
+    ranges = [("", "A")] + [(chr(i), chr(i + 1)) for i in range(ord("A"), ord("Z"))] + [("Z", "")]
 
     def _fetch_range(low: str, high: str) -> list:
         parts = []
@@ -283,10 +325,12 @@ def fetch_v3_catalog(company_name: str, on_date: str | None = None) -> list:
         if high:
             parts.append(f"productNo lt '{high}'")
         odata_filter = " and ".join(parts) if parts else None
-        url = _build_v3_url(company_id, effective_date, odata_filter)
-        return _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
+        return _fetch_range_with_offset_pagination(company_id, effective_date, odata_filter, since)
 
-    logger.info(f"v3 catalog parallel fetch (4 ranges) — company={company_name!r} on_date={effective_date!r}")
+    logger.info(
+        f"v3 catalog parallel fetch (4 ranges) — company={company_name!r} "
+        f"on_date={effective_date!r} since={since!r}"
+    )
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(_fetch_range, low, high) for low, high in ranges]
         results = [f.result() for f in as_completed(futures)]
@@ -300,8 +344,94 @@ def fetch_v3_catalog(company_name: str, on_date: str | None = None) -> list:
                 seen.add(key)
                 merged.append(record)
 
-    logger.info(f"v3 catalog fetch complete: {len(merged)} records for {company_name!r}")
+    logger.info(f"v3 catalog fetch complete ({effective_date!r}): {len(merged)} records for {company_name!r}")
     return merged
+
+
+def _probe_v3_date(company_id: str, on_date: str) -> str | None:
+    """Light probe: fetch up to 50 records for on_date and check if any are non-blocked.
+
+    Returns 'active' (has non-blocked records), 'blocked' (all blocked), or None
+    (BC returned an error or no records for this date — skip it).
+
+    Uses a single cheap request instead of the full 4-range parallel fetch so that
+    the fallback loop can cheaply scan many candidate dates without memory pressure.
+    """
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}"
+        f"/companies({company_id})/itemPrices"
+        f"?$filter=onDate eq {on_date}&$select=productNo,blocked&$top=50"
+    )
+    resp = _bc_request("get", url, headers=_auth_headers(), timeout=30)
+    if not resp.ok:
+        return None
+    records = resp.json().get("value", [])
+    if not records:
+        return None
+    return "active" if any(not r.get("blocked") for r in records) else "blocked"
+
+
+def fetch_v3_catalog(company_name: str, on_date: str | None = None, since: str | None = None) -> list:
+    """Fetch the v3 item price catalog using four parallel productNo range requests.
+
+    Splits the alphabet into four ranges (A-G, G-M, M-S, S-Z) so BC runs four
+    independent OData cursors simultaneously. Results are merged and de-duplicated on
+    productNo.
+
+    For full fetches (since=None): probes each candidate date with a minimal single
+    request before committing to the full 4-range parallel fetch. Probe errors (4xx)
+    skip the date; full-fetch errors also skip and try the next date. This handles
+    expired price list end dates and transient BC range errors (e.g. 400 on M-S range
+    for a specific date) without aborting the entire fallback loop.
+
+    For incremental fetches (since set): fetches only records modified after that
+    timestamp on the given date — no date fallback (partial delta, not a full re-sync).
+    """
+    company_id = get_company_id(company_name)
+    start_date = datetime.date.fromisoformat(on_date) if on_date else datetime.date.today()
+
+    if since is not None:
+        # Incremental: just fetch the delta for the given date, no fallback needed
+        return _fetch_v3_catalog_for_date(company_id, company_name, start_date.isoformat(), since=since)
+
+    # Full fetch: probe each date cheaply before committing to the full 4-range parallel fetch
+    for days_back in range(31):
+        effective_date = (start_date - datetime.timedelta(days=days_back)).isoformat()
+
+        probe = _probe_v3_date(company_id, effective_date)
+        if probe is None:
+            logger.warning(f"v3 catalog: date {effective_date!r} probe failed for {company_name!r} — skipping")
+            continue
+        if probe != "active":
+            continue  # all-blocked on this date, try the next one silently
+
+        try:
+            records = _fetch_v3_catalog_for_date(company_id, company_name, effective_date)
+        except Exception as e:
+            logger.warning(
+                f"v3 catalog: full fetch for {effective_date!r} failed ({e}) "
+                f"for {company_name!r} — skipping"
+            )
+            continue
+
+        if any(not r.get("blocked") for r in records):
+            if days_back > 0:
+                logger.info(
+                    f"v3 catalog: no active prices on {start_date.isoformat()!r}; "
+                    f"using {effective_date!r} ({days_back}d back) — {len(records)} records for {company_name!r}"
+                )
+            return records
+        # Probe said active but full fetch had no non-blocked (probe sample was all-blocked by chance)
+        logger.warning(
+            f"v3 catalog: probe said active but full fetch all-blocked on {effective_date!r} "
+            f"for {company_name!r} — trying earlier date"
+        )
+
+    logger.warning(
+        f"v3 catalog fetch: no active prices in 30-day window for {company_name!r} "
+        f"(checked {start_date.isoformat()!r} to {(start_date - datetime.timedelta(days=30)).isoformat()!r})"
+    )
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +450,27 @@ def fetch_price_list_headers(company_name: str, odata_filter: str | None = None)
     )
     if odata_filter:
         url += f"?$filter={odata_filter}"
+    return _fetch_all_pages(url)
+
+
+def fetch_price_list_headers_with_lines(company_name: str, since: str | None = None) -> list:
+    """Fetch priceListHeaders with embedded priceListLines via OData $expand.
+
+    Pass since (UTC ISO string) to fetch only headers modified after that timestamp.
+    Lines are embedded in their parent header — so a header change brings all its
+    current lines. If only a line changes without touching its header, pass since=None
+    for a full sync to pick it up.
+    """
+    company_id = get_company_id(company_name)
+    base = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/priceListHeaders"
+    )
+    if since:
+        url = f"{base}?$expand=priceListLines&$filter=lastModifiedDateTime gt {since}"
+    else:
+        url = f"{base}?$expand=priceListLines"
+    logger.info(f"fetch_price_list_headers_with_lines — company={company_name!r} since={since!r}")
     return _fetch_all_pages(url)
 
 
