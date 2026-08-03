@@ -303,6 +303,29 @@ def _fetch_v3_catalog_for_date(
     return merged
 
 
+def _probe_v3_date(company_id: str, on_date: str) -> str | None:
+    """Light probe: fetch up to 50 records for on_date and check if any are non-blocked.
+
+    Returns 'active' (has non-blocked records), 'blocked' (all blocked), or None
+    (BC returned an error or no records for this date — skip it).
+
+    Uses a single cheap request instead of the full 4-range parallel fetch so that
+    the fallback loop can cheaply scan many candidate dates without memory pressure.
+    """
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}"
+        f"/companies({company_id})/itemPrices"
+        f"?$filter=onDate eq {on_date}&$select=productNo,blocked&$top=50"
+    )
+    resp = _bc_request("get", url, headers=_auth_headers(), timeout=30)
+    if not resp.ok:
+        return None
+    records = resp.json().get("value", [])
+    if not records:
+        return None
+    return "active" if any(not r.get("blocked") for r in records) else "blocked"
+
+
 def fetch_v3_catalog(company_name: str, on_date: str | None = None, since: str | None = None) -> list:
     """Fetch the v3 item price catalog using four parallel productNo range requests.
 
@@ -310,9 +333,11 @@ def fetch_v3_catalog(company_name: str, on_date: str | None = None, since: str |
     independent OData cursors simultaneously. Results are merged and de-duplicated on
     productNo.
 
-    For full fetches (since=None): tries on_date first; if BC returns no active
-    (non-blocked) prices, falls back one day at a time up to 30 days to find the
-    nearest valid price date. This handles expired price list end dates gracefully.
+    For full fetches (since=None): probes each candidate date with a minimal single
+    request before committing to the full 4-range parallel fetch. Probe errors (4xx)
+    skip the date; full-fetch errors also skip and try the next date. This handles
+    expired price list end dates and transient BC range errors (e.g. 400 on M-S range
+    for a specific date) without aborting the entire fallback loop.
 
     For incremental fetches (since set): fetches only records modified after that
     timestamp on the given date — no date fallback (partial delta, not a full re-sync).
@@ -324,10 +349,26 @@ def fetch_v3_catalog(company_name: str, on_date: str | None = None, since: str |
         # Incremental: just fetch the delta for the given date, no fallback needed
         return _fetch_v3_catalog_for_date(company_id, company_name, start_date.isoformat(), since=since)
 
-    # Full fetch: try today then fall back to find a date with active prices
+    # Full fetch: probe each date cheaply before committing to the full 4-range parallel fetch
     for days_back in range(31):
         effective_date = (start_date - datetime.timedelta(days=days_back)).isoformat()
-        records = _fetch_v3_catalog_for_date(company_id, company_name, effective_date)
+
+        probe = _probe_v3_date(company_id, effective_date)
+        if probe is None:
+            logger.warning(f"v3 catalog: date {effective_date!r} probe failed for {company_name!r} — skipping")
+            continue
+        if probe != "active":
+            continue  # all-blocked on this date, try the next one silently
+
+        try:
+            records = _fetch_v3_catalog_for_date(company_id, company_name, effective_date)
+        except Exception as e:
+            logger.warning(
+                f"v3 catalog: full fetch for {effective_date!r} failed ({e}) "
+                f"for {company_name!r} — skipping"
+            )
+            continue
+
         if any(not r.get("blocked") for r in records):
             if days_back > 0:
                 logger.info(
@@ -335,6 +376,11 @@ def fetch_v3_catalog(company_name: str, on_date: str | None = None, since: str |
                     f"using {effective_date!r} ({days_back}d back) — {len(records)} records for {company_name!r}"
                 )
             return records
+        # Probe said active but full fetch had no non-blocked (probe sample was all-blocked by chance)
+        logger.warning(
+            f"v3 catalog: probe said active but full fetch all-blocked on {effective_date!r} "
+            f"for {company_name!r} — trying earlier date"
+        )
 
     logger.warning(
         f"v3 catalog fetch: no active prices in 30-day window for {company_name!r} "
