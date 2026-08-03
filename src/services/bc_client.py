@@ -438,6 +438,35 @@ def fetch_v3_catalog(company_name: str, on_date: str | None = None, since: str |
 # v2 Price List Headers (Pag50320)
 # ---------------------------------------------------------------------------
 
+def fetch_item_ledger_entries(
+    company_name: str,
+    since_date: str | None = None,
+    limit: int = 5000,
+    offset: int = 0,
+) -> list:
+    """Fetch one page of item ledger entries from BC (Pag50339, v2 API).
+
+    Uses the AL page's custom limit/offset filter fields for explicit pagination
+    (same pattern as the v3 price catalog). Call repeatedly with increasing offset
+    until the returned list is shorter than limit.
+
+    since_date (YYYY-MM-DD): passed as modifiedFrom to restrict to records whose
+    SystemModifiedAt >= that date. Omit for a full fetch.
+    """
+    company_id = get_company_id(company_name)
+    filters = [f"limit eq {limit}", f"offset eq {offset}"]
+    if since_date:
+        filters.append(f"modifiedFrom eq {since_date}")
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/itemLedgerEntries"
+        f"?$filter={' and '.join(filters)}"
+    )
+    resp = _bc_request("get", url, headers=_auth_headers(), timeout=120)
+    resp.raise_for_status()
+    return resp.json().get("value", [])
+
+
 def fetch_price_list_headers(company_name: str, odata_filter: str | None = None) -> list:
     """Fetch all priceListHeaders from the v2.0 RGMC custom API (Pag50320).
 

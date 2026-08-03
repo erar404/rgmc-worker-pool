@@ -1,15 +1,18 @@
 """Firestore task-status store for async order processing."""
 import logging
-import time
 
 from google.cloud import firestore
 
-from src.config import GCP_PROJECT_ID
+from src.config import GCP_ENV, GCP_PROJECT_ID
 
 logger = logging.getLogger("task_service")
 
 _db: firestore.Client | None = None
-_COLLECTION = "order_tasks"
+
+
+def _collection() -> str:
+    env = (GCP_ENV or "staging").lower().replace(" ", "_")
+    return f"order_tasks_{env}"
 
 
 def _firestore() -> firestore.Client:
@@ -20,9 +23,9 @@ def _firestore() -> firestore.Client:
 
 
 def get_task(task_id: str) -> dict | None:
-    doc = _firestore().collection(_COLLECTION).document(task_id).get()
+    doc = _firestore().collection(_collection()).document(task_id).get()
     return doc.to_dict() if doc.exists else None
 
 
 def update_task(task_id: str, **fields):
-    _firestore().collection(_COLLECTION).document(task_id).update(fields)
+    _firestore().collection(_collection()).document(task_id).set(fields, merge=True)

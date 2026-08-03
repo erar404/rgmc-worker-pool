@@ -30,6 +30,7 @@ from google.cloud import pubsub_v1
 
 from src import config
 from src.services.bc_client import (
+    fetch_item_ledger_entries,
     fetch_price_list_headers,
     fetch_price_list_headers_with_lines,
     fetch_v3_catalog,
@@ -37,8 +38,10 @@ from src.services.bc_client import (
 from src.services.gcs_catalog import save_catalog
 from src.services.price_firestore_service import (
     get_sync_state,
+    ile_exists_in_firestore,
     prices_exist_in_firestore,
     set_sync_state,
+    sync_item_ledger_entries_to_firestore,
     sync_price_list_headers_to_firestore,
     sync_price_list_items_to_firestore,
     sync_prices_to_firestore,
@@ -51,6 +54,47 @@ logger = logging.getLogger("worker.sync")
 def _now_utc() -> str:
     """Return current UTC time as 'YYYY-MM-DDTHH:MM:SSZ' — used as the sync state timestamp."""
     return datetime.datetime.utcnow().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+_ILE_PAGE_SIZE = 5000
+
+
+def _sync_item_ledger_entries(company: str, since_date: str | None = None) -> int:
+    """Fetch all item ledger entries for one company (with limit/offset paging) and write to Firestore.
+
+    since_date (YYYY-MM-DD): only fetch records modified on or after this date.
+    Omit for a full fetch. Returns total records written.
+    """
+    sync_start = _now_utc()
+
+    # If we have a stored sync timestamp but the collection is empty, force a full re-fetch.
+    if since_date is not None and not ile_exists_in_firestore(company):
+        logger.info(
+            f"[{company}] ILE collection empty despite stored sync state "
+            f"(since={since_date!r}) — forcing full fetch"
+        )
+        since_date = None
+
+    total = 0
+    offset = 0
+    while True:
+        records = fetch_item_ledger_entries(company, since_date=since_date, limit=_ILE_PAGE_SIZE, offset=offset)
+        if not records:
+            break
+        written = sync_item_ledger_entries_to_firestore(records, company)
+        total += written
+        logger.info(
+            f"[{company}] ILE page offset={offset}: {len(records)} fetched, {written} written "
+            f"(since={since_date!r})"
+        )
+        if len(records) < _ILE_PAGE_SIZE:
+            break
+        offset += _ILE_PAGE_SIZE
+
+    if total > 0:
+        set_sync_state(company, "item_ledger_entries", sync_start)
+    logger.info(f"[{company}] ILE sync complete: {total} records written (since={since_date!r})")
+    return total
 
 
 def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
@@ -121,6 +165,14 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
         )
     except Exception as e:
         logger.error(f"[{company}] item prices failed — {e}")
+
+    try:
+        since_ile = get_sync_state(company, "item_ledger_entries")
+        # Convert stored UTC datetime string to date string for BC's modifiedFrom filter.
+        since_date_ile = since_ile[:10] if since_ile else None
+        _sync_item_ledger_entries(company, since_date=since_date_ile)
+    except Exception as e:
+        logger.error(f"[{company}] item ledger entries failed — {e}")
 
     logger.info(f"[{company}] sync complete")
 
@@ -203,6 +255,16 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                 title=f"Price List Items Sync Complete — {company}",
                 detail=f"Company: {company}\n{total} items written to Firestore",
                 context=f"price_list_code={price_list_code or 'all'} since={effective_since or 'full'}",
+            )
+
+        elif msg_type == "sync-item-ledger-entries":
+            company = data.get("company") or config.BC_COMPANY
+            since_date = data.get("since_date")  # YYYY-MM-DD, optional
+            total = _sync_item_ledger_entries(company, since_date=since_date)
+            notify_success(
+                title=f"Item Ledger Entries Sync Complete — {company}",
+                detail=f"Company: {company}\n{total} records written to Firestore",
+                context=f"since_date={since_date or 'full'}",
             )
 
         elif msg_type == "ping":

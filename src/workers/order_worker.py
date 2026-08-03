@@ -57,9 +57,9 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
     _create = v2_create_record if api_version == "v2" else v1_create_record
     _delete = v2_delete_record if api_version == "v2" else v1_delete_record
 
-    update_task(task_id, status="processing")
-
     try:
+        update_task(task_id, status="processing")
+
         http_status, resp_data = _create(_TABLE, header, company)
         if http_status not in (200, 201):
             raise ValueError(f"Order header failed: BC returned {http_status}: {resp_data}")

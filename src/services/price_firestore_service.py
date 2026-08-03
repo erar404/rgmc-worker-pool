@@ -251,6 +251,57 @@ def sync_price_list_items_to_firestore(lines: list, company: str, price_list_cod
     return written
 
 
+def _ile_collection() -> str:
+    return f"item_ledger_entries_{_env_slug()}"
+
+
+def ile_exists_in_firestore(company: str) -> bool:
+    """Return True if at least one item ledger entry exists for this company."""
+    db = _firestore()
+    docs = db.collection(_ile_collection()).where("company", "==", company).limit(1).stream()
+    return any(True for _ in docs)
+
+
+def sync_item_ledger_entries_to_firestore(records: list, company: str) -> int:
+    """Upsert item ledger entry records into Firestore. Returns count written.
+
+    Document ID: {company}_{entryNo} — entryNo is the integer primary key of
+    Item Ledger Entry (table 32), unique within a company.
+    """
+    collection = _ile_collection()
+    db = _firestore()
+    synced_at = time.time()
+    written = 0
+    batch = db.batch()
+    count_in_batch = 0
+
+    for record in records:
+        entry_no = record.get("entryNo")
+        if entry_no is None:
+            continue
+        ref = db.collection(collection).document(f"{company}_{entry_no}")
+        batch.set(ref, {
+            **record,
+            "company": company,
+            "syncedAt": synced_at,
+            "env": GCP_ENV,
+        })
+        count_in_batch += 1
+        written += 1
+        if count_in_batch >= _BATCH_SIZE:
+            batch.commit()
+            batch = db.batch()
+            count_in_batch = 0
+
+    if count_in_batch > 0:
+        batch.commit()
+
+    logger.info(
+        f"Synced {written} item ledger entries → {collection!r} (company={company!r})"
+    )
+    return written
+
+
 def get_price_list_items_from_firestore(
     company: str,
     price_list_code: str | None = None,
