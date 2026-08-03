@@ -245,11 +245,16 @@ def get_company_id(company_name: str) -> str:
 # v3 Item Price Catalog (Pag50318)
 # ---------------------------------------------------------------------------
 
+_V3_PAGE_SIZE = 5000  # records per BC offset-pagination page
+
+
 def _build_v3_url(
     company_id: str,
     on_date: str | None,
     odata_filter: str | None = None,
     since: str | None = None,
+    bc_limit: int | None = None,
+    bc_offset: int | None = None,
 ) -> str:
     filters = []
     if on_date:
@@ -258,6 +263,10 @@ def _build_v3_url(
         filters.append(f"lastModifiedDateTime gt {since}")
     if odata_filter:
         filters.append(odata_filter)
+    if bc_limit is not None:
+        filters.append(f"limit eq {bc_limit}")
+    if bc_offset is not None:
+        filters.append(f"offset eq {bc_offset}")
     params = []
     if filters:
         params.append(f"$filter={' and '.join(filters)}")
@@ -266,10 +275,40 @@ def _build_v3_url(
     return url + "?" + "&".join(params)
 
 
+def _fetch_range_with_offset_pagination(
+    company_id: str, on_date: str, odata_filter: str | None, since: str | None
+) -> list:
+    """Fetch all records for a single productNo range using explicit limit/offset pagination.
+
+    Uses BC's native `limit eq` and `offset eq` OData filter params instead of
+    following @odata.nextLink. This avoids the `aid=FIN` broken nextLink issue where
+    BC returns 400/409 on the second page of certain range+date combos.
+    """
+    all_records: list = []
+    offset = 0
+    while True:
+        url = _build_v3_url(
+            company_id, on_date, odata_filter, since=since,
+            bc_limit=_V3_PAGE_SIZE, bc_offset=offset,
+        )
+        resp = _bc_request("get", url, headers=_auth_headers(), timeout=120)
+        resp.raise_for_status()
+        records = resp.json().get("value", [])
+        all_records.extend(records)
+        if len(records) < _V3_PAGE_SIZE:
+            break  # last page
+        offset += _V3_PAGE_SIZE
+    return all_records
+
+
 def _fetch_v3_catalog_for_date(
     company_id: str, company_name: str, effective_date: str, since: str | None = None
 ) -> list:
-    """Run the 4-range parallel fetch for a specific effective_date."""
+    """Run the 4-range parallel fetch for a specific effective_date.
+
+    Uses explicit limit/offset pagination instead of @odata.nextLink to avoid the
+    aid=FIN broken nextLink issue on BC's Pag50318 for certain range+date combinations.
+    """
     ranges = [("", "G"), ("G", "M"), ("M", "S"), ("S", "")]
 
     def _fetch_range(low: str, high: str) -> list:
@@ -279,8 +318,7 @@ def _fetch_v3_catalog_for_date(
         if high:
             parts.append(f"productNo lt '{high}'")
         odata_filter = " and ".join(parts) if parts else None
-        url = _build_v3_url(company_id, effective_date, odata_filter, since=since)
-        return _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
+        return _fetch_range_with_offset_pagination(company_id, effective_date, odata_filter, since)
 
     logger.info(
         f"v3 catalog parallel fetch (4 ranges) — company={company_name!r} "
