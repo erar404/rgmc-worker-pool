@@ -241,6 +241,11 @@ def get_company_id(company_name: str) -> str:
     raise ValueError(f"Company '{name}' not found in Business Central")
 
 
+def get_all_company_names() -> list[str]:
+    """Return the names of all companies registered in Business Central."""
+    return [c["name"] for c in _fetch_companies() if c.get("name")]
+
+
 # ---------------------------------------------------------------------------
 # v3 Item Price Catalog (Pag50318)
 # ---------------------------------------------------------------------------

@@ -42,6 +42,7 @@ from src.services.bc_client import (
     fetch_price_list_headers,
     fetch_price_list_headers_with_lines,
     fetch_v3_catalog,
+    get_all_company_names,
 )
 from src.services.gcs_catalog import save_catalog
 from src.services.price_firestore_service import (
@@ -62,6 +63,26 @@ logger = logging.getLogger("worker.sync")
 def _now_utc() -> str:
     """Return current UTC time as 'YYYY-MM-DDTHH:MM:SSZ' — used as the sync state timestamp."""
     return datetime.datetime.utcnow().replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _get_companies(company: str) -> list[str]:
+    """Expand company to a list of real BC company names.
+
+    If company is "ALL" (or empty), returns companies from BC_COMPANIES env var
+    (comma-separated), filtering out "ALL" entries. If BC_COMPANIES is not set or
+    still resolves to nothing, falls back to fetching the full list from BC.
+    """
+    if company.upper() != "ALL":
+        return [company]
+    env_companies = [
+        c.strip()
+        for c in (config.BC_COMPANIES or config.BC_COMPANY or "").split(",")
+        if c.strip() and c.strip().upper() != "ALL"
+    ]
+    if env_companies:
+        return env_companies
+    logger.info("BC_COMPANIES not set or contains only 'ALL' — fetching company list from BC")
+    return get_all_company_names()
 
 
 _ILE_PAGE_SIZE = 5000
@@ -199,11 +220,11 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
 
     try:
         if msg_type == "routine-sync":
-            companies = [
-                c.strip()
-                for c in (config.BC_COMPANIES or config.BC_COMPANY or "").split(",")
-                if c.strip()
-            ]
+            # Split BC_COMPANIES/BC_COMPANY; filter out "ALL" sentinels; fall back to BC API.
+            raw = [c.strip() for c in (config.BC_COMPANIES or config.BC_COMPANY or "").split(",") if c.strip()]
+            companies = [c for c in raw if c.upper() != "ALL"]
+            if not companies:
+                companies = get_all_company_names()
             for company in companies:
                 _sync_company(company, on_date, page_size)
             notify_success(
@@ -266,12 +287,15 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             )
 
         elif msg_type == "sync-item-ledger-entries":
-            company = data.get("company") or config.BC_COMPANY
+            company = data.get("company") or "ALL"
             since_date = data.get("since_date")  # YYYY-MM-DD, optional
-            total = _sync_item_ledger_entries(company, since_date=since_date)
+            companies = _get_companies(company)
+            total = 0
+            for c in companies:
+                total += _sync_item_ledger_entries(c, since_date=since_date)
             notify_success(
                 title=f"Item Ledger Entries Sync Complete — {company}",
-                detail=f"Company: {company}\n{total} records written to Firestore",
+                detail=f"Companies: {', '.join(companies)}\n{total} records written to Firestore",
                 context=f"since_date={since_date or 'full'}",
             )
 
