@@ -4,23 +4,31 @@ Subscribes to PUBSUB_SYNC_SUBSCRIPTION and dispatches based on the "type" field.
 
 Message formats (JSON):
 
-  Routine sync — all companies:
+  Routine sync — all companies (price list headers + item prices + item ledger entries):
     { "type": "routine-sync", "on_date": "YYYY-MM-DD" }
 
-  Single company item prices:
+  Single company item prices (also syncs price list headers + item ledger entries):
     { "type": "sync-item-prices", "company": "RGMC", "on_date": "YYYY-MM-DD", "page_size": 500 }
 
-  Single company price list headers:
+  Single company price list headers only:
     { "type": "sync-price-list-headers", "company": "RGMC" }
 
   Single company price list items (omit price_list_code to sync all codes):
     { "type": "sync-price-list-items", "company": "RGMC", "price_list_code": "PLH001" }
+
+  Single company item ledger entries only:
+    { "type": "sync-item-ledger-entries", "company": "RGMC", "since_date": "YYYY-MM-DD" }
 
   Connectivity test (bc-api → worker pool):
     { "type": "ping", "sent_at": "ISO8601", "sent_by": "bc-api", "note": "optional" }
 
 Cloud Scheduler publishes { "type": "routine-sync" } to the rgmc-sync topic on a cron schedule.
 The main API can publish any of the above to trigger targeted syncs or test connectivity.
+
+Sync state is persisted to sync_state_{env} Firestore collection, keyed by
+{company}_{collection_type} (e.g. "RGMC_item_ledger_entries"). Incremental syncs
+use the stored lastSyncAt timestamp as a modifiedFrom filter. Missing collection →
+forced full fetch even when a state record exists.
 """
 import datetime
 import json
