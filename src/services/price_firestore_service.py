@@ -70,6 +70,13 @@ def set_sync_state(company: str, collection_type: str, timestamp: str) -> None:
     })
 
 
+def prices_exist_in_firestore(company: str) -> bool:
+    """Return True if at least one item price record exists for this company."""
+    db = _firestore()
+    docs = db.collection(_prices_collection()).where("company", "==", company).limit(1).stream()
+    return any(True for _ in docs)
+
+
 def get_prices_from_firestore(
     company: str,
     family_code: str | None = None,

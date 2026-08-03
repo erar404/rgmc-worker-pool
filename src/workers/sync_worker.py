@@ -37,6 +37,7 @@ from src.services.bc_client import (
 from src.services.gcs_catalog import save_catalog
 from src.services.price_firestore_service import (
     get_sync_state,
+    prices_exist_in_firestore,
     set_sync_state,
     sync_price_list_headers_to_firestore,
     sync_price_list_items_to_firestore,
@@ -91,6 +92,15 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
 
     try:
         since_prices = get_sync_state(company, "item_prices")
+        # If the collection is empty despite a stored sync timestamp, the previous sync
+        # completed (setting the state) but Firestore writes failed or were lost.
+        # Force a full fetch so we actually populate the collection.
+        if since_prices is not None and not prices_exist_in_firestore(company):
+            logger.info(
+                f"[{company}] item_prices collection empty despite stored sync state "
+                f"(since={since_prices!r}) — forcing full fetch"
+            )
+            since_prices = None
         records = fetch_v3_catalog(company, on_date, since=since_prices)
         # Only save a full GCS snapshot on full-fetch runs; incremental results are partial.
         if since_prices is None:
