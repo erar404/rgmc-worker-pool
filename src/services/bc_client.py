@@ -304,12 +304,19 @@ def _fetch_range_with_offset_pagination(
 def _fetch_v3_catalog_for_date(
     company_id: str, company_name: str, effective_date: str, since: str | None = None
 ) -> list:
-    """Run the 4-range parallel fetch for a specific effective_date.
+    """Run the per-letter parallel fetch for a specific effective_date.
+
+    Uses 27 single-letter productNo ranges (plus a catch-all for non-alpha product
+    codes) instead of 4 broad ranges. Each letter range has ~10k records → 2 pages of
+    5000 → completes in ~20s, well within BC's Pag50318 temp-buffer TTL (~3 min).
+    The previous 4-range approach produced M-S ranges with >55k records which caused
+    BC to expire the temp buffer mid-pagination and return 409.
 
     Uses explicit limit/offset pagination instead of @odata.nextLink to avoid the
-    aid=FIN broken nextLink issue on BC's Pag50318 for certain range+date combinations.
+    aid=FIN broken nextLink issue on BC's Pag50318 for historical dates.
     """
-    ranges = [("", "G"), ("G", "M"), ("M", "S"), ("S", "")]
+    # 27 ranges: non-alpha (digits/specials before 'A'), one per letter A-Z, plus Z+
+    ranges = [("", "A")] + [(chr(i), chr(i + 1)) for i in range(ord("A"), ord("Z"))] + [("Z", "")]
 
     def _fetch_range(low: str, high: str) -> list:
         parts = []
