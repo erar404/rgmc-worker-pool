@@ -19,6 +19,10 @@ BC_COMPANIES = os.getenv("BC_COMPANIES", "")
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
 GCP_ENV = os.getenv("GCP_ENV", "Staging")      # "Production" or "Staging"
 
+# BigQuery
+BIGQUERY_PROJECT_ID = os.getenv("BIGQUERY_PROJECT_ID", "")
+BIGQUERY_DATASET_ID = os.getenv("BIGQUERY_DATASET_ID", "")
+
 # Cloud Storage
 GCS_CATALOG_BUCKET = os.getenv("GCS_CATALOG_BUCKET", "")
 

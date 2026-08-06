@@ -16,8 +16,12 @@ Message formats (JSON):
   Single company price list items (omit price_list_code to sync all codes):
     { "type": "sync-price-list-items", "company": "RGMC", "price_list_code": "PLH001" }
 
-  Single company item ledger entries only:
+  Single company item ledger entries only (Firestore):
     { "type": "sync-item-ledger-entries", "company": "RGMC", "since_date": "YYYY-MM-DD" }
+
+  Item ledger entries → BigQuery (uses BC pagination endpoint directly):
+    { "type": "bq-sync-ile", "company": "RGMC", "since_date": "YYYY-MM-DD" }
+    Omit since_date for a full sync. "ALL" expands to all configured companies.
 
   Connectivity test (bc-api → worker pool):
     { "type": "ping", "sent_at": "ISO8601", "sent_by": "bc-api", "note": "optional" }
@@ -55,6 +59,7 @@ from src.services.price_firestore_service import (
     sync_price_list_items_to_firestore,
     sync_prices_to_firestore,
 )
+from src.services.bigquery_ile_service import upsert_ile_to_bigquery
 from src.services.send_mail import notify_error, notify_success
 
 logger = logging.getLogger("worker.sync")
@@ -123,6 +128,46 @@ def _sync_item_ledger_entries(company: str, since_date: str | None = None) -> in
     if total > 0:
         set_sync_state(company, "item_ledger_entries", sync_start)
     logger.info(f"[{company}] ILE sync complete: {total} records written (since={since_date!r})")
+    return total
+
+
+_BQ_ILE_PAGE_SIZE = 5000
+_BQ_ILE_SYNC_STATE_KEY = "ile_bigquery"
+
+
+def _sync_ile_to_bigquery(company: str, since_date: str | None = None) -> int:
+    """Fetch all ILE records for one company from BC and stream them into BigQuery.
+
+    Uses the same limit/offset pagination as the Firestore ILE sync.
+    since_date (YYYY-MM-DD): pass to fetch only records modified on/after this date.
+    Sync state is persisted under key 'ile_bigquery' (separate from Firestore ILE state).
+    Returns total rows inserted into BigQuery.
+    """
+    sync_start = _now_utc()
+    total = 0
+    offset = 0
+    while True:
+        records = fetch_item_ledger_entries(
+            company,
+            since_date=since_date,
+            limit=_BQ_ILE_PAGE_SIZE,
+            offset=offset,
+        )
+        if not records:
+            break
+        inserted = upsert_ile_to_bigquery(records, company)
+        total += inserted
+        logger.info(
+            f"[{company}] BQ ILE page offset={offset}: {len(records)} fetched, "
+            f"{inserted} inserted (since={since_date!r})"
+        )
+        if len(records) < _BQ_ILE_PAGE_SIZE:
+            break
+        offset += _BQ_ILE_PAGE_SIZE
+
+    if total > 0:
+        set_sync_state(company, _BQ_ILE_SYNC_STATE_KEY, sync_start)
+    logger.info(f"[{company}] BQ ILE sync complete: {total} rows inserted (since={since_date!r})")
     return total
 
 
@@ -297,6 +342,24 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                 title=f"Item Ledger Entries Sync Complete — {company}",
                 detail=f"Companies: {', '.join(companies)}\n{total} records written to Firestore",
                 context=f"since_date={since_date or 'full'}",
+            )
+
+        elif msg_type == "bq-sync-ile":
+            company = data.get("company") or "ALL"
+            since_date = data.get("since_date")  # YYYY-MM-DD, optional
+            companies = _get_companies(company)
+            total = 0
+            for c in companies:
+                # Fall back to stored BQ ILE sync state when no explicit since_date.
+                effective_since = since_date
+                if effective_since is None:
+                    stored = get_sync_state(c, _BQ_ILE_SYNC_STATE_KEY)
+                    effective_since = stored[:10] if stored else None
+                total += _sync_ile_to_bigquery(c, since_date=effective_since)
+            notify_success(
+                title=f"BQ ILE Sync Complete — {company}",
+                detail=f"Companies: {', '.join(companies)}\n{total} rows inserted into BigQuery",
+                context=f"since_date={since_date or 'incremental/full'}",
             )
 
         elif msg_type == "ping":
