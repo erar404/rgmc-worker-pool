@@ -59,7 +59,7 @@ from src.services.price_firestore_service import (
     sync_price_list_items_to_firestore,
     sync_prices_to_firestore,
 )
-from src.services.bigquery_ile_service import upsert_ile_to_bigquery
+from src.services.bigquery_ile_service import get_max_last_modified, upsert_ile_to_bigquery
 from src.services.send_mail import notify_error, notify_success
 
 logger = logging.getLogger("worker.sync")
@@ -132,18 +132,20 @@ def _sync_item_ledger_entries(company: str, since_date: str | None = None) -> in
 
 
 _BQ_ILE_PAGE_SIZE = 5000
-_BQ_ILE_SYNC_STATE_KEY = "ile_bigquery"
 
 
 def _sync_ile_to_bigquery(company: str, since_date: str | None = None) -> int:
     """Fetch all ILE records for one company from BC and stream them into BigQuery.
 
-    Uses the same limit/offset pagination as the Firestore ILE sync.
-    since_date (YYYY-MM-DD): pass to fetch only records modified on/after this date.
-    Sync state is persisted under key 'ile_bigquery' (separate from Firestore ILE state).
+    When since_date is None, queries the BQ table for MAX(lastModifiedDateTime) of
+    the company's existing rows and uses that date as the incremental watermark.
+    Pass since_date explicitly (YYYY-MM-DD) to override, or pass "" to force a full fetch.
     Returns total rows inserted into BigQuery.
     """
-    sync_start = _now_utc()
+    if since_date is None:
+        since_date = get_max_last_modified(company)
+        logger.info(f"[{company}] BQ watermark from table: {since_date!r}")
+
     total = 0
     offset = 0
     while True:
@@ -165,8 +167,6 @@ def _sync_ile_to_bigquery(company: str, since_date: str | None = None) -> int:
             break
         offset += _BQ_ILE_PAGE_SIZE
 
-    if total > 0:
-        set_sync_state(company, _BQ_ILE_SYNC_STATE_KEY, sync_start)
     logger.info(f"[{company}] BQ ILE sync complete: {total} rows inserted (since={since_date!r})")
     return total
 
@@ -346,21 +346,45 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
 
         elif msg_type == "bq-sync-ile":
             company = data.get("company") or "ALL"
-            since_date = data.get("since_date")  # YYYY-MM-DD, optional
+            # since_date (YYYY-MM-DD) overrides the BQ watermark; omit for auto-incremental.
+            # Pass "" to force a full re-fetch regardless of existing BQ data.
+            since_date = data.get("since_date")
+            triggered_at = data.get("triggered_at", "")
             companies = _get_companies(company)
-            total = 0
+            inserted_by_company: dict[str, int] = {}
+            errors_by_company: dict[str, str] = {}
             for c in companies:
-                # Fall back to stored BQ ILE sync state when no explicit since_date.
-                effective_since = since_date
-                if effective_since is None:
-                    stored = get_sync_state(c, _BQ_ILE_SYNC_STATE_KEY)
-                    effective_since = stored[:10] if stored else None
-                total += _sync_ile_to_bigquery(c, since_date=effective_since)
-            notify_success(
-                title=f"BQ ILE Sync Complete — {company}",
-                detail=f"Companies: {', '.join(companies)}\n{total} rows inserted into BigQuery",
-                context=f"since_date={since_date or 'incremental/full'}",
+                try:
+                    inserted_by_company[c] = _sync_ile_to_bigquery(c, since_date=since_date)
+                except Exception as exc:
+                    logger.error(f"[{c}] BQ ILE sync failed: {exc}")
+                    errors_by_company[c] = str(exc)
+
+            context = (
+                f"since_date={since_date or 'auto (BQ watermark)'}"
+                + (f" | triggered_at={triggered_at}" if triggered_at else "")
             )
+
+            if errors_by_company:
+                error_lines = [f"{c}: {err}" for c, err in errors_by_company.items()]
+                success_lines = [f"{c}: {n} rows inserted" for c, n in inserted_by_company.items()]
+                detail = "\n".join(
+                    (["=== FAILED ==="] + error_lines)
+                    + (["\n=== SUCCEEDED ==="] + success_lines if success_lines else [])
+                )
+                notify_error(
+                    title=f"BQ ILE Sync {'Partial Failure' if inserted_by_company else 'Failed'} — {company}",
+                    detail=detail,
+                    context=context,
+                )
+            else:
+                total = sum(inserted_by_company.values())
+                lines = [f"{c}: {n} rows inserted" for c, n in inserted_by_company.items()]
+                notify_success(
+                    title=f"BQ ILE Sync Complete — {company}",
+                    detail=f"Total rows inserted: {total}\n\n" + "\n".join(lines),
+                    context=context,
+                )
 
         elif msg_type == "ping":
             sent_at = data.get("sent_at", "unknown")

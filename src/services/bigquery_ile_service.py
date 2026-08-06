@@ -25,7 +25,16 @@ from src import config
 logger = logging.getLogger("bigquery_ile_service")
 
 _client: bigquery.Client | None = None
-_TABLE_NAME = "item_ledger_entries"
+_TABLE_NAME = "itemLedgerEntries"
+
+_DATASET_MAP: dict[str, str] = {
+    "USGI":  "bc_usgi_raw",
+    "CGI":   "bc_covent_raw",
+    "KW1":   "bc_keywest_raw",
+    "LGAP":  "bc_lgap_raw",
+    "RGMC":  "bc_richfield_raw",
+    "SBIC":  "bc_sbic_raw",
+}
 
 _EXCLUDE_FIELDS = {
     "limit", "offset", "modifiedFrom", "modifiedTo",
@@ -121,14 +130,19 @@ def _bq() -> bigquery.Client:
     return _client
 
 
-def _table_id() -> str:
-    return f"{config.BIGQUERY_PROJECT_ID}.{config.BIGQUERY_DATASET_ID}.{_TABLE_NAME}"
+def _dataset_id(company: str) -> str | None:
+    """Return the BigQuery dataset ID for a given company code, or None if unmapped."""
+    return _DATASET_MAP.get(company)
 
 
-def ensure_table() -> None:
-    """Create the ILE BigQuery table if it does not already exist."""
+def _table_id(company: str) -> str:
+    return f"{config.BIGQUERY_PROJECT_ID}.{_dataset_id(company)}.{_TABLE_NAME}"
+
+
+def ensure_table(company: str) -> None:
+    """Create the ILE BigQuery table for the given company if it does not already exist."""
     client = _bq()
-    tid = _table_id()
+    tid = _table_id(company)
     try:
         client.get_table(tid)
         return
@@ -142,6 +156,34 @@ def ensure_table() -> None:
     table.clustering_fields = ["company", "entryType", "locationCode"]
     client.create_table(table, exists_ok=True)
     logger.info(f"Created BigQuery table {tid}")
+
+
+def get_max_last_modified(company: str) -> str | None:
+    """Return the date (YYYY-MM-DD) of the most recent lastModifiedDateTime in the BQ table
+    for the given company, or None if the table is empty, doesn't exist, or is unmapped.
+
+    Used by the sync worker to determine the incremental fetch window from BC.
+    """
+    if not config.BIGQUERY_PROJECT_ID or not _dataset_id(company):
+        return None
+    try:
+        tid = _table_id(company)
+        query = (
+            f"SELECT MAX(lastModifiedDateTime) AS max_ts "
+            f"FROM `{tid}` "
+            f"WHERE company = @company"
+        )
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("company", "STRING", company)]
+        )
+        rows = list(_bq().query(query, job_config=job_config).result())
+        if rows and rows[0].max_ts is not None:
+            # max_ts is a datetime object; return just the date portion for BC's modifiedFrom filter
+            return rows[0].max_ts.date().isoformat()
+        return None
+    except Exception as exc:
+        logger.warning(f"[{company}] could not query BQ max lastModifiedDateTime: {exc}")
+        return None
 
 
 def _clean(record: dict, bq_synced_at: str) -> dict:
@@ -168,13 +210,16 @@ def upsert_ile_to_bigquery(records: list[dict], company: str) -> int:
     """
     if not records:
         return 0
-    if not config.BIGQUERY_PROJECT_ID or not config.BIGQUERY_DATASET_ID:
-        logger.warning("BIGQUERY_PROJECT_ID or BIGQUERY_DATASET_ID not configured — skipping BQ write")
+    if not config.BIGQUERY_PROJECT_ID:
+        logger.warning("BIGQUERY_PROJECT_ID not configured — skipping BQ write")
+        return 0
+    if not _dataset_id(company):
+        logger.warning(f"[{company}] no BigQuery dataset mapped — skipping BQ write")
         return 0
 
-    ensure_table()
+    ensure_table(company)
     client = _bq()
-    tid = _table_id()
+    tid = _table_id(company)
     bq_synced_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     rows = [_clean(r, bq_synced_at) for r in records]
