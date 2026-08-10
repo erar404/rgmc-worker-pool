@@ -1,13 +1,17 @@
 """BigQuery writer for Item Ledger Entry records fetched from Business Central.
 
-Table: {BIGQUERY_PROJECT_ID}.{BIGQUERY_DATASET_ID}.item_ledger_entries
+Table: {BIGQUERY_PROJECT_ID}.{BIGQUERY_DATASET_ID}.itemLedgerEntries
   - Partitioned by postingDate (DAY)
   - Clustered by company, entryType, locationCode
 
-Writes use streaming inserts with row_id = '{company}_{entryNo}' for best-effort
-deduplication within the streaming buffer (~1 minute window). Callers should treat
-the table as append-only and use DISTINCT / QUALIFY in queries, or run a periodic
-dedup job, if strict uniqueness is required.
+Writes use a load-to-staging + MERGE pattern keyed on (company, entryNo).
+Each call loads rows into a temporary staging table, runs a MERGE into the main
+table (UPDATE on match, INSERT on new), then drops the staging table. This
+guarantees true upsert semantics with no duplicate rows regardless of how many
+times the same entryNo is fetched from BC.
+
+BC's modifiedFrom filter is a Date type — it always re-fetches the entire
+watermark day. MERGE handles the resulting overlap without producing duplicates.
 
 Fields excluded from BC records before writing:
   limit, offset, modifiedFrom, modifiedTo, modifiedMonth, modifiedYear,
@@ -15,7 +19,6 @@ Fields excluded from BC records before writing:
   env, syncedAt     — Firestore metadata, replaced with bq_synced_at
   @odata.etag       — OData internal field
 """
-import json
 import logging
 import time
 import uuid
@@ -224,37 +227,81 @@ def _clean(record: dict, bq_synced_at: str) -> dict:
     row["bq_synced_at"] = bq_synced_at
     row["_airbyte_raw_id"] = str(uuid.uuid4())
     row["_airbyte_extracted_at"] = bq_synced_at
-    row["_airbyte_meta"] = json.dumps({"changes": [], "sync_id": 0})
+    row["_airbyte_meta"] = {"changes": [], "sync_id": 0}
     row["_airbyte_generation_id"] = 0
     return row
 
 
-def upsert_ile_to_bigquery(records: list[dict], company: str) -> int:
-    """Stream ILE records into BigQuery. Returns the count of rows inserted.
+def _merge_sql(target: str, staging: str, all_fields: list[str]) -> str:
+    """Return the MERGE DML that upserts staging rows into the target table."""
+    update_fields = [f for f in all_fields if f != "_airbyte_raw_id"]
+    set_clause = ",\n        ".join(f"T.`{f}` = S.`{f}`" for f in update_fields)
+    col_list = ", ".join(f"`{f}`" for f in all_fields)
+    val_list = ", ".join(f"S.`{f}`" for f in all_fields)
+    return f"""
+MERGE `{target}` AS T
+USING `{staging}` AS S
+ON T.company = S.company AND T.entryNo = S.entryNo
+WHEN MATCHED THEN UPDATE SET
+        {set_clause}
+WHEN NOT MATCHED THEN INSERT ({col_list})
+VALUES ({val_list})
+"""
 
-    row_id is set to '{company}_{entryNo}' for best-effort deduplication within
-    the streaming buffer. The table is append-only; use QUALIFY ROW_NUMBER() or
-    a scheduled dedup query for strict uniqueness over historical data.
+
+def upsert_ile_to_bigquery(records: list[dict], company: str) -> int:
+    """Upsert ILE records into BigQuery via load-to-staging + MERGE.
+
+    Keyed on (company, entryNo). Existing rows are updated; new rows are
+    inserted. The staging table is deleted in a finally block regardless of
+    outcome. Returns the count of source rows processed (not BQ merge rows).
     """
     if not records:
         return 0
     if not config.BIGQUERY_PROJECT_ID:
         logger.warning("BIGQUERY_PROJECT_ID not configured — skipping BQ write")
         return 0
-    if not _dataset_id(company):
+    dataset = _dataset_id(company)
+    if not dataset:
         logger.warning(f"[{company}] no BigQuery dataset mapped — skipping BQ write")
         return 0
 
-    ensure_table(company)
     client = _bq()
     tid = _table_id(company)
     bq_synced_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    rows = [_clean(r, bq_synced_at) for r in records]
-    row_ids = [f"{company}_{r.get('entryNo', i)}" for i, r in enumerate(rows)]
-
-    errors = client.insert_rows_json(tid, rows, row_ids=row_ids)
-    if errors:
-        logger.error(f"[{company}] BigQuery streaming insert errors (first 3): {errors[:3]}")
+    rows = [_clean(r, bq_synced_at) for r in records if r.get("entryNo") is not None]
+    if not rows:
+        logger.warning(f"[{company}] all records missing entryNo — skipping BQ write")
         return 0
-    return len(rows)
+
+    stg_id = f"{config.BIGQUERY_PROJECT_ID}.{dataset}.itemLedgerEntries_stg_{uuid.uuid4().hex[:12]}"
+    stg_ref = bigquery.TableReference.from_string(stg_id)
+
+    try:
+        job_config = bigquery.LoadJobConfig(
+            schema=_SCHEMA,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        )
+        load_job = client.load_table_from_json(rows, stg_ref, job_config=job_config)
+        load_job.result()
+        if load_job.errors:
+            logger.error(f"[{company}] staging load errors: {load_job.errors[:3]}")
+            return 0
+
+        all_fields = [f.name for f in _SCHEMA]
+        sql = _merge_sql(tid, stg_id, all_fields)
+        merge_job = client.query(sql)
+        merge_job.result()
+        if merge_job.errors:
+            logger.error(f"[{company}] MERGE errors: {merge_job.errors[:3]}")
+            return 0
+
+        logger.info(f"[{company}] MERGE complete — {len(rows)} source rows processed into {tid}")
+        return len(rows)
+    finally:
+        try:
+            client.delete_table(stg_ref, not_found_ok=True)
+        except Exception as exc:
+            logger.warning(f"[{company}] could not delete staging table {stg_id}: {exc}")
