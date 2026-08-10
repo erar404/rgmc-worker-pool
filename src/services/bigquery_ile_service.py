@@ -146,11 +146,14 @@ def _table_id(company: str) -> str:
     return f"{config.BIGQUERY_PROJECT_ID}.{_dataset_id(company)}.{_TABLE_NAME}"
 
 
-def ensure_table(company: str) -> None:
+def ensure_table(company: str) -> list[str]:
     """Create the ILE BigQuery table for the given company if it does not already exist.
 
     If the table already exists, any columns present in _SCHEMA but missing from the
     current table schema are added via update_table (e.g. new Airbyte compat columns).
+
+    Returns the names of columns added to an existing table (empty list when the table
+    was just created or already had all columns).
     """
     client = _bq()
     tid = _table_id(company)
@@ -161,8 +164,10 @@ def ensure_table(company: str) -> None:
         if new_fields:
             table.schema = list(table.schema) + new_fields
             client.update_table(table, ["schema"])
-            logger.info(f"[{company}] Added {len(new_fields)} column(s) to {tid}: {[f.name for f in new_fields]}")
-        return
+            added = [f.name for f in new_fields]
+            logger.info(f"[{company}] Added {len(added)} column(s) to {tid}: {added}")
+            return added
+        return []
     except Exception:
         pass
     table = bigquery.Table(tid, schema=_SCHEMA)
@@ -173,6 +178,7 @@ def ensure_table(company: str) -> None:
     table.clustering_fields = ["company", "entryType", "locationCode"]
     client.create_table(table, exists_ok=True)
     logger.info(f"Created BigQuery table {tid}")
+    return []
 
 
 def get_max_last_modified(company: str) -> str | None:

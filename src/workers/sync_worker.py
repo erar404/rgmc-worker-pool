@@ -59,7 +59,7 @@ from src.services.price_firestore_service import (
     sync_price_list_items_to_firestore,
     sync_prices_to_firestore,
 )
-from src.services.bigquery_ile_service import get_max_last_modified, upsert_ile_to_bigquery
+from src.services.bigquery_ile_service import ensure_table, get_max_last_modified, upsert_ile_to_bigquery
 from src.services.send_mail import notify_error, notify_success
 
 logger = logging.getLogger("worker.sync")
@@ -134,14 +134,18 @@ def _sync_item_ledger_entries(company: str, since_date: str | None = None) -> in
 _BQ_ILE_PAGE_SIZE = 5000
 
 
-def _sync_ile_to_bigquery(company: str, since_date: str | None = None) -> int:
+def _sync_ile_to_bigquery(company: str, since_date: str | None = None) -> tuple[int, list[str]]:
     """Fetch all ILE records for one company from BC and stream them into BigQuery.
 
     When since_date is None, queries the BQ table for MAX(lastModifiedDateTime) of
     the company's existing rows and uses that date as the incremental watermark.
     Pass since_date explicitly (YYYY-MM-DD) to override, or pass "" to force a full fetch.
-    Returns total rows inserted into BigQuery.
+    Returns (total_rows_inserted, columns_added_to_table).
     """
+    # Patch schema first so any new columns exist before the first insert.
+    # Also captures which columns (if any) were added to an existing table.
+    cols_added = ensure_table(company)
+
     if since_date is None:
         since_date = get_max_last_modified(company)
         logger.info(f"[{company}] BQ watermark from table: {since_date!r}")
@@ -168,7 +172,7 @@ def _sync_ile_to_bigquery(company: str, since_date: str | None = None) -> int:
         offset += _BQ_ILE_PAGE_SIZE
 
     logger.info(f"[{company}] BQ ILE sync complete: {total} rows inserted (since={since_date!r})")
-    return total
+    return total, cols_added
 
 
 def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
@@ -352,10 +356,14 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             triggered_at = data.get("triggered_at", "")
             companies = _get_companies(company)
             inserted_by_company: dict[str, int] = {}
+            cols_added_by_company: dict[str, list[str]] = {}
             errors_by_company: dict[str, str] = {}
             for c in companies:
                 try:
-                    inserted_by_company[c] = _sync_ile_to_bigquery(c, since_date=since_date)
+                    rows, cols = _sync_ile_to_bigquery(c, since_date=since_date)
+                    inserted_by_company[c] = rows
+                    if cols:
+                        cols_added_by_company[c] = cols
                 except Exception as exc:
                     logger.error(f"[{c}] BQ ILE sync failed: {exc}")
                     errors_by_company[c] = str(exc)
@@ -365,9 +373,17 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                 + (f" | triggered_at={triggered_at}" if triggered_at else "")
             )
 
+            def _company_line(c: str) -> str:
+                rows = inserted_by_company.get(c, 0)
+                line = f"{c}: {rows} rows inserted"
+                if c in cols_added_by_company:
+                    names = ", ".join(cols_added_by_company[c])
+                    line += f" | {len(cols_added_by_company[c])} column(s) added to table ({names})"
+                return line
+
             if errors_by_company:
                 error_lines = [f"{c}: {err}" for c, err in errors_by_company.items()]
-                success_lines = [f"{c}: {n} rows inserted" for c, n in inserted_by_company.items()]
+                success_lines = [_company_line(c) for c in inserted_by_company]
                 detail = "\n".join(
                     (["=== FAILED ==="] + error_lines)
                     + (["\n=== SUCCEEDED ==="] + success_lines if success_lines else [])
@@ -379,7 +395,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                 )
             else:
                 total = sum(inserted_by_company.values())
-                lines = [f"{c}: {n} rows inserted" for c, n in inserted_by_company.items()]
+                lines = [_company_line(c) for c in inserted_by_company]
                 notify_success(
                     title=f"BQ ILE Sync Complete — {company}",
                     detail=f"Total rows inserted: {total}\n\n" + "\n".join(lines),
