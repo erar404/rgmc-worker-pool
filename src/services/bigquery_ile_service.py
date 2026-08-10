@@ -15,8 +15,10 @@ Fields excluded from BC records before writing:
   env, syncedAt     — Firestore metadata, replaced with bq_synced_at
   @odata.etag       — OData internal field
 """
+import json
 import logging
 import time
+import uuid
 
 from google.cloud import bigquery
 
@@ -120,6 +122,11 @@ _SCHEMA = [
     bigquery.SchemaField("company",                    "STRING",    mode="NULLABLE"),
     bigquery.SchemaField("companyName",                "STRING",    mode="NULLABLE"),
     bigquery.SchemaField("bq_synced_at",               "TIMESTAMP", mode="NULLABLE"),
+    # Airbyte compatibility columns
+    bigquery.SchemaField("_airbyte_raw_id",            "STRING",    mode="NULLABLE"),
+    bigquery.SchemaField("_airbyte_extracted_at",      "TIMESTAMP", mode="NULLABLE"),
+    bigquery.SchemaField("_airbyte_meta",              "JSON",      mode="NULLABLE"),
+    bigquery.SchemaField("_airbyte_generation_id",     "INTEGER",   mode="NULLABLE"),
 ]
 
 
@@ -140,11 +147,21 @@ def _table_id(company: str) -> str:
 
 
 def ensure_table(company: str) -> None:
-    """Create the ILE BigQuery table for the given company if it does not already exist."""
+    """Create the ILE BigQuery table for the given company if it does not already exist.
+
+    If the table already exists, any columns present in _SCHEMA but missing from the
+    current table schema are added via update_table (e.g. new Airbyte compat columns).
+    """
     client = _bq()
     tid = _table_id(company)
     try:
-        client.get_table(tid)
+        table = client.get_table(tid)
+        existing_names = {f.name for f in table.schema}
+        new_fields = [f for f in _SCHEMA if f.name not in existing_names]
+        if new_fields:
+            table.schema = list(table.schema) + new_fields
+            client.update_table(table, ["schema"])
+            logger.info(f"[{company}] Added {len(new_fields)} column(s) to {tid}: {[f.name for f in new_fields]}")
         return
     except Exception:
         pass
@@ -198,6 +215,10 @@ def _clean(record: dict, bq_synced_at: str) -> dict:
         if val.startswith(_NULL_TIMESTAMP_PREFIX):
             row[field] = None
     row["bq_synced_at"] = bq_synced_at
+    row["_airbyte_raw_id"] = str(uuid.uuid4())
+    row["_airbyte_extracted_at"] = bq_synced_at
+    row["_airbyte_meta"] = json.dumps({"changes": [], "sync_id": 0})
+    row["_airbyte_generation_id"] = 0
     return row
 
 
