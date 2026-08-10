@@ -157,6 +157,7 @@ def ensure_table(company: str) -> list[str]:
     """
     client = _bq()
     tid = _table_id(company)
+    from google.api_core.exceptions import NotFound
     try:
         table = client.get_table(tid)
         existing_names = {f.name for f in table.schema}
@@ -168,8 +169,8 @@ def ensure_table(company: str) -> list[str]:
             logger.info(f"[{company}] Added {len(added)} column(s) to {tid}: {added}")
             return added
         return []
-    except Exception:
-        pass
+    except NotFound:
+        pass  # Table does not exist yet — fall through to create it
     table = bigquery.Table(tid, schema=_SCHEMA)
     table.time_partitioning = bigquery.TimePartitioning(
         type_=bigquery.TimePartitioningType.DAY,
