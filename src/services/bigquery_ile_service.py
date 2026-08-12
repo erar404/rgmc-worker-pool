@@ -130,6 +130,16 @@ _SCHEMA = [
     bigquery.SchemaField("_airbyte_extracted_at",      "TIMESTAMP", mode="NULLABLE"),
     bigquery.SchemaField("_airbyte_meta",              "JSON",      mode="NULLABLE"),
     bigquery.SchemaField("_airbyte_generation_id",     "INTEGER",   mode="NULLABLE"),
+    # Legacy Airbyte / CDC compatibility columns (null-filled; not sourced from BC ILE)
+    bigquery.SchemaField("ab_id",                      "STRING",    mode="NULLABLE"),
+    bigquery.SchemaField("_ab_cdc_lsn",                "STRING",    mode="NULLABLE"),
+    bigquery.SchemaField("_ab_cdc_cursor",             "INTEGER",   mode="NULLABLE"),
+    bigquery.SchemaField("_ab_cdc_deleted_at",         "STRING",    mode="NULLABLE"),
+    bigquery.SchemaField("_ab_cdc_updated_at",         "STRING",    mode="NULLABLE"),
+    bigquery.SchemaField("_ab_cdc_event_serial_no",    "STRING",    mode="NULLABLE"),
+    # BC fields absent from ILE (Table 32) — always null
+    bigquery.SchemaField("Product_Group_Code",         "STRING",    mode="NULLABLE"),
+    bigquery.SchemaField("Cross_Reference_No_",        "STRING",    mode="NULLABLE"),
 ]
 
 
@@ -225,10 +235,21 @@ def _clean(record: dict, bq_synced_at: str) -> dict:
         if val.startswith(_NULL_TIMESTAMP_PREFIX):
             row[field] = None
     row["bq_synced_at"] = bq_synced_at
-    row["_airbyte_raw_id"] = str(uuid.uuid4())
+    airbyte_id = str(uuid.uuid4())
+    row["_airbyte_raw_id"] = airbyte_id
     row["_airbyte_extracted_at"] = bq_synced_at
     row["_airbyte_meta"] = {"changes": [], "sync_id": 0}
     row["_airbyte_generation_id"] = 0
+    # Legacy Airbyte / CDC columns — always null for full-refresh BC syncs
+    row["ab_id"] = airbyte_id
+    row["_ab_cdc_lsn"] = None
+    row["_ab_cdc_cursor"] = None
+    row["_ab_cdc_deleted_at"] = None
+    row["_ab_cdc_updated_at"] = None
+    row["_ab_cdc_event_serial_no"] = None
+    # BC ILE (Table 32) fields not exposed by AL page — always null
+    row["Product_Group_Code"] = None
+    row["Cross_Reference_No_"] = None
     return row
 
 
