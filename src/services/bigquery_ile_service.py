@@ -253,12 +253,32 @@ def _clean(record: dict, bq_synced_at: str) -> dict:
     return row
 
 
-def _merge_sql(target: str, staging: str, all_fields: list[str]) -> str:
-    """Return the MERGE DML that upserts staging rows into the target table."""
+def _merge_sql(
+    target: str,
+    staging: str,
+    staging_schema: list[bigquery.SchemaField],
+    target_schema: list[bigquery.SchemaField],
+) -> str:
+    """Return the MERGE DML that upserts staging rows into the target table.
+
+    Adds explicit CASTs when a staging column's type differs from the target's
+    (e.g. DATE→STRING for legacy tables created before the DATE schema was adopted).
+    """
+    target_types = {f.name: f.field_type for f in target_schema}
+    staging_type_map = {f.name: f.field_type for f in staging_schema}
+
+    def src_expr(field: str) -> str:
+        t_type = target_types.get(field)
+        s_type = staging_type_map.get(field)
+        if t_type and s_type and t_type != s_type:
+            return f"CAST(S.`{field}` AS {t_type})"
+        return f"S.`{field}`"
+
+    all_fields = [f.name for f in staging_schema]
     update_fields = [f for f in all_fields if f != "_airbyte_raw_id"]
-    set_clause = ",\n        ".join(f"T.`{f}` = S.`{f}`" for f in update_fields)
+    set_clause = ",\n        ".join(f"T.`{f}` = {src_expr(f)}" for f in update_fields)
     col_list = ", ".join(f"`{f}`" for f in all_fields)
-    val_list = ", ".join(f"S.`{f}`" for f in all_fields)
+    val_list = ", ".join(src_expr(f) for f in all_fields)
     return f"""
 MERGE `{target}` AS T
 USING `{staging}` AS S
@@ -311,8 +331,8 @@ def upsert_ile_to_bigquery(records: list[dict], company: str) -> int:
             logger.error(f"[{company}] staging load errors: {load_job.errors[:3]}")
             return 0
 
-        all_fields = [f.name for f in _SCHEMA]
-        sql = _merge_sql(tid, stg_id, all_fields)
+        target_table = client.get_table(tid)
+        sql = _merge_sql(tid, stg_id, _SCHEMA, list(target_table.schema))
         merge_job = client.query(sql)
         merge_job.result()
         if merge_job.errors:
