@@ -354,17 +354,28 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
 
         elif msg_type == "backfill-family-codes":
             company = data.get("company") or config.BC_COMPANY
+            logger.info(f"[{company}] backfill-family-codes: fetching v3 catalog from BC (on_date={on_date!r})")
             records = fetch_v3_catalog(company, on_date=on_date)
-            result = backfill_family_codes(records, company)
-            notify_success(
-                title=f"Family Code Backfill Complete — {company}",
-                detail=(
-                    f"Company: {company}\n"
-                    f"{result['patched']} documents patched\n"
-                    f"{result['skipped_missing_product_no']} skipped (no productNo)"
-                ),
-                context=f"on_date={on_date} bc_records={len(records)}",
-            )
+            logger.info(f"[{company}] backfill-family-codes: {len(records)} records from BC — patching Firestore familyCode")
+            if not records:
+                logger.warning(f"[{company}] backfill-family-codes: BC returned 0 records — nothing to patch")
+                notify_success(
+                    title=f"Family Code Backfill Skipped — {company}",
+                    detail=f"Company: {company}\nBC returned 0 records for on_date={on_date} — Firestore unchanged.",
+                    context=f"on_date={on_date}",
+                )
+            else:
+                result = backfill_family_codes(records, company)
+                logger.info(f"[{company}] backfill-family-codes complete: {result['patched']} patched, {result['skipped_missing_product_no']} skipped")
+                notify_success(
+                    title=f"Family Code Backfill Complete — {company}",
+                    detail=(
+                        f"Company: {company}\n"
+                        f"{result['patched']} documents patched\n"
+                        f"{result['skipped_missing_product_no']} skipped (no productNo)"
+                    ),
+                    context=f"on_date={on_date} bc_records={len(records)}",
+                )
 
         elif msg_type == "bq-sync-ile":
             company = data.get("company") or "ALL"
