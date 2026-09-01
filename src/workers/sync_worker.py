@@ -353,7 +353,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             )
 
         elif msg_type == "backfill-family-codes":
-            company = data.get("company") or config.BC_COMPANY
+            company = (data.get("company") or config.BC_COMPANY).upper()
             logger.info(f"[{company}] backfill-family-codes: fetching v3 catalog from BC (on_date={on_date!r})")
             records = fetch_v3_catalog(company, on_date=on_date)
             logger.info(f"[{company}] backfill-family-codes: {len(records)} records from BC — patching Firestore familyCode")

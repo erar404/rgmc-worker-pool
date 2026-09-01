@@ -177,12 +177,14 @@ def sync_prices_to_firestore(records: list, company: str, on_date: str) -> int:
 def backfill_family_codes(records: list, company: str) -> dict:
     """Patch the familyCode field on existing Firestore item price documents.
 
-    Uses batch update (not set) so only familyCode is touched — all other fields
-    are left exactly as they are. Documents that don't yet exist are skipped.
+    Uses set(merge=True) so only familyCode is touched on existing docs.
+    Company name is uppercased to match the convention used by sync_prices_to_firestore
+    (which receives company from BC_COMPANY env var, always uppercase).
     Returns {"patched": int, "skipped_missing_product_no": int}.
     """
     collection = _prices_collection()
     db = _firestore()
+    doc_company = company.upper()
     patched = 0
     skipped = 0
     batch = db.batch()
@@ -193,7 +195,7 @@ def backfill_family_codes(records: list, company: str) -> dict:
         if not product_no:
             skipped += 1
             continue
-        ref = db.collection(collection).document(f"{company}_{product_no}")
+        ref = db.collection(collection).document(f"{doc_company}_{product_no}")
         batch.set(ref, {"familyCode": record.get("familyCode") or ""}, merge=True)
         count_in_batch += 1
         patched += 1
