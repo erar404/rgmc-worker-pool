@@ -23,6 +23,9 @@ Message formats (JSON):
     { "type": "bq-sync-ile", "company": "RGMC", "since_date": "YYYY-MM-DD" }
     Omit since_date for a full sync. "ALL" expands to all configured companies.
 
+  Patch familyCode field on existing Firestore item price documents (uses update, not set):
+    { "type": "backfill-family-codes", "company": "RGMC", "on_date": "YYYY-MM-DD" }
+
   Connectivity test (bc-api → worker pool):
     { "type": "ping", "sent_at": "ISO8601", "sent_by": "bc-api", "note": "optional" }
 
@@ -50,6 +53,7 @@ from src.services.bc_client import (
 )
 from src.services.gcs_catalog import save_catalog
 from src.services.price_firestore_service import (
+    backfill_family_codes,
     get_sync_state,
     ile_exists_in_firestore,
     prices_exist_in_firestore,
@@ -346,6 +350,20 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                 title=f"Item Ledger Entries Sync Complete — {company}",
                 detail=f"Companies: {', '.join(companies)}\n{total} records written to Firestore",
                 context=f"since_date={since_date or 'full'}",
+            )
+
+        elif msg_type == "backfill-family-codes":
+            company = data.get("company") or config.BC_COMPANY
+            records = fetch_v3_catalog(company, on_date=on_date)
+            result = backfill_family_codes(records, company)
+            notify_success(
+                title=f"Family Code Backfill Complete — {company}",
+                detail=(
+                    f"Company: {company}\n"
+                    f"{result['patched']} documents patched\n"
+                    f"{result['skipped_missing_product_no']} skipped (no productNo)"
+                ),
+                context=f"on_date={on_date} bc_records={len(records)}",
             )
 
         elif msg_type == "bq-sync-ile":
