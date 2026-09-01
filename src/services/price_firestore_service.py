@@ -174,6 +174,41 @@ def sync_prices_to_firestore(records: list, company: str, on_date: str) -> int:
     return written
 
 
+def backfill_family_codes(records: list, company: str) -> dict:
+    """Patch the familyCode field on existing Firestore item price documents.
+
+    Uses batch update (not set) so only familyCode is touched — all other fields
+    are left exactly as they are. Documents that don't yet exist are skipped.
+    Returns {"patched": int, "skipped_missing_product_no": int}.
+    """
+    collection = _prices_collection()
+    db = _firestore()
+    patched = 0
+    skipped = 0
+    batch = db.batch()
+    count_in_batch = 0
+
+    for record in records:
+        product_no = record.get("productNo") or ""
+        if not product_no:
+            skipped += 1
+            continue
+        ref = db.collection(collection).document(f"{company}_{product_no}")
+        batch.update(ref, {"familyCode": record.get("familyCode") or ""})
+        count_in_batch += 1
+        patched += 1
+        if count_in_batch >= _BATCH_SIZE:
+            batch.commit()
+            batch = db.batch()
+            count_in_batch = 0
+
+    if count_in_batch > 0:
+        batch.commit()
+
+    logger.info(f"Backfilled familyCode on {patched} documents in {collection!r} (company={company!r})")
+    return {"patched": patched, "skipped_missing_product_no": skipped}
+
+
 def sync_price_list_headers_to_firestore(records: list, company: str) -> int:
     """Upsert price list header records into Firestore. Returns the count written."""
     collection = _headers_collection()
