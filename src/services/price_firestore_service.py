@@ -194,7 +194,7 @@ def backfill_family_codes(records: list, company: str) -> dict:
             skipped += 1
             continue
         ref = db.collection(collection).document(f"{company}_{product_no}")
-        batch.update(ref, {"familyCode": record.get("familyCode") or ""})
+        batch.set(ref, {"familyCode": record.get("familyCode") or ""}, merge=True)
         count_in_batch += 1
         patched += 1
         if count_in_batch >= _BATCH_SIZE:
