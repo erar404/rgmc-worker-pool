@@ -158,6 +158,7 @@ def sync_prices_to_firestore(records: list, company: str, on_date: str) -> int:
             "onDate": on_date,
             "syncedAt": synced_at,
             "env": GCP_ENV,
+            "familyCode": record.get("familyCode") or "",
         })
         count_in_batch += 1
         written += 1
