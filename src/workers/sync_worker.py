@@ -26,6 +26,12 @@ Message formats (JSON):
   Patch familyCode field on existing Firestore item price documents (uses update, not set):
     { "type": "backfill-family-codes", "company": "RGMC", "on_date": "YYYY-MM-DD" }
 
+  Patch target ILE columns (quantity, entryType, itemNo, sourceType, description, entryNo,
+  postingDate, documentType, sourceNo, documentNo, costAmountActual, salesAmountActual,
+  lastModifiedDateTime) on existing Firestore docs and BQ rows using set-with-merge + MERGE:
+    { "type": "backfill-ile-columns", "company": "RGMC", "since_date": "YYYY-MM-DD" }
+    Omit since_date to backfill all records. "ALL" expands to all configured companies.
+
   Connectivity test (bc-api → worker pool):
     { "type": "ping", "sent_at": "ISO8601", "sent_by": "bc-api", "note": "optional" }
 
@@ -54,6 +60,7 @@ from src.services.bc_client import (
 from src.services.gcs_catalog import save_catalog
 from src.services.price_firestore_service import (
     backfill_family_codes,
+    backfill_ile_columns_in_firestore,
     get_sync_state,
     ile_exists_in_firestore,
     prices_exist_in_firestore,
@@ -63,7 +70,12 @@ from src.services.price_firestore_service import (
     sync_price_list_items_to_firestore,
     sync_prices_to_firestore,
 )
-from src.services.bigquery_ile_service import ensure_table, get_max_last_modified, upsert_ile_to_bigquery
+from src.services.bigquery_ile_service import (
+    backfill_ile_columns_in_bigquery,
+    ensure_table,
+    get_max_last_modified,
+    upsert_ile_to_bigquery,
+)
 from src.services.send_mail import notify_error, notify_success
 
 logger = logging.getLogger("worker.sync")
@@ -136,6 +148,42 @@ def _sync_item_ledger_entries(company: str, since_date: str | None = None) -> in
 
 
 _BQ_ILE_PAGE_SIZE = 5000
+
+_ILE_BACKFILL_COLUMNS: set[str] = {
+    "quantity", "entryType", "itemNo", "sourceType", "description",
+    "entryNo", "postingDate", "documentType", "sourceNo", "documentNo",
+    "costAmountActual", "salesAmountActual", "lastModifiedDateTime",
+}
+
+
+def _backfill_ile_columns(company: str, since_date: str | None = None) -> dict:
+    """Re-fetch ILE from BC and patch target columns in Firestore and BigQuery.
+
+    For Firestore: set-with-merge so only the target fields are written.
+    For BigQuery: ensure_table adds any missing columns, then MERGE updates all rows.
+    Returns {"firestore": <patched>, "bq": <rows>}.
+    """
+    ensure_table(company)
+    total_fs = 0
+    total_bq = 0
+    offset = 0
+    while True:
+        records = fetch_item_ledger_entries(company, since_date=since_date, limit=_ILE_PAGE_SIZE, offset=offset)
+        if not records:
+            break
+        fs_patched = backfill_ile_columns_in_firestore(records, company, _ILE_BACKFILL_COLUMNS)
+        bq_rows = backfill_ile_columns_in_bigquery(records, company, _ILE_BACKFILL_COLUMNS)
+        total_fs += fs_patched
+        total_bq += bq_rows
+        logger.info(
+            f"[{company}] backfill offset={offset}: {len(records)} from BC, "
+            f"{fs_patched} Firestore patched, {bq_rows} BQ upserted"
+        )
+        if len(records) < _ILE_PAGE_SIZE:
+            break
+        offset += _ILE_PAGE_SIZE
+    logger.info(f"[{company}] backfill-ile-columns complete: {total_fs} FS patched, {total_bq} BQ rows")
+    return {"firestore": total_fs, "bq": total_bq}
 
 
 def _sync_ile_to_bigquery(company: str, since_date: str | None = None) -> tuple[int, list[str]]:
@@ -429,6 +477,41 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                     title=f"BQ ILE Sync Complete — {company}",
                     detail=f"Total rows inserted: {total}\n\n" + "\n".join(lines),
                     context=context,
+                )
+
+        elif msg_type == "backfill-ile-columns":
+            company = data.get("company") or "ALL"
+            since_date = data.get("since_date")
+            companies = _get_companies(company)
+            results: dict[str, dict] = {}
+            errors: dict[str, str] = {}
+            for c in companies:
+                try:
+                    results[c] = _backfill_ile_columns(c, since_date=since_date)
+                except Exception as exc:
+                    logger.error(f"[{c}] backfill-ile-columns failed: {exc}")
+                    errors[c] = str(exc)
+            total_fs = sum(r["firestore"] for r in results.values())
+            total_bq = sum(r["bq"] for r in results.values())
+            detail_lines = [
+                f"{c}: {r['firestore']} Firestore patched, {r['bq']} BQ rows upserted"
+                for c, r in results.items()
+            ]
+            if errors:
+                error_lines = [f"{c}: {err}" for c, err in errors.items()]
+                notify_error(
+                    title=f"ILE Column Backfill {'Partial Failure' if results else 'Failed'} — {company}",
+                    detail="\n".join(
+                        ["=== FAILED ==="] + error_lines
+                        + (["\n=== SUCCEEDED ==="] + detail_lines if detail_lines else [])
+                    ),
+                    context=f"since_date={since_date or 'full'}",
+                )
+            else:
+                notify_success(
+                    title=f"ILE Column Backfill Complete — {company}",
+                    detail=f"Total: {total_fs} Firestore docs patched, {total_bq} BQ rows upserted\n\n" + "\n".join(detail_lines),
+                    context=f"since_date={since_date or 'full'} columns={sorted(_ILE_BACKFILL_COLUMNS)}",
                 )
 
         elif msg_type == "ping":

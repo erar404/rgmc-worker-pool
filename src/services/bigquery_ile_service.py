@@ -290,6 +290,108 @@ VALUES ({val_list})
 """
 
 
+def _backfill_merge_sql(
+    target: str,
+    staging: str,
+    staging_schema: list[bigquery.SchemaField],
+    target_schema: list[bigquery.SchemaField],
+    backfill_fields: set[str],
+) -> str:
+    """Return MERGE DML that fills NULL target columns using COALESCE.
+
+    For matched rows: only the columns in backfill_fields are touched, and only
+    where the target value is currently NULL — COALESCE(T.field, S.field).
+    All other columns on matched rows are left untouched.
+    For new rows: full INSERT of all staging columns.
+    """
+    target_types = {f.name: f.field_type for f in target_schema}
+    staging_type_map = {f.name: f.field_type for f in staging_schema}
+
+    def src_expr(field: str) -> str:
+        t_type = target_types.get(field)
+        s_type = staging_type_map.get(field)
+        if t_type and s_type and t_type != s_type:
+            return f"CAST(S.`{field}` AS {t_type})"
+        return f"S.`{field}`"
+
+    all_fields = [f.name for f in staging_schema]
+    set_clause = ",\n        ".join(
+        f"T.`{f}` = COALESCE(T.`{f}`, {src_expr(f)})"
+        for f in all_fields
+        if f in backfill_fields
+    )
+    col_list = ", ".join(f"`{f}`" for f in all_fields)
+    val_list = ", ".join(src_expr(f) for f in all_fields)
+    return f"""
+MERGE `{target}` AS T
+USING `{staging}` AS S
+ON T.company = S.company AND T.entryNo = S.entryNo
+WHEN MATCHED THEN UPDATE SET
+        {set_clause}
+WHEN NOT MATCHED THEN INSERT ({col_list})
+VALUES ({val_list})
+"""
+
+
+def backfill_ile_columns_in_bigquery(records: list[dict], company: str, fields: set[str]) -> int:
+    """MERGE ILE records into BigQuery, filling only currently-NULL target columns.
+
+    Uses COALESCE(T.field, S.field) for each field in `fields` so existing
+    non-null values are never overwritten. All other columns on matched rows
+    are untouched. New rows (not yet in BQ) receive a full INSERT.
+    Returns count of source rows processed.
+    """
+    if not records:
+        return 0
+    if not config.BIGQUERY_PROJECT_ID:
+        logger.warning("BIGQUERY_PROJECT_ID not configured — skipping BQ backfill")
+        return 0
+    dataset = _dataset_id(company)
+    if not dataset:
+        logger.warning(f"[{company}] no BigQuery dataset mapped — skipping BQ backfill")
+        return 0
+
+    client = _bq()
+    tid = _table_id(company)
+    bq_synced_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    rows = [_clean(r, bq_synced_at) for r in records if r.get("entryNo") is not None]
+    if not rows:
+        logger.warning(f"[{company}] all records missing entryNo — skipping BQ backfill")
+        return 0
+
+    stg_id = f"{config.BIGQUERY_PROJECT_ID}.{dataset}.itemLedgerEntries_backfill_stg_{uuid.uuid4().hex[:12]}"
+    stg_ref = bigquery.TableReference.from_string(stg_id)
+
+    try:
+        job_config = bigquery.LoadJobConfig(
+            schema=_SCHEMA,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        )
+        load_job = client.load_table_from_json(rows, stg_ref, job_config=job_config)
+        load_job.result()
+        if load_job.errors:
+            logger.error(f"[{company}] backfill staging load errors: {load_job.errors[:3]}")
+            return 0
+
+        target_table = client.get_table(tid)
+        sql = _backfill_merge_sql(tid, stg_id, _SCHEMA, list(target_table.schema), fields)
+        merge_job = client.query(sql)
+        merge_job.result()
+        if merge_job.errors:
+            logger.error(f"[{company}] backfill MERGE errors: {merge_job.errors[:3]}")
+            return 0
+
+        logger.info(f"[{company}] BQ backfill MERGE complete — {len(rows)} source rows processed into {tid}")
+        return len(rows)
+    finally:
+        try:
+            client.delete_table(stg_ref, not_found_ok=True)
+        except Exception as exc:
+            logger.warning(f"[{company}] could not delete backfill staging table {stg_id}: {exc}")
+
+
 def upsert_ile_to_bigquery(records: list[dict], company: str) -> int:
     """Upsert ILE records into BigQuery via load-to-staging + MERGE.
 

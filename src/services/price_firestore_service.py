@@ -340,6 +340,42 @@ def sync_item_ledger_entries_to_firestore(records: list, company: str) -> int:
     return written
 
 
+def backfill_ile_columns_in_firestore(records: list, company: str, fields: set[str]) -> int:
+    """Patch specific fields on existing ILE Firestore documents.
+
+    Uses set-with-merge so only the named fields are touched; documents that
+    don't exist yet are created with just those fields.
+    Returns count of documents patched.
+    """
+    collection = _ile_collection()
+    db = _firestore()
+    batch = db.batch()
+    count_in_batch = 0
+    patched = 0
+
+    for record in records:
+        entry_no = record.get("entryNo")
+        if entry_no is None:
+            continue
+        patch = {f: record[f] for f in fields if f in record}
+        if not patch:
+            continue
+        ref = db.collection(collection).document(f"{company}_{entry_no}")
+        batch.set(ref, patch, merge=True)
+        count_in_batch += 1
+        patched += 1
+        if count_in_batch >= _BATCH_SIZE:
+            batch.commit()
+            batch = db.batch()
+            count_in_batch = 0
+
+    if count_in_batch > 0:
+        batch.commit()
+
+    logger.info(f"Backfilled {patched} ILE documents in {collection!r} (company={company!r})")
+    return patched
+
+
 def get_price_list_items_from_firestore(
     company: str,
     price_list_code: str | None = None,
