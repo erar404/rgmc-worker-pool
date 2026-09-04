@@ -51,13 +51,21 @@ from google.cloud import pubsub_v1
 
 from src import config
 from src.services.bc_client import (
+    fetch_contacts,
+    fetch_customers,
+    fetch_item_categories,
     fetch_item_ledger_entries,
     fetch_price_list_headers,
     fetch_price_list_headers_with_lines,
     fetch_v3_catalog,
     get_all_company_names,
 )
-from src.services.gcs_catalog import save_catalog
+from src.services.gcs_catalog import (
+    save_catalog,
+    save_contacts,
+    save_customers,
+    save_item_categories,
+)
 from src.services.price_firestore_service import (
     backfill_family_codes,
     backfill_ile_columns_in_firestore,
@@ -303,6 +311,29 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
         _sync_item_ledger_entries(company, since_date=since_date_ile)
     except Exception as e:
         logger.error(f"[{company}] item ledger entries failed — {e}")
+
+    # Sync supporting datasets to GCS so the BC API can serve them in ~200ms
+    # instead of hitting BC OData directly (2-5s, worse on cold start).
+    try:
+        customers = fetch_customers(company)
+        save_customers(company, customers)
+        logger.info(f"[{company}] {len(customers)} customers saved to GCS")
+    except Exception as e:
+        logger.error(f"[{company}] customers GCS sync failed — {e}")
+
+    try:
+        contacts = fetch_contacts(company)
+        save_contacts(company, contacts)
+        logger.info(f"[{company}] {len(contacts)} contacts saved to GCS")
+    except Exception as e:
+        logger.error(f"[{company}] contacts GCS sync failed — {e}")
+
+    try:
+        categories = fetch_item_categories(company)
+        save_item_categories(company, categories)
+        logger.info(f"[{company}] {len(categories)} item categories saved to GCS")
+    except Exception as e:
+        logger.error(f"[{company}] item categories GCS sync failed — {e}")
 
     logger.info(f"[{company}] sync complete")
 

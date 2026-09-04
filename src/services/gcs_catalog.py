@@ -43,3 +43,69 @@ def save_catalog(company_name: str, on_date: str, records: list) -> None:
         logger.info(f"GCS catalog saved: {len(records)} records (company={company_name!r}, date={on_date!r})")
     except Exception as e:
         logger.warning(f"GCS catalog save failed (company={company_name!r}): {e}")
+
+
+# ---------------------------------------------------------------------------
+# Customers
+# ---------------------------------------------------------------------------
+
+def _customers_blob_path(company_name: str) -> str:
+    return f"{(GCP_ENV or 'Staging').strip()}/{company_name.upper()}/customers.json"
+
+
+def save_customers(company_name: str, customers: list) -> None:
+    """Persist all customers for a company to GCS."""
+    if not GCS_CATALOG_BUCKET:
+        return
+    try:
+        payload = json.dumps({"customers": customers, "saved_at": time.time()})
+        _gcs().bucket(GCS_CATALOG_BUCKET).blob(_customers_blob_path(company_name)).upload_from_string(
+            payload, content_type="application/json"
+        )
+        logger.info(f"GCS customers saved: {len(customers)} records (company={company_name!r})")
+    except Exception as e:
+        logger.warning(f"GCS customers save failed (company={company_name!r}): {e}")
+
+
+# ---------------------------------------------------------------------------
+# Contacts
+# ---------------------------------------------------------------------------
+
+def _contacts_blob_path(company_name: str) -> str:
+    return f"{(GCP_ENV or 'Staging').strip()}/{company_name.upper()}/contacts.json"
+
+
+def save_contacts(company_name: str, contacts: list) -> None:
+    """Persist all contacts for a company to GCS."""
+    if not GCS_CATALOG_BUCKET:
+        return
+    try:
+        payload = json.dumps({"contacts": contacts, "saved_at": time.time()})
+        _gcs().bucket(GCS_CATALOG_BUCKET).blob(_contacts_blob_path(company_name)).upload_from_string(
+            payload, content_type="application/json"
+        )
+        logger.info(f"GCS contacts saved: {len(contacts)} records (company={company_name!r})")
+    except Exception as e:
+        logger.warning(f"GCS contacts save failed (company={company_name!r}): {e}")
+
+
+# ---------------------------------------------------------------------------
+# Item categories
+# ---------------------------------------------------------------------------
+
+def _item_categories_blob_path(company_name: str) -> str:
+    return f"{(GCP_ENV or 'Staging').strip()}/{company_name.upper()}/item_categories.json"
+
+
+def save_item_categories(company_name: str, categories: list) -> None:
+    """Persist all item categories for a company to GCS."""
+    if not GCS_CATALOG_BUCKET:
+        return
+    try:
+        payload = json.dumps({"item_categories": categories, "saved_at": time.time()})
+        _gcs().bucket(GCS_CATALOG_BUCKET).blob(_item_categories_blob_path(company_name)).upload_from_string(
+            payload, content_type="application/json"
+        )
+        logger.info(f"GCS item categories saved: {len(categories)} records (company={company_name!r})")
+    except Exception as e:
+        logger.warning(f"GCS item categories save failed (company={company_name!r}): {e}")

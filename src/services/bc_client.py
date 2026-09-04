@@ -509,6 +509,43 @@ def fetch_price_list_headers_with_lines(company_name: str, since: str | None = N
 
 
 # ---------------------------------------------------------------------------
+# Customers, Contacts, Item Categories (v2 RGMC / standard BC API)
+# ---------------------------------------------------------------------------
+
+def fetch_customers(company_name: str) -> list:
+    """Fetch all customers from the v2.0 RGMC custom API (full fetch, no filter)."""
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/customers"
+    )
+    logger.info(f"fetch_customers — company={company_name!r}")
+    return _fetch_all_pages(url)
+
+
+def fetch_contacts(company_name: str) -> list:
+    """Fetch all contacts from the v2.0 RGMC custom API (full fetch, no filter)."""
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/contacts"
+    )
+    logger.info(f"fetch_contacts — company={company_name!r}")
+    return _fetch_all_pages(url)
+
+
+def fetch_item_categories(company_name: str) -> list:
+    """Fetch all item categories from the standard BC API v2.0."""
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0"
+        f"/companies({company_id})/itemCategories"
+    )
+    logger.info(f"fetch_item_categories — company={company_name!r}")
+    return _fetch_all_pages(url)
+
+
+# ---------------------------------------------------------------------------
 # Order CRUD — v1 (RGMC custom v1.0) and v2 (RGMC custom v2.0)
 # ---------------------------------------------------------------------------
 
