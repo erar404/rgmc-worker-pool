@@ -485,13 +485,18 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                 )
             else:
                 result = backfill_family_codes(records, company)
-                logger.info(f"[{company}] backfill-family-codes complete: {result['patched']} patched, {result['skipped_missing_product_no']} skipped")
+                logger.info(
+                    f"[{company}] backfill-family-codes complete: {result['patched']} patched, "
+                    f"{result['skipped_missing_product_no']} skipped (no productNo), "
+                    f"{result.get('skipped_no_family_code', 0)} skipped (no familyCode from BC)"
+                )
                 notify_success(
                     title=f"Family Code Backfill Complete — {company}",
                     detail=(
                         f"Company: {company}\n"
                         f"{result['patched']} documents patched\n"
-                        f"{result['skipped_missing_product_no']} skipped (no productNo)"
+                        f"{result['skipped_missing_product_no']} skipped (no productNo)\n"
+                        f"{result.get('skipped_no_family_code', 0)} skipped (BC returned no familyCode)"
                     ),
                     context=f"on_date={on_date} bc_records={len(records)}",
                 )

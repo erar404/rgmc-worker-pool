@@ -157,14 +157,19 @@ def sync_prices_to_firestore(records: list, company: str, on_date: str) -> int:
         if not product_no:
             continue
         ref = db.collection(collection).document(f"{company}_{product_no}")
-        batch.set(ref, {
+        doc_data = {
             **record,
             "company": company,
             "onDate": on_date,
             "syncedAt": synced_at,
             "env": GCP_ENV,
-            "familyCode": record.get("familyCode") or "",
-        })
+        }
+        # familyCode is a computed temp-buffer field that BC may omit from incremental
+        # (lastModifiedDateTime-filtered) responses. Don't force-write "" — use merge=True
+        # so any value previously set by backfill_family_codes is preserved.
+        if not doc_data.get("familyCode"):
+            doc_data.pop("familyCode", None)
+        batch.set(ref, doc_data, merge=True)
         count_in_batch += 1
         written += 1
         if count_in_batch >= _BATCH_SIZE:
@@ -190,35 +195,51 @@ def backfill_family_codes(records: list, company: str) -> dict:
     Uses set(merge=True) so only familyCode is touched on existing docs.
     Company name is uppercased to match the convention used by sync_prices_to_firestore
     (which receives company from BC_COMPANY env var, always uppercase).
-    Returns {"patched": int, "skipped_missing_product_no": int}.
+    Skips records where BC returned no familyCode so we never overwrite a valid
+    existing value with an empty string.
+    Returns {"patched": int, "skipped_missing_product_no": int, "skipped_no_family_code": int}.
     """
     collection = _prices_collection()
     db = _firestore()
     doc_company = company.upper()
     patched = 0
-    skipped = 0
+    skipped_no_pno = 0
+    skipped_no_fc = 0
+    batches: list = []
     batch = db.batch()
     count_in_batch = 0
 
     for record in records:
         product_no = record.get("productNo") or ""
         if not product_no:
-            skipped += 1
+            skipped_no_pno += 1
+            continue
+        family_code = record.get("familyCode") or ""
+        if not family_code:
+            skipped_no_fc += 1
             continue
         ref = db.collection(collection).document(f"{doc_company}_{product_no}")
-        batch.set(ref, {"familyCode": record.get("familyCode") or ""}, merge=True)
+        batch.set(ref, {"familyCode": family_code}, merge=True)
         count_in_batch += 1
         patched += 1
         if count_in_batch >= _BATCH_SIZE:
-            batch.commit()
+            batches.append(batch)
             batch = db.batch()
             count_in_batch = 0
 
     if count_in_batch > 0:
-        batch.commit()
+        batches.append(batch)
 
-    logger.info(f"Backfilled familyCode on {patched} documents in {collection!r} (company={company!r})")
-    return {"patched": patched, "skipped_missing_product_no": skipped}
+    if batches:
+        with ThreadPoolExecutor(max_workers=min(len(batches), _COMMIT_WORKERS)) as ex:
+            for f in as_completed([ex.submit(b.commit) for b in batches]):
+                f.result()
+
+    logger.info(
+        f"Backfilled familyCode on {patched} documents in {collection!r} "
+        f"(company={company!r}, skipped_no_pno={skipped_no_pno}, skipped_no_fc={skipped_no_fc})"
+    )
+    return {"patched": patched, "skipped_missing_product_no": skipped_no_pno, "skipped_no_family_code": skipped_no_fc}
 
 
 def sync_price_list_headers_to_firestore(records: list, company: str) -> int:
