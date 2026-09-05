@@ -377,28 +377,44 @@ def _probe_v3_date(company_id: str, on_date: str) -> str | None:
     return "active" if any(not r.get("blocked") for r in records) else "blocked"
 
 
+def _fetch_v3_catalog_incremental(
+    company_id: str, company_name: str, on_date: str, since: str
+) -> list:
+    """Fetch only records modified after `since` using a single paged request.
+
+    The 27-range split exists to avoid BC's temp-buffer 409 on large full fetches.
+    Incremental deltas are small (typically 0–few hundred records) so a single
+    OData request with nextLink paging is correct and much cheaper.
+    """
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}"
+        f"/companies({company_id})/itemPrices"
+        f"?$filter=onDate eq {on_date} and lastModifiedDateTime gt {since}"
+        f"&$select={_V3_SELECT_FIELDS}"
+    )
+    logger.info(
+        f"v3 catalog incremental fetch — company={company_name!r} "
+        f"on_date={on_date!r} since={since!r}"
+    )
+    return _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
+
+
 def fetch_v3_catalog(company_name: str, on_date: str | None = None, since: str | None = None) -> list:
-    """Fetch the v3 item price catalog using four parallel productNo range requests.
+    """Fetch the v3 item price catalog.
 
-    Splits the alphabet into four ranges (A-G, G-M, M-S, S-Z) so BC runs four
-    independent OData cursors simultaneously. Results are merged and de-duplicated on
-    productNo.
+    Incremental (since set): single request filtered by lastModifiedDateTime — fast,
+    no range splitting needed for small delta result sets.
 
-    For full fetches (since=None): probes each candidate date with a minimal single
-    request before committing to the full 4-range parallel fetch. Probe errors (4xx)
-    skip the date; full-fetch errors also skip and try the next date. This handles
-    expired price list end dates and transient BC range errors (e.g. 400 on M-S range
-    for a specific date) without aborting the entire fallback loop.
-
-    For incremental fetches (since set): fetches only records modified after that
-    timestamp on the given date — no date fallback (partial delta, not a full re-sync).
+    Full fetch (since=None): 27 parallel productNo letter-range requests to avoid
+    BC's temp-buffer 409 on large result sets. Probes each candidate date cheaply
+    before committing to the full parallel fetch.
     """
     company_id = get_company_id(company_name)
     start_date = datetime.date.fromisoformat(on_date) if on_date else datetime.date.today()
 
     if since is not None:
-        # Incremental: just fetch the delta for the given date, no fallback needed
-        return _fetch_v3_catalog_for_date(company_id, company_name, start_date.isoformat(), since=since)
+        # Incremental: single request, no range splitting, no date fallback.
+        return _fetch_v3_catalog_incremental(company_id, company_name, start_date.isoformat(), since)
 
     # Full fetch: probe each date cheaply before committing to the full 4-range parallel fetch
     for days_back in range(31):
