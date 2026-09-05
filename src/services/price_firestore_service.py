@@ -12,6 +12,7 @@ Document IDs:
 """
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from google.cloud import firestore
 
@@ -138,12 +139,16 @@ def get_price_list_headers_from_firestore(
     return results
 
 
+_COMMIT_WORKERS = 8
+
+
 def sync_prices_to_firestore(records: list, company: str, on_date: str) -> int:
     """Upsert item price records into Firestore. Returns the count of records written."""
     collection = _prices_collection()
     db = _firestore()
     synced_at = time.time()
     written = 0
+    batches: list = []
     batch = db.batch()
     count_in_batch = 0
 
@@ -163,12 +168,17 @@ def sync_prices_to_firestore(records: list, company: str, on_date: str) -> int:
         count_in_batch += 1
         written += 1
         if count_in_batch >= _BATCH_SIZE:
-            batch.commit()
+            batches.append(batch)
             batch = db.batch()
             count_in_batch = 0
 
     if count_in_batch > 0:
-        batch.commit()
+        batches.append(batch)
+
+    if batches:
+        with ThreadPoolExecutor(max_workers=min(len(batches), _COMMIT_WORKERS)) as ex:
+            for f in as_completed([ex.submit(b.commit) for b in batches]):
+                f.result()
 
     logger.info(f"Synced {written} item prices → {collection!r} (company={company!r}, onDate={on_date!r})")
     return written
@@ -255,6 +265,7 @@ def sync_price_list_items_to_firestore(lines: list, company: str, price_list_cod
     db = _firestore()
     synced_at = time.time()
     written = 0
+    batches: list = []
     batch = db.batch()
     count_in_batch = 0
 
@@ -275,12 +286,17 @@ def sync_price_list_items_to_firestore(lines: list, company: str, price_list_cod
         count_in_batch += 1
         written += 1
         if count_in_batch >= _BATCH_SIZE:
-            batch.commit()
+            batches.append(batch)
             batch = db.batch()
             count_in_batch = 0
 
     if count_in_batch > 0:
-        batch.commit()
+        batches.append(batch)
+
+    if batches:
+        with ThreadPoolExecutor(max_workers=min(len(batches), _COMMIT_WORKERS)) as ex:
+            for f in as_completed([ex.submit(b.commit) for b in batches]):
+                f.result()
 
     logger.info(
         f"Synced {written} price list items → {collection!r} "
@@ -310,6 +326,7 @@ def sync_item_ledger_entries_to_firestore(records: list, company: str) -> int:
     db = _firestore()
     synced_at = time.time()
     written = 0
+    batches: list = []
     batch = db.batch()
     count_in_batch = 0
 
@@ -327,12 +344,17 @@ def sync_item_ledger_entries_to_firestore(records: list, company: str) -> int:
         count_in_batch += 1
         written += 1
         if count_in_batch >= _BATCH_SIZE:
-            batch.commit()
+            batches.append(batch)
             batch = db.batch()
             count_in_batch = 0
 
     if count_in_batch > 0:
-        batch.commit()
+        batches.append(batch)
+
+    if batches:
+        with ThreadPoolExecutor(max_workers=min(len(batches), _COMMIT_WORKERS)) as ex:
+            for f in as_completed([ex.submit(b.commit) for b in batches]):
+                f.result()
 
     logger.info(
         f"Synced {written} item ledger entries → {collection!r} (company={company!r})"

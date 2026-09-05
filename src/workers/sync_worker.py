@@ -46,6 +46,7 @@ forced full fetch even when a state record exists.
 import datetime
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from google.cloud import pubsub_v1
 
@@ -236,11 +237,17 @@ def _sync_ile_to_bigquery(company: str, since_date: str | None = None) -> tuple[
 
 
 def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
-    """Sync price list headers then item price catalog for a single company.
+    """Sync all datasets for a single company concurrently.
 
     Uses lastModifiedDateTime-based incremental sync: only records modified since the
     last successful sync are fetched from BC and written to Firestore. First run (no
     stored sync state) falls back to a full fetch.
+
+    Four independent stages run in parallel:
+      1. price list headers + items (one per price list code, also in parallel)
+      2. v3 item price catalog → GCS + Firestore
+      3. item ledger entries → Firestore
+      4. supporting datasets (customers, contacts, item categories) → GCS
     """
     logger.info(f"[{company}] sync started — on_date={on_date!r}")
 
@@ -248,92 +255,108 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
     # are picked up on the next run (no gap, small overlap is fine).
     sync_start = _now_utc()
 
-    try:
-        since_headers = get_sync_state(company, "price_list_headers")
-        headers_with_lines = fetch_price_list_headers_with_lines(company, since=since_headers)
-        headers = [{k: v for k, v in h.items() if k != "priceListLines"} for h in headers_with_lines]
-        written = sync_price_list_headers_to_firestore(headers, company)
-        logger.info(
-            f"[{company}] {written} price list headers written "
-            f"(since={since_headers!r})"
-        )
-        total_items = 0
-        for header in headers_with_lines:
-            code = header.get("code") or ""
-            lines = header.get("priceListLines") or []
-            if not (code and lines):
-                continue
-            written_items = sync_price_list_items_to_firestore(lines, company, code)
-            total_items += written_items
-            logger.info(f"[{company}] price list items [{code}]: {written_items} written")
-        if headers_with_lines:
-            set_sync_state(company, "price_list_headers", sync_start)
-        logger.info(f"[{company}] {total_items} price list items written total")
-    except Exception as e:
-        logger.error(f"[{company}] price list headers/items failed — {e}")
+    def _stage_price_list_headers() -> None:
+        try:
+            since_headers = get_sync_state(company, "price_list_headers")
+            headers_with_lines = fetch_price_list_headers_with_lines(company, since=since_headers)
+            headers = [{k: v for k, v in h.items() if k != "priceListLines"} for h in headers_with_lines]
+            written = sync_price_list_headers_to_firestore(headers, company)
+            logger.info(f"[{company}] {written} price list headers written (since={since_headers!r})")
 
-    try:
-        since_prices = get_sync_state(company, "item_prices")
-        # If the collection is empty despite a stored sync timestamp, the previous sync
-        # completed (setting the state) but Firestore writes failed or were lost.
-        # Force a full fetch so we actually populate the collection.
-        if since_prices is not None and not prices_exist_in_firestore(company):
-            logger.info(
-                f"[{company}] item_prices collection empty despite stored sync state "
-                f"(since={since_prices!r}) — forcing full fetch"
-            )
-            since_prices = None
-        records = fetch_v3_catalog(company, on_date, since=since_prices)
-        # Only save a full GCS snapshot on full-fetch runs; incremental results are partial.
-        if since_prices is None:
-            save_catalog(company, on_date, records)
-        total = 0
-        for i in range(0, len(records), page_size):
-            chunk = records[i : i + page_size]
-            total += sync_prices_to_firestore(chunk, company, on_date)
-            logger.info(
-                f"[{company}] item prices page {i // page_size + 1}: "
-                f"{len(chunk)} records (offset={i})"
-            )
-        if records:
-            set_sync_state(company, "item_prices", sync_start)
-        logger.info(
-            f"[{company}] {total} item prices written total "
-            f"(since={since_prices!r})"
-        )
-    except Exception as e:
-        logger.error(f"[{company}] item prices failed — {e}")
+            # Sync each price list code's lines in parallel.
+            def _sync_header_lines(header: dict) -> int:
+                code = header.get("code") or ""
+                lines = header.get("priceListLines") or []
+                if not (code and lines):
+                    return 0
+                n = sync_price_list_items_to_firestore(lines, company, code)
+                logger.info(f"[{company}] price list items [{code}]: {n} written")
+                return n
 
-    try:
-        since_ile = get_sync_state(company, "item_ledger_entries")
-        # Convert stored UTC datetime string to date string for BC's modifiedFrom filter.
-        since_date_ile = since_ile[:10] if since_ile else None
-        _sync_item_ledger_entries(company, since_date=since_date_ile)
-    except Exception as e:
-        logger.error(f"[{company}] item ledger entries failed — {e}")
+            total_items = 0
+            if headers_with_lines:
+                with ThreadPoolExecutor(max_workers=4) as ex:
+                    for f in as_completed([ex.submit(_sync_header_lines, h) for h in headers_with_lines]):
+                        total_items += f.result()
+                set_sync_state(company, "price_list_headers", sync_start)
+            logger.info(f"[{company}] {total_items} price list items written total")
+        except Exception as e:
+            logger.error(f"[{company}] price list headers/items failed — {e}")
 
-    # Sync supporting datasets to GCS so the BC API can serve them in ~200ms
-    # instead of hitting BC OData directly (2-5s, worse on cold start).
-    try:
-        customers = fetch_customers(company)
-        save_customers(company, customers)
-        logger.info(f"[{company}] {len(customers)} customers saved to GCS")
-    except Exception as e:
-        logger.error(f"[{company}] customers GCS sync failed — {e}")
+    def _stage_v3_catalog() -> None:
+        try:
+            since_prices = get_sync_state(company, "item_prices")
+            # If the collection is empty despite a stored sync timestamp, the previous sync
+            # completed (setting the state) but Firestore writes failed or were lost.
+            # Force a full fetch so we actually populate the collection.
+            if since_prices is not None and not prices_exist_in_firestore(company):
+                logger.info(
+                    f"[{company}] item_prices collection empty despite stored sync state "
+                    f"(since={since_prices!r}) — forcing full fetch"
+                )
+                since_prices = None
+            records = fetch_v3_catalog(company, on_date, since=since_prices)
+            # Only save a full GCS snapshot on full-fetch runs; incremental results are partial.
+            if since_prices is None:
+                save_catalog(company, on_date, records)
+            total = sync_prices_to_firestore(records, company, on_date)
+            if records:
+                set_sync_state(company, "item_prices", sync_start)
+            logger.info(f"[{company}] {total} item prices written total (since={since_prices!r})")
+        except Exception as e:
+            logger.error(f"[{company}] item prices failed — {e}")
 
-    try:
-        contacts = fetch_contacts(company)
-        save_contacts(company, contacts)
-        logger.info(f"[{company}] {len(contacts)} contacts saved to GCS")
-    except Exception as e:
-        logger.error(f"[{company}] contacts GCS sync failed — {e}")
+    def _stage_ile() -> None:
+        try:
+            since_ile = get_sync_state(company, "item_ledger_entries")
+            # Convert stored UTC datetime string to date string for BC's modifiedFrom filter.
+            since_date_ile = since_ile[:10] if since_ile else None
+            _sync_item_ledger_entries(company, since_date=since_date_ile)
+        except Exception as e:
+            logger.error(f"[{company}] item ledger entries failed — {e}")
 
-    try:
-        categories = fetch_item_categories(company)
-        save_item_categories(company, categories)
-        logger.info(f"[{company}] {len(categories)} item categories saved to GCS")
-    except Exception as e:
-        logger.error(f"[{company}] item categories GCS sync failed — {e}")
+    def _stage_supporting_datasets() -> None:
+        # Customers, contacts, and item categories are independent — fetch+save in parallel.
+        def _sync_customers() -> None:
+            try:
+                customers = fetch_customers(company)
+                save_customers(company, customers)
+                logger.info(f"[{company}] {len(customers)} customers saved to GCS")
+            except Exception as e:
+                logger.error(f"[{company}] customers GCS sync failed — {e}")
+
+        def _sync_contacts() -> None:
+            try:
+                contacts = fetch_contacts(company)
+                save_contacts(company, contacts)
+                logger.info(f"[{company}] {len(contacts)} contacts saved to GCS")
+            except Exception as e:
+                logger.error(f"[{company}] contacts GCS sync failed — {e}")
+
+        def _sync_item_categories() -> None:
+            try:
+                categories = fetch_item_categories(company)
+                save_item_categories(company, categories)
+                logger.info(f"[{company}] {len(categories)} item categories saved to GCS")
+            except Exception as e:
+                logger.error(f"[{company}] item categories GCS sync failed — {e}")
+
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            for f in as_completed([
+                ex.submit(_sync_customers),
+                ex.submit(_sync_contacts),
+                ex.submit(_sync_item_categories),
+            ]):
+                f.result()
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for f in as_completed([
+            executor.submit(_stage_price_list_headers),
+            executor.submit(_stage_v3_catalog),
+            executor.submit(_stage_ile),
+            executor.submit(_stage_supporting_datasets),
+        ]):
+            f.result()
 
     logger.info(f"[{company}] sync complete")
 

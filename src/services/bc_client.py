@@ -48,9 +48,10 @@ _companies_lock = threading.Lock()
 _companies_cache: dict = {"value": None, "expires_at": 0.0}
 _COMPANIES_TTL = 600
 
-# Semaphore: one below BC's 5-concurrent-request cap.
-# Workers are background-only so 3 slots are sufficient; keeps head-room for the main API.
-_bc_semaphore = threading.Semaphore(3)
+# Semaphore: worker pool is a separate Cloud Run service from the main API, so it has
+# its own request budget. 4 slots runs more v3 ranges in parallel while still leaving
+# head-room for transient BC pressure.
+_bc_semaphore = threading.Semaphore(4)
 _active_bc_requests: int = 0
 _active_bc_lock = threading.Lock()
 
@@ -333,10 +334,10 @@ def _fetch_v3_catalog_for_date(
         return _fetch_range_with_offset_pagination(company_id, effective_date, odata_filter, since)
 
     logger.info(
-        f"v3 catalog parallel fetch (4 ranges) — company={company_name!r} "
+        f"v3 catalog parallel fetch ({len(ranges)} ranges) — company={company_name!r} "
         f"on_date={effective_date!r} since={since!r}"
     )
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         futures = [executor.submit(_fetch_range, low, high) for low, high in ranges]
         results = [f.result() for f in as_completed(futures)]
 
