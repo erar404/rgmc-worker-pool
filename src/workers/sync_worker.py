@@ -66,6 +66,7 @@ from src.services.gcs_catalog import (
     save_contacts,
     save_customers,
     save_item_categories,
+    save_pl_items,
 )
 from src.services.price_firestore_service import (
     backfill_family_codes,
@@ -279,6 +280,22 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
                     for f in as_completed([ex.submit(_sync_header_lines, h) for h in headers_with_lines]):
                         total_items += f.result()
                 set_sync_state(company, "price_list_headers", sync_start)
+
+                # On full syncs only: write all price list items to GCS so the BC API's
+                # get_price_overrides_from_price_list_items can serve from the memory cache
+                # instead of issuing per-batch Firestore queries on every request.
+                if since_headers is None:
+                    all_lines = []
+                    for header in headers_with_lines:
+                        code = header.get("code") or ""
+                        for line in (header.get("priceListLines") or []):
+                            all_lines.append({**line, "priceListCode": code, "company": company})
+                    try:
+                        save_pl_items(company, all_lines)
+                        logger.info(f"[{company}] {len(all_lines)} price list items saved to GCS")
+                    except Exception as _e:
+                        logger.error(f"[{company}] price list items GCS save failed — {_e}")
+
             logger.info(f"[{company}] {total_items} price list items written total")
         except Exception as e:
             logger.error(f"[{company}] price list headers/items failed — {e}")

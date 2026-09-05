@@ -46,6 +46,33 @@ def save_catalog(company_name: str, on_date: str, records: list) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Price List Items (used by BC API's override cache)
+# ---------------------------------------------------------------------------
+
+def _pl_items_blob_path(company_name: str) -> str:
+    return f"{(GCP_ENV or 'Staging').strip()}/{company_name.upper()}/price_list_items.json"
+
+
+def save_pl_items(company_name: str, items: list) -> None:
+    """Persist all price list items for a company to GCS.
+
+    The BC API reads this blob to serve price overrides from memory instead of
+    issuing thousands of per-batch Firestore queries on every item-price request.
+    Only called on full syncs — incremental syncs leave the existing blob intact.
+    """
+    if not GCS_CATALOG_BUCKET:
+        return
+    try:
+        payload = json.dumps({"items": items, "saved_at": time.time()})
+        _gcs().bucket(GCS_CATALOG_BUCKET).blob(_pl_items_blob_path(company_name)).upload_from_string(
+            payload, content_type="application/json"
+        )
+        logger.info(f"GCS price list items saved: {len(items)} records (company={company_name!r})")
+    except Exception as e:
+        logger.warning(f"GCS price list items save failed (company={company_name!r}): {e}")
+
+
+# ---------------------------------------------------------------------------
 # Customers
 # ---------------------------------------------------------------------------
 
