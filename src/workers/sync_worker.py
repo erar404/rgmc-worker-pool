@@ -25,6 +25,7 @@ Message formats (JSON):
 
   Patch familyCode field on existing Firestore item price documents (uses update, not set):
     { "type": "backfill-family-codes", "company": "RGMC", "on_date": "YYYY-MM-DD" }
+    Omit company (or pass "ALL") to process all companies in BC_COMPANIES. One notification per company.
 
   Patch target ILE columns (quantity, entryType, itemNo, sourceType, description, entryNo,
   postingDate, documentType, sourceNo, documentNo, costAmountActual, salesAmountActual,
@@ -472,34 +473,36 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             )
 
         elif msg_type == "backfill-family-codes":
-            company = (data.get("company") or config.BC_COMPANY).upper()
-            logger.info(f"[{company}] backfill-family-codes: fetching v3 catalog from BC (on_date={on_date!r})")
-            records = fetch_v3_catalog(company, on_date=on_date)
-            logger.info(f"[{company}] backfill-family-codes: {len(records)} records from BC — patching Firestore familyCode")
-            if not records:
-                logger.warning(f"[{company}] backfill-family-codes: BC returned 0 records — nothing to patch")
-                notify_success(
-                    title=f"Family Code Backfill Skipped — {company}",
-                    detail=f"Company: {company}\nBC returned 0 records for on_date={on_date} — Firestore unchanged.",
-                    context=f"on_date={on_date}",
-                )
-            else:
-                result = backfill_family_codes(records, company)
-                logger.info(
-                    f"[{company}] backfill-family-codes complete: {result['patched']} patched, "
-                    f"{result['skipped_missing_product_no']} skipped (no productNo), "
-                    f"{result.get('skipped_no_family_code', 0)} skipped (no familyCode from BC)"
-                )
-                notify_success(
-                    title=f"Family Code Backfill Complete — {company}",
-                    detail=(
-                        f"Company: {company}\n"
-                        f"{result['patched']} documents patched\n"
-                        f"{result['skipped_missing_product_no']} skipped (no productNo)\n"
-                        f"{result.get('skipped_no_family_code', 0)} skipped (BC returned no familyCode)"
-                    ),
-                    context=f"on_date={on_date} bc_records={len(records)}",
-                )
+            company = data.get("company") or "ALL"
+            companies = _get_companies(company)
+            for c in companies:
+                logger.info(f"[{c}] backfill-family-codes: fetching v3 catalog from BC (on_date={on_date!r})")
+                records = fetch_v3_catalog(c, on_date=on_date)
+                logger.info(f"[{c}] backfill-family-codes: {len(records)} records from BC — patching Firestore familyCode")
+                if not records:
+                    logger.warning(f"[{c}] backfill-family-codes: BC returned 0 records — nothing to patch")
+                    notify_success(
+                        title=f"Family Code Backfill Skipped — {c}",
+                        detail=f"Company: {c}\nBC returned 0 records for on_date={on_date} — Firestore unchanged.",
+                        context=f"on_date={on_date}",
+                    )
+                else:
+                    result = backfill_family_codes(records, c)
+                    logger.info(
+                        f"[{c}] backfill-family-codes complete: {result['patched']} patched, "
+                        f"{result['skipped_missing_product_no']} skipped (no productNo), "
+                        f"{result.get('skipped_no_family_code', 0)} skipped (no familyCode from BC)"
+                    )
+                    notify_success(
+                        title=f"Family Code Backfill Complete — {c}",
+                        detail=(
+                            f"Company: {c}\n"
+                            f"{result['patched']} documents patched\n"
+                            f"{result['skipped_missing_product_no']} skipped (no productNo)\n"
+                            f"{result.get('skipped_no_family_code', 0)} skipped (BC returned no familyCode)"
+                        ),
+                        context=f"on_date={on_date} bc_records={len(records)}",
+                    )
 
         elif msg_type == "bq-sync-ile":
             company = data.get("company") or "ALL"
