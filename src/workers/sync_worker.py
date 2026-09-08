@@ -27,6 +27,12 @@ Message formats (JSON):
     { "type": "backfill-family-codes", "company": "RGMC", "on_date": "YYYY-MM-DD" }
     Omit company (or pass "ALL") to process all companies in BC_COMPANIES. One notification per company.
 
+  Patch unitPriceIncVAT + priceListCode on item_prices_{env} from price list lines (best price per
+  product across all active non-IC price lists for on_date; uses merge so other fields are preserved):
+    { "type": "backfill-item-prices", "company": "RGMC", "on_date": "YYYY-MM-DD", "price_list_code": "PLH001" }
+    Omit price_list_code to process all active codes. Omit company (or pass "ALL") for all companies.
+    Also runs automatically as the final stage of every routine-sync.
+
   Patch target ILE columns (quantity, entryType, itemNo, sourceType, description, entryNo,
   postingDate, documentType, sourceNo, documentNo, costAmountActual, salesAmountActual,
   lastModifiedDateTime) on existing Firestore docs and BQ rows using set-with-merge + MERGE:
@@ -72,6 +78,7 @@ from src.services.gcs_catalog import (
 from src.services.price_firestore_service import (
     backfill_family_codes,
     backfill_ile_columns_in_firestore,
+    backfill_item_prices_per_price_list,
     get_sync_state,
     ile_exists_in_firestore,
     prices_exist_in_firestore,
@@ -257,7 +264,11 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
     # are picked up on the next run (no gap, small overlap is fine).
     sync_start = _now_utc()
 
+    # Shared state written by _stage_price_list_headers and read by the post-stage backfill.
+    _synced_headers: list = []
+
     def _stage_price_list_headers() -> None:
+        nonlocal _synced_headers
         try:
             since_headers = get_sync_state(company, "price_list_headers")
             headers_with_lines = fetch_price_list_headers_with_lines(company, since=since_headers)
@@ -277,6 +288,7 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
 
             total_items = 0
             if headers_with_lines:
+                _synced_headers = headers_with_lines  # captured for post-stage price backfill
                 with ThreadPoolExecutor(max_workers=4) as ex:
                     for f in as_completed([ex.submit(_sync_header_lines, h) for h in headers_with_lines]):
                         total_items += f.result()
@@ -375,6 +387,18 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
             executor.submit(_stage_supporting_datasets),
         ]):
             f.result()
+
+    # Stage 5 (sequential): backfill item prices from price list lines.
+    # Runs after stages 1+2 so it reads freshly synced price list data and
+    # does not race with the v3 catalog writes.
+    if _synced_headers:
+        try:
+            result = backfill_item_prices_per_price_list(_synced_headers, company, on_date)
+            logger.info(
+                f"[{company}] item price backfill from price lists: {result['patched']} patched"
+            )
+        except Exception as e:
+            logger.error(f"[{company}] item price backfill from price lists failed — {e}")
 
     logger.info(f"[{company}] sync complete")
 
@@ -503,6 +527,37 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                         ),
                         context=f"on_date={on_date} bc_records={len(records)}",
                     )
+
+        elif msg_type == "backfill-item-prices":
+            company = data.get("company") or "ALL"
+            price_list_code = data.get("price_list_code")
+            companies = _get_companies(company)
+            for c in companies:
+                logger.info(
+                    f"[{c}] backfill-item-prices: fetching price list headers from BC "
+                    f"(price_list_code={price_list_code!r})"
+                )
+                headers_with_lines = fetch_price_list_headers_with_lines(c)
+                logger.info(
+                    f"[{c}] backfill-item-prices: {len(headers_with_lines)} headers — "
+                    f"patching item prices in Firestore"
+                )
+                result = backfill_item_prices_per_price_list(
+                    headers_with_lines, c, on_date, price_list_code
+                )
+                logger.info(
+                    f"[{c}] backfill-item-prices complete: {result['patched']} patched "
+                    f"(price_list_code={price_list_code or 'all'})"
+                )
+                notify_success(
+                    title=f"Item Prices Backfill Complete — {c}",
+                    detail=(
+                        f"Company: {c}\n"
+                        f"{result['patched']} items patched with price list prices\n"
+                        f"Price list: {price_list_code or 'all active non-IC codes'}"
+                    ),
+                    context=f"on_date={on_date} price_list_code={price_list_code or 'all'}",
+                )
 
         elif msg_type == "bq-sync-ile":
             company = data.get("company") or "ALL"

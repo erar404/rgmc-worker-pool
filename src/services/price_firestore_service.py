@@ -419,6 +419,111 @@ def backfill_ile_columns_in_firestore(records: list, company: str, fields: set[s
     return patched
 
 
+_BC_NULL_DATE = "0001-01-01"
+
+
+def backfill_item_prices_per_price_list(
+    headers_with_lines: list,
+    company: str,
+    on_date: str,
+    price_list_code: str | None = None,
+) -> dict:
+    """Patch unitPriceIncVAT and priceListCode on item_prices_{env} from price list line data.
+
+    For each product that appears in the embedded priceListLines, picks the best price:
+    latest startingDate <= on_date wins; header order is the tiebreaker. IC price lists
+    (code starts with "IC" or second segment starts with "IC") are skipped.
+
+    price_list_code: when set, restricts the patch to that specific code only.
+    Uses merge=True so familyCode, blocked, and other fields are never overwritten.
+
+    Returns {patched, skipped_no_product_no, skipped_no_price}.
+    """
+    # Build per-product best-price map across all active price list codes.
+    best: dict[str, dict] = {}
+
+    for header in headers_with_lines:
+        code = (header.get("code") or "").strip()
+        if not code:
+            continue
+        if price_list_code and code != price_list_code:
+            continue
+        code_upper = code.upper()
+        parts = code_upper.split("_")
+        is_ic = code_upper.startswith("IC") or (len(parts) >= 2 and parts[1].startswith("IC"))
+        if is_ic:
+            continue
+
+        for line in (header.get("priceListLines") or []):
+            asset_no = (line.get("assetNo") or "").strip().upper()
+            if not asset_no:
+                continue
+            unit_price = (
+                line.get("unitPriceIncVAT")
+                or line.get("unitPrice")
+                or line.get("unitAmount")
+            )
+            if unit_price is None:
+                continue
+
+            line_date = (line.get("startingDate") or "").strip()[:10]
+            if line_date == _BC_NULL_DATE:
+                line_date = ""
+            if line_date and line_date > on_date:
+                continue
+
+            current = best.get(asset_no)
+            if current is None or line_date > current["startingDate"]:
+                best[asset_no] = {
+                    "unitPriceIncVAT": unit_price,
+                    "priceListCode": code,
+                    "startingDate": line_date,
+                }
+
+    if not best:
+        logger.info(
+            f"backfill_item_prices_per_price_list: no eligible prices found "
+            f"(company={company!r}, price_list_code={price_list_code!r})"
+        )
+        return {"patched": 0, "skipped_no_product_no": 0, "skipped_no_price": 0}
+
+    collection = _prices_collection()
+    db = _firestore()
+    doc_company = company.upper()
+    patched = 0
+    batches: list = []
+    batch = db.batch()
+    count_in_batch = 0
+
+    for product_no, price_data in best.items():
+        ref = db.collection(collection).document(f"{doc_company}_{product_no}")
+        batch.set(
+            ref,
+            {"unitPriceIncVAT": price_data["unitPriceIncVAT"], "priceListCode": price_data["priceListCode"]},
+            merge=True,
+        )
+        count_in_batch += 1
+        patched += 1
+        if count_in_batch >= _BATCH_SIZE:
+            batches.append(batch)
+            batch = db.batch()
+            count_in_batch = 0
+
+    if count_in_batch > 0:
+        batches.append(batch)
+
+    if batches:
+        with ThreadPoolExecutor(max_workers=min(len(batches), _COMMIT_WORKERS)) as ex:
+            for f in as_completed([ex.submit(b.commit) for b in batches]):
+                f.result()
+
+    logger.info(
+        f"backfill_item_prices_per_price_list: {patched} products patched "
+        f"(company={company!r}, on_date={on_date!r}, price_list_code={price_list_code!r})"
+    )
+    return {"patched": patched, "skipped_no_product_no": 0, "skipped_no_price": 0}
+
+
 def get_price_list_items_from_firestore(
     company: str,
     price_list_code: str | None = None,
