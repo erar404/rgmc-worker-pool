@@ -458,29 +458,33 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         elif msg_type == "sync-price-list-items":
             company = data.get("company") or config.BC_COMPANY
             price_list_code = data.get("price_list_code")
-            sync_start = _now_utc()
-            since_headers = get_sync_state(company, "price_list_headers")
-            # Use since only when syncing all codes; targeted single-code sync is always full.
-            effective_since = since_headers if not price_list_code else None
-            headers_with_lines = fetch_price_list_headers_with_lines(company, since=effective_since)
+            companies = _get_companies(company)
             total = 0
-            for header in headers_with_lines:
-                code = header.get("code") or ""
-                lines = header.get("priceListLines") or []
-                if not code:
-                    continue
-                if price_list_code and code != price_list_code:
-                    continue
-                written = sync_price_list_items_to_firestore(lines, company, code)
-                total += written
-                logger.info(f"[{company}] price list items [{code}]: {written} written")
-            if headers_with_lines and not price_list_code:
-                set_sync_state(company, "price_list_headers", sync_start)
-            logger.info(f"[{company}] {total} price list items written total")
+            for c in companies:
+                sync_start = _now_utc()
+                since_headers = get_sync_state(c, "price_list_headers")
+                # Use since only when syncing all codes; targeted single-code sync is always full.
+                effective_since = since_headers if not price_list_code else None
+                headers_with_lines = fetch_price_list_headers_with_lines(c, since=effective_since)
+                company_total = 0
+                for header in headers_with_lines:
+                    code = header.get("code") or ""
+                    lines = header.get("priceListLines") or []
+                    if not code:
+                        continue
+                    if price_list_code and code != price_list_code:
+                        continue
+                    written = sync_price_list_items_to_firestore(lines, c, code)
+                    company_total += written
+                    logger.info(f"[{c}] price list items [{code}]: {written} written")
+                if headers_with_lines and not price_list_code:
+                    set_sync_state(c, "price_list_headers", sync_start)
+                logger.info(f"[{c}] {company_total} price list items written total")
+                total += company_total
             notify_success(
                 title=f"Price List Items Sync Complete — {company}",
-                detail=f"Company: {company}\n{total} items written to Firestore",
-                context=f"price_list_code={price_list_code or 'all'} since={effective_since or 'full'}",
+                detail=f"Companies: {', '.join(companies)}\n{total} items written to Firestore",
+                context=f"price_list_code={price_list_code or 'all'}",
             )
 
         elif msg_type == "sync-item-ledger-entries":
