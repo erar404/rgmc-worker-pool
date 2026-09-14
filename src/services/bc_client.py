@@ -562,6 +562,49 @@ def fetch_item_categories(company_name: str) -> list:
     return _fetch_all_pages(url)
 
 
+def fetch_locations(company_name: str) -> list:
+    """Fetch all locations from BC standard API v2.0."""
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0"
+        f"/companies({company_id})/locations"
+    )
+    logger.info(f"fetch_locations — company={company_name!r}")
+    return _fetch_all_pages(url)
+
+
+def fetch_ship_to_addresses(company_name: str, customer_no: str | None = None) -> list:
+    """Fetch Ship-To Addresses from BC standard API v2.0.
+
+    Pass customer_no to filter by customer; omit for all ship-to addresses.
+    Each record has: id, customerNumber, code, name, address, address2, city, etc.
+    """
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0"
+        f"/companies({company_id})/shipToAddresses"
+    )
+    if customer_no:
+        url += f"?$filter=customerNumber eq '{customer_no}'"
+    logger.info(f"fetch_ship_to_addresses — company={company_name!r} customer_no={customer_no!r}")
+    return _fetch_all_pages(url)
+
+
+def fetch_item_references(company_name: str) -> list:
+    """Fetch all item references from BC standard API v2.0.
+
+    Used to resolve a customer/barcode SKU code to a BC item number.
+    Each record has: id, itemNo, referenceNo, referenceType, unitOfMeasure, description.
+    """
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0"
+        f"/companies({company_id})/itemReferences"
+    )
+    logger.info(f"fetch_item_references — company={company_name!r}")
+    return _fetch_all_pages(url)
+
+
 # ---------------------------------------------------------------------------
 # Order CRUD — v1 (RGMC custom v1.0) and v2 (RGMC custom v2.0)
 # ---------------------------------------------------------------------------

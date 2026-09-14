@@ -223,7 +223,7 @@ gcloud run worker-pools deploy rgmc-worker-pool \
 |BC_SCOPE=https://api.businesscentral.dynamics.com/.default\
 |BC_ENVIRONMENT=Production\
 |BC_COMPANY=RGMC\
-|BC_COMPANIES=RGMC,CGI\
+|BC_COMPANIES=RGMC,CGI,USGI,KW1,LGAP\
 |GCP_PROJECT_ID=$PROJECT\
 |GCP_ENV=Production\
 |GCS_CATALOG_BUCKET=rgmc-bc-catalog-$PROJECT\
