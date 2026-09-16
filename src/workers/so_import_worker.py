@@ -38,6 +38,13 @@ _TRANSIENT_SIGNALS = ("429", "502", "503", "timeout", "ConnectionError", "ReadTi
 
 # UOM rules: if the source unit_of_measurement contains any of these substrings
 # (case-insensitive), treat the line as Piece/Pcs and use poQtyPcs / unitPricePcs.
+# Maps source companyName keywords (upper-case, substring match) → BC company name.
+# Checked in order; first match wins. Falls back to POUL_SO_BC_COMPANY / BC_COMPANY.
+_COMPANY_MAP: list[tuple[str, str]] = [
+    ("SUNCOAST", "SBIC"),
+    ("SBIC", "SBIC"),
+]
+
 _PCS_KEYWORDS = ("pcs", "piece", "pc/s")
 
 # ---------------------------------------------------------------------------
@@ -140,6 +147,14 @@ class _BatchAccumulator:
 _batch = _BatchAccumulator()
 
 
+def _resolve_bc_company(src_company_name: str) -> str:
+    upper = (src_company_name or "").upper()
+    for keyword, bc_company in _COMPANY_MAP:
+        if keyword in upper:
+            return bc_company
+    return config.POUL_SO_BC_COMPANY or config.BC_COMPANY
+
+
 def _is_pcs(uom_raw: str) -> bool:
     lower = (uom_raw or "").lower().strip()
     return any(kw in lower for kw in _PCS_KEYWORDS)
@@ -209,9 +224,9 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
 
     header: dict = data.get("header", {})
     lines: list = data.get("lines", [])
-    company: str = config.POUL_SO_BC_COMPANY or config.BC_COMPANY
-    po_ref: str = header.get("poRefNumber", "unknown")
     company_name_src: str = header.get("companyName", "")
+    company: str = _resolve_bc_company(company_name_src)
+    po_ref: str = header.get("poRefNumber", "unknown")
 
     try:
         # ── Customer lookup ──────────────────────────────────────────────────
