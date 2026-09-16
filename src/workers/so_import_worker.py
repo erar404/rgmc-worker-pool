@@ -55,7 +55,7 @@ _COMPANY_MAP: list[tuple[str, str]] = [
 _PCS_KEYWORDS = ("pcs", "piece", "pc/s")
 
 # Minimum SequenceMatcher ratio (0–1) for a fuzzy ship-to name match to be accepted.
-_SHIP_TO_FUZZY_THRESHOLD = 0.6
+_SHIP_TO_FUZZY_THRESHOLD = 0.5
 
 
 def _normalize_name(s: str) -> str:
