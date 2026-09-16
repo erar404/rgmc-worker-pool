@@ -81,7 +81,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                 raise ValueError(f"Line {i} failed (BC {lh}): {ld}. Order rolled back.")
 
         update_task(task_id, status="done", result=resp_data)
-        logger.info(f"Task {task_id} done — order {resp_data.get('no') or order_id}")
+        logger.info(f"Task {task_id} done — order {resp_data.get('number') or order_id}")
         message.ack()
 
     except ValueError as e:
