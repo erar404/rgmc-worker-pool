@@ -606,7 +606,7 @@ def fetch_ship_to_addresses(company_name: str, customer_no: str | None = None) -
 
 
 def fetch_item_references(company_name: str) -> list:
-    """Fetch all item references from the RGMC custom API v2.0 (Pag50347).
+    """Fetch all item references from the RGMC custom API v2.0 (Pag50349).
 
     Uses the RGMC custom endpoint rather than the standard BC API v2.0
     because the standard /itemReferences entity is not exposed on this BC instance.
