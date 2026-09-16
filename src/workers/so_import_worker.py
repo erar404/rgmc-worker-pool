@@ -29,7 +29,9 @@ On per-order permanent failure: logged + included in the batch email, processing
 """
 import json
 import logging
+import re
 import time
+from difflib import SequenceMatcher
 
 from google.cloud import pubsub_v1
 
@@ -51,6 +53,51 @@ _COMPANY_MAP: list[tuple[str, str]] = [
 # UOM rules: if the source unit_of_measurement contains any of these substrings
 # (case-insensitive), treat the line as Piece/Pcs and use poQtyPcs / unitPricePcs.
 _PCS_KEYWORDS = ("pcs", "piece", "pc/s")
+
+# Minimum SequenceMatcher ratio (0–1) for a fuzzy ship-to name match to be accepted.
+_SHIP_TO_FUZZY_THRESHOLD = 0.6
+
+
+def _normalize_name(s: str) -> str:
+    """Uppercase, strip punctuation, collapse whitespace — for fuzzy comparison."""
+    return " ".join(re.sub(r"[^A-Z0-9\s]", "", (s or "").upper()).split())
+
+
+def _fuzzy_ship_to_lookup(
+    branch_name: str,
+    ship_to_by_name: dict[str, tuple[str, str]],
+) -> tuple[str, str] | None:
+    """Return (customer_no, ship_to_code) for the BC ship-to address whose normalized
+    name has the highest SequenceMatcher similarity to branch_name, provided the ratio
+    is at or above _SHIP_TO_FUZZY_THRESHOLD.  Returns None when no match qualifies.
+    """
+    norm_query = _normalize_name(branch_name)
+    if not norm_query or not ship_to_by_name:
+        return None
+
+    best_ratio = 0.0
+    best_key: str | None = None
+    best_match: tuple[str, str] | None = None
+
+    for norm_bc_name, match_data in ship_to_by_name.items():
+        ratio = SequenceMatcher(None, norm_query, norm_bc_name).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_key = norm_bc_name
+            best_match = match_data
+
+    if best_ratio >= _SHIP_TO_FUZZY_THRESHOLD and best_match is not None:
+        logger.info(
+            f"Fuzzy ship-to match: {branch_name!r} → {best_key!r} "
+            f"(ratio={best_ratio:.2f})"
+        )
+        return best_match
+
+    logger.warning(
+        f"Fuzzy ship-to: no match above threshold {_SHIP_TO_FUZZY_THRESHOLD} "
+        f"for {branch_name!r} (best={best_key!r} ratio={best_ratio:.2f})"
+    )
+    return None
 
 
 def _resolve_bc_company(src_company_name: str) -> str:
@@ -138,9 +185,14 @@ def _create_order(
 
     # ── Customer lookup via Ship-to Address ───────────────────────────────────
     branch_code: str = (header.get("customerBranchLookUpCode") or "").strip().upper()
-    branch_name: str = (header.get("customerBranchName") or "").strip().upper()
+    branch_name: str = (header.get("customerBranchName") or "").strip()
 
-    ship_to_match = ship_to_by_code.get(branch_code) or ship_to_by_name.get(branch_name)
+    # 1. Exact code match (fastest, most reliable)
+    # 2. Fuzzy name match (SequenceMatcher on normalized strings)
+    ship_to_match = (
+        ship_to_by_code.get(branch_code)
+        or _fuzzy_ship_to_lookup(branch_name, ship_to_by_name)
+    )
     if not ship_to_match:
         raise ValueError(
             f"No ship-to address in BC for branch code={branch_code!r} / "
@@ -325,7 +377,9 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         message.ack()
         return
 
-    # Build ship-to lookup maps: upper-cased code/name → (customer_no, ship_to_code)
+    # Build ship-to lookup maps
+    # ship_to_by_code: exact upper-cased code → (customer_no, ship_to_code)
+    # ship_to_by_name: normalized BC name → (customer_no, ship_to_code), used for fuzzy match
     ship_to_by_code: dict[str, tuple[str, str]] = {}
     ship_to_by_name: dict[str, tuple[str, str]] = {}
     for st in ship_tos:
@@ -336,7 +390,9 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             continue
         ship_to_by_code[st_code.upper()] = (cust_no, st_code)
         if st_name:
-            ship_to_by_name[st_name.upper()] = (cust_no, st_code)
+            norm_name = _normalize_name(st_name)
+            if norm_name:
+                ship_to_by_name[norm_name] = (cust_no, st_code)
 
     ref_map: dict[str, str] = {
         r.get("referenceNo", "").upper(): r["itemNo"]
