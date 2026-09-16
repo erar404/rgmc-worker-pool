@@ -11,7 +11,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import Any, Iterable
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -504,25 +504,40 @@ def fetch_price_list_headers(company_name: str, odata_filter: str | None = None)
     return _fetch_all_pages(url)
 
 
-def fetch_price_list_headers_with_lines(company_name: str, since: str | None = None) -> list:
-    """Fetch priceListHeaders with embedded priceListLines via OData $expand.
+def fetch_price_list_lines_for_code(company_name: str, code: str) -> list:
+    """Fetch the priceListLines of a single price list header via $expand + $filter=code.
 
-    Pass since (UTC ISO string) to fetch only headers modified after that timestamp.
-    Lines are embedded in their parent header — so a header change brings all its
-    current lines. If only a line changes without touching its header, pass since=None
-    for a full sync to pick it up.
+    One header at a time keeps memory bounded — the previous all-headers $expand pulled
+    150 MB of JSON for RGMC into a single response.
     """
     company_id = get_company_id(company_name)
-    base = (
+    code_esc = code.replace("'", "''")
+    url = (
         f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
         f"/companies({company_id})/priceListHeaders"
+        f"?$expand=priceListLines&$filter=code eq '{code_esc}'"
     )
-    if since:
-        url = f"{base}?$expand=priceListLines&$filter=lastModifiedDateTime gt {since}"
-    else:
-        url = f"{base}?$expand=priceListLines"
-    logger.info(f"fetch_price_list_headers_with_lines — company={company_name!r} since={since!r}")
-    return _fetch_all_pages(url)
+    headers = _fetch_all_pages(url)
+    lines: list = []
+    for h in headers:
+        lines.extend(h.get("priceListLines") or [])
+    return lines
+
+
+def iter_price_list_headers_with_lines(company_name: str, codes: Iterable[str] | None = None):
+    """Yield {**header, "priceListLines": [...]} one header at a time.
+
+    codes restricts which headers get their lines fetched; every header is still yielded
+    (with an empty line list) so callers see the complete header set.
+    """
+    wanted = set(codes) if codes is not None else None
+    for header in fetch_price_list_headers(company_name):
+        code = header.get("code") or ""
+        if code and (wanted is None or code in wanted):
+            lines = fetch_price_list_lines_for_code(company_name, code)
+        else:
+            lines = []
+        yield {**header, "priceListLines": lines}
 
 
 # ---------------------------------------------------------------------------

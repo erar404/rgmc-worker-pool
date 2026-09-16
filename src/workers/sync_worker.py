@@ -4,10 +4,10 @@ Subscribes to PUBSUB_SYNC_SUBSCRIPTION and dispatches based on the "type" field.
 
 Message formats (JSON):
 
-  Routine sync — all companies (price list headers + item prices + item ledger entries):
+  Routine sync — all companies (price lists + item prices + item ledger entries + GCS blobs):
     { "type": "routine-sync", "on_date": "YYYY-MM-DD" }
 
-  Single company item prices (also syncs price list headers + item ledger entries):
+  Single company (same stages as routine-sync, one company):
     { "type": "sync-item-prices", "company": "RGMC", "on_date": "YYYY-MM-DD", "page_size": 500 }
 
   Single company price list headers only:
@@ -23,32 +23,34 @@ Message formats (JSON):
     { "type": "bq-sync-ile", "company": "RGMC", "since_date": "YYYY-MM-DD" }
     Omit since_date for a full sync. "ALL" expands to all configured companies.
 
-  Patch familyCode field on existing Firestore item price documents (uses update, not set):
+  Patch familyCode field on existing Firestore item price documents:
     { "type": "backfill-family-codes", "company": "RGMC", "on_date": "YYYY-MM-DD" }
-    Omit company (or pass "ALL") to process all companies in BC_COMPANIES. One notification per company.
+    Omit company (or pass "ALL") to process all companies in BC_COMPANIES.
 
-  Patch unitPriceIncVAT + priceListCode on item_prices_{env} from price list lines (best price per
-  product across all active non-IC price lists for on_date; uses merge so other fields are preserved):
+  Patch unitPriceIncVAT + priceListCode on item_prices_{env} from price list lines:
     { "type": "backfill-item-prices", "company": "RGMC", "on_date": "YYYY-MM-DD", "price_list_code": "PLH001" }
-    Omit price_list_code to process all active codes. Omit company (or pass "ALL") for all companies.
-    Also runs automatically as the final stage of every routine-sync.
+    Omit price_list_code to process all non-IC codes. Omit company (or pass "ALL") for all companies.
 
-  Patch target ILE columns (quantity, entryType, itemNo, sourceType, description, entryNo,
-  postingDate, documentType, sourceNo, documentNo, costAmountActual, salesAmountActual,
-  lastModifiedDateTime) on existing Firestore docs and BQ rows using set-with-merge + MERGE:
+  Patch target ILE columns on existing Firestore docs and BQ rows:
     { "type": "backfill-ile-columns", "company": "RGMC", "since_date": "YYYY-MM-DD" }
-    Omit since_date to backfill all records. "ALL" expands to all configured companies.
 
   Connectivity test (bc-api → worker pool):
     { "type": "ping", "sent_at": "ISO8601", "sent_by": "bc-api", "note": "optional" }
 
 Cloud Scheduler publishes { "type": "routine-sync" } to the rgmc-sync topic on a cron schedule.
-The main API can publish any of the above to trigger targeted syncs or test connectivity.
 
-Sync state is persisted to sync_state_{env} Firestore collection, keyed by
-{company}_{collection_type} (e.g. "RGMC_item_ledger_entries"). Incremental syncs
-use the stored lastSyncAt timestamp as a modifiedFrom filter. Missing collection →
-forced full fetch even when a state record exists.
+What a company sync produces
+----------------------------
+Firestore (unchanged shape): price_list_headers, price_list_items, item_prices (raw BC prices,
+then patched by the best-price backfill), item_ledger_entries, sync_state.
+
+GCS (read by the BC API on every catalog request — see gcs_catalog.py for the layout):
+families/{FAMILY}.json blobs with the active-price-list overlay already applied for
+on_date, a streamed catalog.json, prices.json for change detection, price_overrides.json
+for historical-date lookups, price_list_headers.json, customers/contacts/item_categories.
+
+Sync state is persisted to sync_state_{env}, keyed by {company}_{collection_type}.
+Incremental syncs use the stored lastSyncAt as a lastModifiedDateTime filter.
 """
 import datetime
 import json
@@ -64,18 +66,30 @@ from src.services.bc_client import (
     fetch_item_categories,
     fetch_item_ledger_entries,
     fetch_price_list_headers,
-    fetch_price_list_headers_with_lines,
+    fetch_price_list_lines_for_code,
     fetch_v3_catalog,
     get_all_company_names,
+    iter_price_list_headers_with_lines,
 )
 from src.services.gcs_catalog import (
-    save_catalog,
+    family_blob_name,
+    load_family_index,
+    load_family_records,
+    load_prices_index,
+    save_catalog_streaming,
     save_contacts,
     save_customers,
+    save_family_blob,
+    save_family_index,
     save_item_categories,
-    save_pl_items,
+    save_pl_headers,
+    save_price_overrides,
+    save_prices_index,
+    save_search_index,
+    slim_record,
 )
 from src.services.price_firestore_service import (
+    apply_best_prices_to_firestore,
     backfill_family_codes,
     backfill_ile_columns_in_firestore,
     backfill_item_prices_per_price_list,
@@ -87,6 +101,13 @@ from src.services.price_firestore_service import (
     sync_price_list_headers_to_firestore,
     sync_price_list_items_to_firestore,
     sync_prices_to_firestore,
+)
+from src.services.price_overlay import (
+    BestPriceAccumulator,
+    OverrideAccumulator,
+    active_price_list_codes,
+    compact_index_lines,
+    is_ic_code,
 )
 from src.services.bigquery_ile_service import (
     backfill_ile_columns_in_bigquery,
@@ -105,12 +126,7 @@ def _now_utc() -> str:
 
 
 def _get_companies(company: str) -> list[str]:
-    """Expand company to a list of real BC company names.
-
-    If company is "ALL" (or empty), returns companies from BC_COMPANIES env var
-    (comma-separated), filtering out "ALL" entries. If BC_COMPANIES is not set or
-    still resolves to nothing, falls back to fetching the full list from BC.
-    """
+    """Expand company to a list of real BC company names ("ALL" → BC_COMPANIES or BC's list)."""
     if company.upper() != "ALL":
         return [company]
     env_companies = [
@@ -128,14 +144,9 @@ _ILE_PAGE_SIZE = 5000
 
 
 def _sync_item_ledger_entries(company: str, since_date: str | None = None) -> int:
-    """Fetch all item ledger entries for one company (with limit/offset paging) and write to Firestore.
-
-    since_date (YYYY-MM-DD): only fetch records modified on or after this date.
-    Omit for a full fetch. Returns total records written.
-    """
+    """Fetch all item ledger entries for one company (with limit/offset paging) and write to Firestore."""
     sync_start = _now_utc()
 
-    # If we have a stored sync timestamp but the collection is empty, force a full re-fetch.
     if since_date is not None and not ile_exists_in_firestore(company):
         logger.info(
             f"[{company}] ILE collection empty despite stored sync state "
@@ -175,12 +186,7 @@ _ILE_BACKFILL_COLUMNS: set[str] = {
 
 
 def _backfill_ile_columns(company: str, since_date: str | None = None) -> dict:
-    """Re-fetch ILE from BC and patch target columns in Firestore and BigQuery.
-
-    For Firestore: set-with-merge so only the target fields are written.
-    For BigQuery: ensure_table adds any missing columns, then MERGE updates all rows.
-    Returns {"firestore": <patched>, "bq": <rows>}.
-    """
+    """Re-fetch ILE from BC and patch target columns in Firestore and BigQuery."""
     ensure_table(company)
     total_fs = 0
     total_bq = 0
@@ -205,15 +211,7 @@ def _backfill_ile_columns(company: str, since_date: str | None = None) -> dict:
 
 
 def _sync_ile_to_bigquery(company: str, since_date: str | None = None) -> tuple[int, list[str]]:
-    """Fetch all ILE records for one company from BC and stream them into BigQuery.
-
-    When since_date is None, queries the BQ table for MAX(lastModifiedDateTime) of
-    the company's existing rows and uses that date as the incremental watermark.
-    Pass since_date explicitly (YYYY-MM-DD) to override, or pass "" to force a full fetch.
-    Returns (total_rows_inserted, columns_added_to_table).
-    """
-    # Patch schema first so any new columns exist before the first insert.
-    # Also captures which columns (if any) were added to an existing table.
+    """Fetch all ILE records for one company from BC and stream them into BigQuery."""
     cols_added = ensure_table(company)
 
     if since_date is None:
@@ -245,18 +243,165 @@ def _sync_ile_to_bigquery(company: str, since_date: str | None = None) -> tuple[
     return total, cols_added
 
 
+# ---------------------------------------------------------------------------
+# Company sync stages
+# ---------------------------------------------------------------------------
+
+def _stage_price_lists(company: str, on_date: str, sync_start: str) -> tuple[dict, dict]:
+    """Sync price lists and compute the two price maps.
+
+    Returns (overlay, best):
+      overlay — API-semantics map baked into the GCS catalog for on_date
+      best    — worker-semantics map patched into Firestore item_prices
+
+    Headers are always fetched in full (small). Lines are fetched one header at a time,
+    only for headers that changed since the last sync (→ Firestore) or that are active
+    Sale lists on on_date (→ overlay). Each header's lines are dropped before the next
+    fetch, so peak memory is one price list.
+    """
+    since = get_sync_state(company, "price_list_headers")
+    all_headers = fetch_price_list_headers(company)
+    logger.info(f"[{company}] {len(all_headers)} price list headers from BC (since={since!r})")
+
+    changed = {
+        h.get("code") for h in all_headers
+        if h.get("code") and (since is None or (h.get("lastModifiedDateTime") or "") > since)
+    }
+    active = active_price_list_codes(all_headers, on_date)
+    need_lines = changed | set(active)
+
+    sync_price_list_headers_to_firestore(all_headers, company)
+    save_pl_headers(company, [{**h, "company": company} for h in all_headers])
+
+    overlay = OverrideAccumulator(active)
+    best = BestPriceAccumulator(on_date)
+    index: dict[str, dict] = {}
+    items_written = 0
+
+    for header in all_headers:
+        code = header.get("code") or ""
+        if code not in need_lines:
+            continue
+        lines = fetch_price_list_lines_for_code(company, code)
+        if code in changed:
+            n = sync_price_list_items_to_firestore(lines, company, code)
+            items_written += n
+            logger.info(f"[{company}] price list items [{code}]: {n} written")
+        if code in active:
+            overlay.add_lines(code, lines)
+            index[code] = compact_index_lines(lines)
+        best.add_header(header, lines)
+        del lines
+
+    save_price_overrides(company, on_date, index)
+    if all_headers:
+        set_sync_state(company, "price_list_headers", sync_start)
+
+    logger.info(
+        f"[{company}] price lists: {len(changed)} changed, {len(active)} active on {on_date}, "
+        f"{items_written} items written, overlay covers {len(overlay.as_map())} products"
+    )
+    return overlay.as_map(), best.best
+
+
+def _assemble_catalog(
+    company: str,
+    on_date: str,
+    sync_start: str,
+    records: list,
+    full: bool,
+    overlay: dict,
+) -> dict[str, int]:
+    """Rebuild the GCS family blobs, prices index and streamed catalog.json.
+
+    full=True  — records is the whole catalog; families are grouped from it.
+    full=False — records are the items changed since the last sync; each existing family
+                 blob is loaded, merged, re-overlaid and saved one family at a time.
+
+    A record whose overlaid price or priceListCode differs from the previous sync gets
+    priceChangedAt=sync_start so the app's modified_since delta sync picks it up — BC's
+    lastModifiedDateTime does not move when only a price list changes.
+    """
+    prev_prices = load_prices_index(company)
+    new_prices: dict[str, list] = {}
+    search_entries: list = []
+
+    def finalize(raw: list, fam: str) -> list:
+        out = []
+        for rec in raw:
+            if rec.get("blocked") is True:
+                continue
+            pno = rec.get("productNo")
+            if not pno:
+                continue
+            search_entries.append([pno, (rec.get("description") or "").lower(), fam])
+            base_price = rec.get("bcUnitPriceIncVAT", rec.get("unitPriceIncVAT"))
+            base_plc = rec.get("bcPriceListCode", rec.get("priceListCode"))
+            rec = {**rec, "unitPriceIncVAT": base_price, "priceListCode": base_plc,
+                   "bcUnitPriceIncVAT": base_price, "bcPriceListCode": base_plc}
+            ov = overlay.get(pno)
+            if ov:
+                rec.update(ov)
+            price, plc = rec.get("unitPriceIncVAT"), rec.get("priceListCode")
+            prev = prev_prices.get(pno)
+            if prev is not None and (prev[0] != price or prev[1] != plc):
+                rec["priceChangedAt"] = sync_start
+            new_prices[pno] = [price, plc]
+            out.append(slim_record(rec))
+        return out
+
+    families: dict[str, int] = {}
+    slim_by_family: dict[str, list] = {}
+
+    if full:
+        groups: dict[str, list] = {}
+        for rec in records:
+            groups.setdefault(family_blob_name(rec.get("familyCode") or ""), []).append(rec)
+        records.clear()
+        for fam in list(groups):
+            slim = finalize(groups.pop(fam), fam)
+            families[fam] = len(slim)
+            slim_by_family[fam] = slim
+            save_family_blob(company, fam, on_date, on_date, slim)
+    else:
+        index = load_family_index(company) or {}
+        existing = set((index.get("families") or {}).keys())
+        changed_by_family: dict[str, list] = {}
+        new_family_of: dict[str, str] = {}
+        for rec in records:
+            fam = family_blob_name(rec.get("familyCode") or "")
+            changed_by_family.setdefault(fam, []).append(rec)
+            if rec.get("productNo"):
+                new_family_of[rec["productNo"]] = fam
+        for fam in sorted(existing | set(changed_by_family)):
+            by_pno: dict[str, dict] = {}
+            if fam in existing:
+                for r in load_family_records(company, fam):
+                    pno = r.get("productNo")
+                    # Drop items that moved to another family in this delta.
+                    if pno and new_family_of.get(pno, fam) == fam:
+                        by_pno[pno] = r
+            for r in changed_by_family.get(fam, []):
+                by_pno[r["productNo"]] = r
+            slim = finalize(list(by_pno.values()), fam)
+            families[fam] = len(slim)
+            slim_by_family[fam] = slim
+            save_family_blob(company, fam, on_date, on_date, slim)
+
+    save_catalog_streaming(company, on_date, on_date, ((fam, slim_by_family[fam]) for fam in slim_by_family))
+    save_family_index(company, on_date, on_date, families)
+    save_prices_index(company, new_prices)
+    save_search_index(company, search_entries)
+    return families
+
+
 def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
-    """Sync all datasets for a single company concurrently.
+    """Sync all datasets for a single company.
 
-    Uses lastModifiedDateTime-based incremental sync: only records modified since the
-    last successful sync are fetched from BC and written to Firestore. First run (no
-    stored sync state) falls back to a full fetch.
-
-    Four independent stages run in parallel:
-      1. price list headers + items (one per price list code, also in parallel)
-      2. v3 item price catalog → GCS + Firestore
-      3. item ledger entries → Firestore
-      4. supporting datasets (customers, contacts, item categories) → GCS
+    Stages 1 (price lists), 2 (v3 catalog fetch + Firestore), 3 (item ledger entries) and
+    4 (customers/contacts/categories → GCS) run in parallel. Stage 5 then bakes the price
+    overlay from stage 1 into the catalog from stage 2 and rebuilds the GCS blobs, and
+    stage 6 patches Firestore item_prices with the best-price map.
     """
     logger.info(f"[{company}] sync started — on_date={on_date!r}")
 
@@ -264,74 +409,38 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
     # are picked up on the next run (no gap, small overlap is fine).
     sync_start = _now_utc()
 
-    # Shared state written by _stage_price_list_headers and read by the post-stage backfill.
-    _synced_headers: list = []
+    price_maps: dict = {"overlay": {}, "best": {}}
+    catalog: dict = {"records": None, "full": False}
 
-    def _stage_price_list_headers() -> None:
-        nonlocal _synced_headers
+    def _stage_price_lists_wrapped() -> None:
         try:
-            since_headers = get_sync_state(company, "price_list_headers")
-            headers_with_lines = fetch_price_list_headers_with_lines(company, since=since_headers)
-            headers = [{k: v for k, v in h.items() if k != "priceListLines"} for h in headers_with_lines]
-            written = sync_price_list_headers_to_firestore(headers, company)
-            logger.info(f"[{company}] {written} price list headers written (since={since_headers!r})")
-
-            # Sync each price list code's lines in parallel.
-            def _sync_header_lines(header: dict) -> int:
-                code = header.get("code") or ""
-                lines = header.get("priceListLines") or []
-                if not (code and lines):
-                    return 0
-                n = sync_price_list_items_to_firestore(lines, company, code)
-                logger.info(f"[{company}] price list items [{code}]: {n} written")
-                return n
-
-            total_items = 0
-            if headers_with_lines:
-                _synced_headers = headers_with_lines  # captured for post-stage price backfill
-                with ThreadPoolExecutor(max_workers=4) as ex:
-                    for f in as_completed([ex.submit(_sync_header_lines, h) for h in headers_with_lines]):
-                        total_items += f.result()
-                set_sync_state(company, "price_list_headers", sync_start)
-
-                # On full syncs only: write all price list items to GCS so the BC API's
-                # get_price_overrides_from_price_list_items can serve from the memory cache
-                # instead of issuing per-batch Firestore queries on every request.
-                if since_headers is None:
-                    all_lines = []
-                    for header in headers_with_lines:
-                        code = header.get("code") or ""
-                        for line in (header.get("priceListLines") or []):
-                            all_lines.append({**line, "priceListCode": code, "company": company})
-                    try:
-                        save_pl_items(company, all_lines)
-                        logger.info(f"[{company}] {len(all_lines)} price list items saved to GCS")
-                    except Exception as _e:
-                        logger.error(f"[{company}] price list items GCS save failed — {_e}")
-
-            logger.info(f"[{company}] {total_items} price list items written total")
+            overlay, best = _stage_price_lists(company, on_date, sync_start)
+            price_maps["overlay"], price_maps["best"] = overlay, best
         except Exception as e:
             logger.error(f"[{company}] price list headers/items failed — {e}")
 
     def _stage_v3_catalog() -> None:
         try:
             since_prices = get_sync_state(company, "item_prices")
-            # If the collection is empty despite a stored sync timestamp, the previous sync
-            # completed (setting the state) but Firestore writes failed or were lost.
-            # Force a full fetch so we actually populate the collection.
+            # The collection being empty despite a stored state means the previous run's
+            # writes were lost — force a full fetch so it actually gets populated.
             if since_prices is not None and not prices_exist_in_firestore(company):
                 logger.info(
                     f"[{company}] item_prices collection empty despite stored sync state "
                     f"(since={since_prices!r}) — forcing full fetch"
                 )
                 since_prices = None
+            # First run after the GCS layout change has no family index yet — a full
+            # fetch is the only way to build it.
+            if since_prices is not None and load_family_index(company) is None:
+                logger.info(f"[{company}] no GCS family index yet — forcing full catalog fetch")
+                since_prices = None
             records = fetch_v3_catalog(company, on_date, since=since_prices)
-            # Only save a full GCS snapshot on full-fetch runs; incremental results are partial.
-            if since_prices is None:
-                save_catalog(company, on_date, records)
             total = sync_prices_to_firestore(records, company, on_date)
             if records:
                 set_sync_state(company, "item_prices", sync_start)
+            catalog["records"] = records
+            catalog["full"] = since_prices is None
             logger.info(f"[{company}] {total} item prices written total (since={since_prices!r})")
         except Exception as e:
             logger.error(f"[{company}] item prices failed — {e}")
@@ -339,19 +448,16 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
     def _stage_ile() -> None:
         try:
             since_ile = get_sync_state(company, "item_ledger_entries")
-            # Convert stored UTC datetime string to date string for BC's modifiedFrom filter.
             since_date_ile = since_ile[:10] if since_ile else None
             _sync_item_ledger_entries(company, since_date=since_date_ile)
         except Exception as e:
             logger.error(f"[{company}] item ledger entries failed — {e}")
 
     def _stage_supporting_datasets() -> None:
-        # Customers, contacts, and item categories are independent — fetch+save in parallel.
         def _sync_customers() -> None:
             try:
                 customers = fetch_customers(company)
                 save_customers(company, customers)
-                logger.info(f"[{company}] {len(customers)} customers saved to GCS")
             except Exception as e:
                 logger.error(f"[{company}] customers GCS sync failed — {e}")
 
@@ -359,7 +465,6 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
             try:
                 contacts = fetch_contacts(company)
                 save_contacts(company, contacts)
-                logger.info(f"[{company}] {len(contacts)} contacts saved to GCS")
             except Exception as e:
                 logger.error(f"[{company}] contacts GCS sync failed — {e}")
 
@@ -367,7 +472,6 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
             try:
                 categories = fetch_item_categories(company)
                 save_item_categories(company, categories)
-                logger.info(f"[{company}] {len(categories)} item categories saved to GCS")
             except Exception as e:
                 logger.error(f"[{company}] item categories GCS sync failed — {e}")
 
@@ -381,22 +485,29 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         for f in as_completed([
-            executor.submit(_stage_price_list_headers),
+            executor.submit(_stage_price_lists_wrapped),
             executor.submit(_stage_v3_catalog),
             executor.submit(_stage_ile),
             executor.submit(_stage_supporting_datasets),
         ]):
             f.result()
 
-    # Stage 5 (sequential): backfill item prices from price list lines.
-    # Runs after stages 1+2 so it reads freshly synced price list data and
-    # does not race with the v3 catalog writes.
-    if _synced_headers:
+    # Stage 5: bake the overlay into the catalog and rebuild the GCS blobs.
+    records = catalog["records"]
+    if records is not None and (records or catalog["full"] is False):
         try:
-            result = backfill_item_prices_per_price_list(_synced_headers, company, on_date)
-            logger.info(
-                f"[{company}] item price backfill from price lists: {result['patched']} patched"
-            )
+            families = _assemble_catalog(company, on_date, sync_start, records, catalog["full"], price_maps["overlay"])
+            logger.info(f"[{company}] GCS catalog rebuilt: {sum(families.values())} records in {len(families)} families")
+        except Exception as e:
+            logger.error(f"[{company}] GCS catalog assembly failed — {e}")
+    elif records is not None:
+        logger.warning(f"[{company}] full catalog fetch returned 0 records — GCS blobs left unchanged")
+
+    # Stage 6: patch Firestore item_prices with the best price per product.
+    if price_maps["best"]:
+        try:
+            patched = apply_best_prices_to_firestore(price_maps["best"], company)
+            logger.info(f"[{company}] item price backfill from price lists: {patched} patched")
         except Exception as e:
             logger.error(f"[{company}] item price backfill from price lists failed — {e}")
 
@@ -417,7 +528,6 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
 
     try:
         if msg_type == "routine-sync":
-            # Split BC_COMPANIES/BC_COMPANY; filter out "ALL" sentinels; fall back to BC API.
             raw = [c.strip() for c in (config.BC_COMPANIES or config.BC_COMPANY or "").split(",") if c.strip()]
             companies = [c for c in raw if c.upper() != "ALL"]
             if not companies:
@@ -442,17 +552,16 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         elif msg_type == "sync-price-list-headers":
             company = data.get("company") or config.BC_COMPANY
             sync_start = _now_utc()
-            since_headers = get_sync_state(company, "price_list_headers")
-            headers_with_lines = fetch_price_list_headers_with_lines(company, since=since_headers)
-            headers = [{k: v for k, v in h.items() if k != "priceListLines"} for h in headers_with_lines]
+            headers = fetch_price_list_headers(company)
             written = sync_price_list_headers_to_firestore(headers, company)
-            if headers_with_lines:
+            save_pl_headers(company, [{**h, "company": company} for h in headers])
+            if headers:
                 set_sync_state(company, "price_list_headers", sync_start)
-            logger.info(f"[{company}] {written} price list headers written (since={since_headers!r})")
+            logger.info(f"[{company}] {written} price list headers written")
             notify_success(
                 title=f"Price List Headers Sync Complete — {company}",
                 detail=f"Company: {company}\n{written} headers written to Firestore",
-                context=f"since={since_headers or 'full'}",
+                context="full",
             )
 
         elif msg_type == "sync-price-list-items":
@@ -463,21 +572,22 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             for c in companies:
                 sync_start = _now_utc()
                 since_headers = get_sync_state(c, "price_list_headers")
-                # Use since only when syncing all codes; targeted single-code sync is always full.
-                effective_since = since_headers if not price_list_code else None
-                headers_with_lines = fetch_price_list_headers_with_lines(c, since=effective_since)
+                headers = fetch_price_list_headers(c)
+                if price_list_code:
+                    codes = [price_list_code]
+                else:
+                    codes = [
+                        h.get("code") for h in headers
+                        if h.get("code") and (since_headers is None or (h.get("lastModifiedDateTime") or "") > since_headers)
+                    ]
                 company_total = 0
-                for header in headers_with_lines:
-                    code = header.get("code") or ""
-                    lines = header.get("priceListLines") or []
-                    if not code:
-                        continue
-                    if price_list_code and code != price_list_code:
-                        continue
+                for code in codes:
+                    lines = fetch_price_list_lines_for_code(c, code)
                     written = sync_price_list_items_to_firestore(lines, c, code)
                     company_total += written
                     logger.info(f"[{c}] price list items [{code}]: {written} written")
-                if headers_with_lines and not price_list_code:
+                    del lines
+                if headers and not price_list_code:
                     set_sync_state(c, "price_list_headers", sync_start)
                 logger.info(f"[{c}] {company_total} price list items written total")
                 total += company_total
@@ -489,7 +599,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
 
         elif msg_type == "sync-item-ledger-entries":
             company = data.get("company") or "ALL"
-            since_date = data.get("since_date")  # YYYY-MM-DD, optional
+            since_date = data.get("since_date")
             companies = _get_companies(company)
             total = 0
             for c in companies:
@@ -537,17 +647,18 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             price_list_code = data.get("price_list_code")
             companies = _get_companies(company)
             for c in companies:
+                headers = fetch_price_list_headers(c)
+                codes = [
+                    h.get("code") for h in headers
+                    if h.get("code") and not is_ic_code(h["code"])
+                    and (not price_list_code or h["code"] == price_list_code)
+                ]
                 logger.info(
-                    f"[{c}] backfill-item-prices: fetching price list headers from BC "
+                    f"[{c}] backfill-item-prices: {len(codes)} price lists to read "
                     f"(price_list_code={price_list_code!r})"
                 )
-                headers_with_lines = fetch_price_list_headers_with_lines(c)
-                logger.info(
-                    f"[{c}] backfill-item-prices: {len(headers_with_lines)} headers — "
-                    f"patching item prices in Firestore"
-                )
                 result = backfill_item_prices_per_price_list(
-                    headers_with_lines, c, on_date, price_list_code
+                    iter_price_list_headers_with_lines(c, codes), c, on_date, price_list_code
                 )
                 logger.info(
                     f"[{c}] backfill-item-prices complete: {result['patched']} patched "
@@ -565,8 +676,6 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
 
         elif msg_type == "bq-sync-ile":
             company = data.get("company") or "ALL"
-            # since_date (YYYY-MM-DD) overrides the BQ watermark; omit for auto-incremental.
-            # Pass "" to force a full re-fetch regardless of existing BQ data.
             since_date = data.get("since_date")
             triggered_at = data.get("triggered_at", "")
             companies = _get_companies(company)

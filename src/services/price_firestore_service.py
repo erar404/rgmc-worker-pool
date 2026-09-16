@@ -11,17 +11,21 @@ Document IDs:
   price_list_items     → {company}_{priceListCode}_{lineNo}  (fallback: _{id})
 """
 import logging
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
+from typing import Iterable
 
 from google.cloud import firestore
 
 from src.config import GCP_ENV, GCP_PROJECT_ID
+from src.services.price_overlay import BestPriceAccumulator
 
 logger = logging.getLogger("price_firestore_service")
 
 _db: firestore.Client | None = None
 _BATCH_SIZE = 500
+_COMMIT_WORKERS = 8
 
 
 def _firestore() -> firestore.Client:
@@ -51,6 +55,72 @@ def _state_collection() -> str:
     return f"sync_state_{_env_slug()}"
 
 
+def _ile_collection() -> str:
+    return f"item_ledger_entries_{_env_slug()}"
+
+
+class _BatchWriter:
+    """Commit 500-document batches in the background with a bounded number in flight.
+
+    Peak memory is (max_in_flight + 1) batches regardless of how many documents are
+    written — the previous implementation built every batch up front, which for a full
+    catalog meant a second copy of the whole dataset in protobuf form.
+    """
+
+    def __init__(self, db: firestore.Client, max_in_flight: int = _COMMIT_WORKERS):
+        self._db = db
+        self._batch = db.batch()
+        self._pending = 0
+        self.written = 0
+        self._executor = ThreadPoolExecutor(max_workers=max_in_flight)
+        self._slots = threading.Semaphore(max_in_flight)
+        self._futures: list = []
+
+    def set(self, ref, data: dict, merge: bool = False) -> None:
+        self._batch.set(ref, data, merge=merge)
+        self._pending += 1
+        self.written += 1
+        if self._pending >= _BATCH_SIZE:
+            self._flush()
+
+    def _commit(self, batch) -> None:
+        try:
+            batch.commit()
+        finally:
+            self._slots.release()
+
+    def _flush(self) -> None:
+        if self._pending == 0:
+            return
+        batch, self._batch, self._pending = self._batch, self._db.batch(), 0
+        self._slots.acquire()
+        self._futures.append(self._executor.submit(self._commit, batch))
+        still_running = []
+        for f in self._futures:
+            if f.done():
+                f.result()
+            else:
+                still_running.append(f)
+        self._futures = still_running
+
+    def close(self) -> None:
+        try:
+            self._flush()
+            for f in self._futures:
+                f.result()
+        finally:
+            self._executor.shutdown(wait=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.close()
+        else:
+            self._executor.shutdown(wait=False)
+
+
 def get_sync_state(company: str, collection_type: str) -> str | None:
     """Return the UTC ISO timestamp of the last successful sync for (company, collection_type), or None."""
     db = _firestore()
@@ -72,7 +142,6 @@ def set_sync_state(company: str, collection_type: str, timestamp: str) -> None:
 
 
 def prices_exist_in_firestore(company: str) -> bool:
-    """Return True if at least one item price record exists for this company."""
     db = _firestore()
     docs = db.collection(_prices_collection()).where("company", "==", company).limit(1).stream()
     return any(True for _ in docs)
@@ -86,15 +155,9 @@ def get_prices_from_firestore(
     price_list_code: str | None = None,
     include_blocked: bool = False,
 ) -> list:
-    """Return item prices from Firestore for the given company and current GCP_ENV.
-
-    All filters are applied in Python after a single company-scoped query — avoids
-    composite index requirements. Returns [] when the collection is empty or filters
-    match nothing.
-    """
-    collection = _prices_collection()
+    """Return item prices from Firestore; filters applied in Python after a company-scoped query."""
     db = _firestore()
-    docs = db.collection(collection).where("company", "==", company).stream()
+    docs = db.collection(_prices_collection()).where("company", "==", company).stream()
     nos_set = set(product_nos) if product_nos else None
     results = []
     for doc in docs:
@@ -119,13 +182,8 @@ def get_price_list_headers_from_firestore(
     item_family_code: str | None = None,
     price_type: str | None = None,
 ) -> list:
-    """Return price list headers from Firestore for the given company and current GCP_ENV.
-
-    Filters are applied in Python after a single company-scoped query.
-    """
-    collection = _headers_collection()
     db = _firestore()
-    docs = db.collection(collection).where("company", "==", company).stream()
+    docs = db.collection(_headers_collection()).where("company", "==", company).stream()
     results = []
     for doc in docs:
         data = doc.to_dict()
@@ -139,384 +197,185 @@ def get_price_list_headers_from_firestore(
     return results
 
 
-_COMMIT_WORKERS = 8
-
-
-def sync_prices_to_firestore(records: list, company: str, on_date: str) -> int:
-    """Upsert item price records into Firestore. Returns the count of records written."""
+def sync_prices_to_firestore(records: Iterable[dict], company: str, on_date: str) -> int:
+    """Upsert item price records into Firestore. Returns the count written."""
     collection = _prices_collection()
     db = _firestore()
     synced_at = time.time()
-    written = 0
-    batches: list = []
-    batch = db.batch()
-    count_in_batch = 0
-
-    for record in records:
-        product_no = record.get("productNo") or ""
-        if not product_no:
-            continue
-        ref = db.collection(collection).document(f"{company}_{product_no}")
-        doc_data = {
-            **record,
-            "company": company,
-            "onDate": on_date,
-            "syncedAt": synced_at,
-            "env": GCP_ENV,
-        }
-        # familyCode is a computed temp-buffer field that BC may omit from incremental
-        # (lastModifiedDateTime-filtered) responses. Don't force-write "" — use merge=True
-        # so any value previously set by backfill_family_codes is preserved.
-        if not doc_data.get("familyCode"):
-            doc_data.pop("familyCode", None)
-        batch.set(ref, doc_data, merge=True)
-        count_in_batch += 1
-        written += 1
-        if count_in_batch >= _BATCH_SIZE:
-            batches.append(batch)
-            batch = db.batch()
-            count_in_batch = 0
-
-    if count_in_batch > 0:
-        batches.append(batch)
-
-    if batches:
-        with ThreadPoolExecutor(max_workers=min(len(batches), _COMMIT_WORKERS)) as ex:
-            for f in as_completed([ex.submit(b.commit) for b in batches]):
-                f.result()
-
-    logger.info(f"Synced {written} item prices → {collection!r} (company={company!r}, onDate={on_date!r})")
-    return written
+    with _BatchWriter(db) as writer:
+        for record in records:
+            product_no = record.get("productNo") or ""
+            if not product_no:
+                continue
+            doc_data = {
+                **record,
+                "company": company,
+                "onDate": on_date,
+                "syncedAt": synced_at,
+                "env": GCP_ENV,
+            }
+            # familyCode is a computed temp-buffer field that BC may omit from incremental
+            # responses. Don't force-write "" — merge so a backfilled value persists.
+            if not doc_data.get("familyCode"):
+                doc_data.pop("familyCode", None)
+            writer.set(db.collection(collection).document(f"{company}_{product_no}"), doc_data, merge=True)
+    logger.info(f"Synced {writer.written} item prices → {collection!r} (company={company!r}, onDate={on_date!r})")
+    return writer.written
 
 
-def backfill_family_codes(records: list, company: str) -> dict:
-    """Patch the familyCode field on existing Firestore item price documents.
-
-    Uses set(merge=True) so only familyCode is touched on existing docs.
-    Company name is uppercased to match the convention used by sync_prices_to_firestore
-    (which receives company from BC_COMPANY env var, always uppercase).
-    Skips records where BC returned no familyCode so we never overwrite a valid
-    existing value with an empty string.
-    Returns {"patched": int, "skipped_missing_product_no": int, "skipped_no_family_code": int}.
-    """
+def backfill_family_codes(records: Iterable[dict], company: str) -> dict:
+    """Patch familyCode on existing item price documents (merge). Skips records without one."""
     collection = _prices_collection()
     db = _firestore()
     doc_company = company.upper()
-    patched = 0
     skipped_no_pno = 0
     skipped_no_fc = 0
-    batches: list = []
-    batch = db.batch()
-    count_in_batch = 0
-
-    for record in records:
-        product_no = record.get("productNo") or ""
-        if not product_no:
-            skipped_no_pno += 1
-            continue
-        family_code = record.get("familyCode") or ""
-        if not family_code:
-            skipped_no_fc += 1
-            continue
-        ref = db.collection(collection).document(f"{doc_company}_{product_no}")
-        batch.set(ref, {"familyCode": family_code}, merge=True)
-        count_in_batch += 1
-        patched += 1
-        if count_in_batch >= _BATCH_SIZE:
-            batches.append(batch)
-            batch = db.batch()
-            count_in_batch = 0
-
-    if count_in_batch > 0:
-        batches.append(batch)
-
-    if batches:
-        with ThreadPoolExecutor(max_workers=min(len(batches), _COMMIT_WORKERS)) as ex:
-            for f in as_completed([ex.submit(b.commit) for b in batches]):
-                f.result()
-
+    with _BatchWriter(db) as writer:
+        for record in records:
+            product_no = record.get("productNo") or ""
+            if not product_no:
+                skipped_no_pno += 1
+                continue
+            family_code = record.get("familyCode") or ""
+            if not family_code:
+                skipped_no_fc += 1
+                continue
+            writer.set(
+                db.collection(collection).document(f"{doc_company}_{product_no}"),
+                {"familyCode": family_code},
+                merge=True,
+            )
     logger.info(
-        f"Backfilled familyCode on {patched} documents in {collection!r} "
+        f"Backfilled familyCode on {writer.written} documents in {collection!r} "
         f"(company={company!r}, skipped_no_pno={skipped_no_pno}, skipped_no_fc={skipped_no_fc})"
     )
-    return {"patched": patched, "skipped_missing_product_no": skipped_no_pno, "skipped_no_family_code": skipped_no_fc}
+    return {
+        "patched": writer.written,
+        "skipped_missing_product_no": skipped_no_pno,
+        "skipped_no_family_code": skipped_no_fc,
+    }
 
 
-def sync_price_list_headers_to_firestore(records: list, company: str) -> int:
-    """Upsert price list header records into Firestore. Returns the count written."""
+def sync_price_list_headers_to_firestore(records: Iterable[dict], company: str) -> int:
     collection = _headers_collection()
     db = _firestore()
     synced_at = time.time()
-    written = 0
-    batch = db.batch()
-    count_in_batch = 0
-
-    for record in records:
-        code = record.get("code") or ""
-        if not code:
-            continue
-        ref = db.collection(collection).document(f"{company}_{code}")
-        batch.set(ref, {
-            **record,
-            "company": company,
-            "syncedAt": synced_at,
-            "env": GCP_ENV,
-        })
-        count_in_batch += 1
-        written += 1
-        if count_in_batch >= _BATCH_SIZE:
-            batch.commit()
-            batch = db.batch()
-            count_in_batch = 0
-
-    if count_in_batch > 0:
-        batch.commit()
-
-    logger.info(f"Synced {written} price list headers → {collection!r} (company={company!r})")
-    return written
+    with _BatchWriter(db) as writer:
+        for record in records:
+            code = record.get("code") or ""
+            if not code:
+                continue
+            doc = {k: v for k, v in record.items() if k != "priceListLines"}
+            writer.set(
+                db.collection(collection).document(f"{company}_{code}"),
+                {**doc, "company": company, "syncedAt": synced_at, "env": GCP_ENV},
+            )
+    logger.info(f"Synced {writer.written} price list headers → {collection!r} (company={company!r})")
+    return writer.written
 
 
-def sync_price_list_items_to_firestore(lines: list, company: str, price_list_code: str) -> int:
-    """Upsert price list line items into Firestore. Returns count written.
-
-    Document ID: {company}_{priceListCode}_{lineNo}, falling back to the line's
-    id (SystemId) if lineNo is absent.
-    """
+def sync_price_list_items_to_firestore(lines: Iterable[dict], company: str, price_list_code: str) -> int:
+    """Upsert price list lines. Document ID: {company}_{priceListCode}_{lineNo|id}."""
     collection = _items_collection()
     db = _firestore()
     synced_at = time.time()
-    written = 0
-    batches: list = []
-    batch = db.batch()
-    count_in_batch = 0
-
-    for line in lines:
-        line_no = line.get("lineNo")
-        line_id = line.get("id") or line.get("systemId") or ""
-        key = str(line_no) if line_no is not None else line_id
-        if not key:
-            continue
-        ref = db.collection(collection).document(f"{company}_{price_list_code}_{key}")
-        batch.set(ref, {
-            **line,
-            "company": company,
-            "priceListCode": price_list_code,
-            "syncedAt": synced_at,
-            "env": GCP_ENV,
-        })
-        count_in_batch += 1
-        written += 1
-        if count_in_batch >= _BATCH_SIZE:
-            batches.append(batch)
-            batch = db.batch()
-            count_in_batch = 0
-
-    if count_in_batch > 0:
-        batches.append(batch)
-
-    if batches:
-        with ThreadPoolExecutor(max_workers=min(len(batches), _COMMIT_WORKERS)) as ex:
-            for f in as_completed([ex.submit(b.commit) for b in batches]):
-                f.result()
-
+    with _BatchWriter(db) as writer:
+        for line in lines:
+            line_no = line.get("lineNo")
+            line_id = line.get("id") or line.get("systemId") or ""
+            key = str(line_no) if line_no is not None else line_id
+            if not key:
+                continue
+            writer.set(
+                db.collection(collection).document(f"{company}_{price_list_code}_{key}"),
+                {**line, "company": company, "priceListCode": price_list_code, "syncedAt": synced_at, "env": GCP_ENV},
+            )
     logger.info(
-        f"Synced {written} price list items → {collection!r} "
+        f"Synced {writer.written} price list items → {collection!r} "
         f"(company={company!r}, priceListCode={price_list_code!r})"
     )
-    return written
-
-
-def _ile_collection() -> str:
-    return f"item_ledger_entries_{_env_slug()}"
+    return writer.written
 
 
 def ile_exists_in_firestore(company: str) -> bool:
-    """Return True if at least one item ledger entry exists for this company."""
     db = _firestore()
     docs = db.collection(_ile_collection()).where("company", "==", company).limit(1).stream()
     return any(True for _ in docs)
 
 
-def sync_item_ledger_entries_to_firestore(records: list, company: str) -> int:
-    """Upsert item ledger entry records into Firestore. Returns count written.
-
-    Document ID: {company}_{entryNo} — entryNo is the integer primary key of
-    Item Ledger Entry (table 32), unique within a company.
-    """
+def sync_item_ledger_entries_to_firestore(records: Iterable[dict], company: str) -> int:
+    """Upsert item ledger entries. Document ID: {company}_{entryNo}."""
     collection = _ile_collection()
     db = _firestore()
     synced_at = time.time()
-    written = 0
-    batches: list = []
-    batch = db.batch()
-    count_in_batch = 0
-
-    for record in records:
-        entry_no = record.get("entryNo")
-        if entry_no is None:
-            continue
-        ref = db.collection(collection).document(f"{company}_{entry_no}")
-        batch.set(ref, {
-            **record,
-            "company": company,
-            "syncedAt": synced_at,
-            "env": GCP_ENV,
-        })
-        count_in_batch += 1
-        written += 1
-        if count_in_batch >= _BATCH_SIZE:
-            batches.append(batch)
-            batch = db.batch()
-            count_in_batch = 0
-
-    if count_in_batch > 0:
-        batches.append(batch)
-
-    if batches:
-        with ThreadPoolExecutor(max_workers=min(len(batches), _COMMIT_WORKERS)) as ex:
-            for f in as_completed([ex.submit(b.commit) for b in batches]):
-                f.result()
-
-    logger.info(
-        f"Synced {written} item ledger entries → {collection!r} (company={company!r})"
-    )
-    return written
+    with _BatchWriter(db) as writer:
+        for record in records:
+            entry_no = record.get("entryNo")
+            if entry_no is None:
+                continue
+            writer.set(
+                db.collection(collection).document(f"{company}_{entry_no}"),
+                {**record, "company": company, "syncedAt": synced_at, "env": GCP_ENV},
+            )
+    logger.info(f"Synced {writer.written} item ledger entries → {collection!r} (company={company!r})")
+    return writer.written
 
 
-def backfill_ile_columns_in_firestore(records: list, company: str, fields: set[str]) -> int:
-    """Patch specific fields on existing ILE Firestore documents.
-
-    Uses set-with-merge so only the named fields are touched; documents that
-    don't exist yet are created with just those fields.
-    Returns count of documents patched.
-    """
+def backfill_ile_columns_in_firestore(records: Iterable[dict], company: str, fields: set[str]) -> int:
+    """Patch specific fields on existing ILE documents (merge). Returns count patched."""
     collection = _ile_collection()
     db = _firestore()
-    batch = db.batch()
-    count_in_batch = 0
-    patched = 0
-
-    for record in records:
-        entry_no = record.get("entryNo")
-        if entry_no is None:
-            continue
-        patch = {f: record[f] for f in fields if f in record}
-        if not patch:
-            continue
-        ref = db.collection(collection).document(f"{company}_{entry_no}")
-        batch.set(ref, patch, merge=True)
-        count_in_batch += 1
-        patched += 1
-        if count_in_batch >= _BATCH_SIZE:
-            batch.commit()
-            batch = db.batch()
-            count_in_batch = 0
-
-    if count_in_batch > 0:
-        batch.commit()
-
-    logger.info(f"Backfilled {patched} ILE documents in {collection!r} (company={company!r})")
-    return patched
+    with _BatchWriter(db) as writer:
+        for record in records:
+            entry_no = record.get("entryNo")
+            if entry_no is None:
+                continue
+            patch = {f: record[f] for f in fields if f in record}
+            if not patch:
+                continue
+            writer.set(db.collection(collection).document(f"{company}_{entry_no}"), patch, merge=True)
+    logger.info(f"Backfilled {writer.written} ILE documents in {collection!r} (company={company!r})")
+    return writer.written
 
 
-_BC_NULL_DATE = "0001-01-01"
+def apply_best_prices_to_firestore(best: dict[str, dict], company: str) -> int:
+    """Patch unitPriceIncVAT + priceListCode on item_prices_{env} from a best-price map (merge)."""
+    if not best:
+        return 0
+    collection = _prices_collection()
+    db = _firestore()
+    doc_company = company.upper()
+    with _BatchWriter(db) as writer:
+        for product_no, price_data in best.items():
+            writer.set(
+                db.collection(collection).document(f"{doc_company}_{product_no}"),
+                {"unitPriceIncVAT": price_data["unitPriceIncVAT"], "priceListCode": price_data["priceListCode"]},
+                merge=True,
+            )
+    return writer.written
 
 
 def backfill_item_prices_per_price_list(
-    headers_with_lines: list,
+    headers_with_lines: Iterable[dict],
     company: str,
     on_date: str,
     price_list_code: str | None = None,
 ) -> dict:
-    """Patch unitPriceIncVAT and priceListCode on item_prices_{env} from price list line data.
+    """Patch unitPriceIncVAT and priceListCode on item_prices_{env} from price list lines.
 
-    For each product that appears in the embedded priceListLines, picks the best price:
-    latest startingDate <= on_date wins; header order is the tiebreaker. IC price lists
-    (code starts with "IC" or second segment starts with "IC") are skipped.
-
-    price_list_code: when set, restricts the patch to that specific code only.
-    Uses merge=True so familyCode, blocked, and other fields are never overwritten.
-
-    Returns {patched, skipped_no_product_no, skipped_no_price}.
+    Consumes headers lazily so an iterator that fetches one header's lines at a time
+    keeps memory bounded. Latest line startingDate <= on_date wins; IC lists are skipped.
     """
-    # Build per-product best-price map across all active price list codes.
-    best: dict[str, dict] = {}
-
+    acc = BestPriceAccumulator(on_date, price_list_code)
     for header in headers_with_lines:
-        code = (header.get("code") or "").strip()
-        if not code:
-            continue
-        if price_list_code and code != price_list_code:
-            continue
-        code_upper = code.upper()
-        parts = code_upper.split("_")
-        is_ic = code_upper.startswith("IC") or (len(parts) >= 2 and parts[1].startswith("IC"))
-        if is_ic:
-            continue
-
-        for line in (header.get("priceListLines") or []):
-            asset_no = (line.get("assetNo") or "").strip().upper()
-            if not asset_no:
-                continue
-            unit_price = (
-                line.get("unitPriceIncVAT")
-                or line.get("unitPrice")
-                or line.get("unitAmount")
-            )
-            if unit_price is None:
-                continue
-
-            line_date = (line.get("startingDate") or "").strip()[:10]
-            if line_date == _BC_NULL_DATE:
-                line_date = ""
-            if line_date and line_date > on_date:
-                continue
-
-            current = best.get(asset_no)
-            if current is None or line_date > current["startingDate"]:
-                best[asset_no] = {
-                    "unitPriceIncVAT": unit_price,
-                    "priceListCode": code,
-                    "startingDate": line_date,
-                }
-
-    if not best:
+        acc.add_header(header, header.get("priceListLines") or [])
+    if not acc.best:
         logger.info(
             f"backfill_item_prices_per_price_list: no eligible prices found "
             f"(company={company!r}, price_list_code={price_list_code!r})"
         )
         return {"patched": 0, "skipped_no_product_no": 0, "skipped_no_price": 0}
-
-    collection = _prices_collection()
-    db = _firestore()
-    doc_company = company.upper()
-    patched = 0
-    batches: list = []
-    batch = db.batch()
-    count_in_batch = 0
-
-    for product_no, price_data in best.items():
-        ref = db.collection(collection).document(f"{doc_company}_{product_no}")
-        batch.set(
-            ref,
-            {"unitPriceIncVAT": price_data["unitPriceIncVAT"], "priceListCode": price_data["priceListCode"]},
-            merge=True,
-        )
-        count_in_batch += 1
-        patched += 1
-        if count_in_batch >= _BATCH_SIZE:
-            batches.append(batch)
-            batch = db.batch()
-            count_in_batch = 0
-
-    if count_in_batch > 0:
-        batches.append(batch)
-
-    if batches:
-        with ThreadPoolExecutor(max_workers=min(len(batches), _COMMIT_WORKERS)) as ex:
-            for f in as_completed([ex.submit(b.commit) for b in batches]):
-                f.result()
-
+    patched = apply_best_prices_to_firestore(acc.best, company)
     logger.info(
         f"backfill_item_prices_per_price_list: {patched} products patched "
         f"(company={company!r}, on_date={on_date!r}, price_list_code={price_list_code!r})"
@@ -524,14 +383,9 @@ def backfill_item_prices_per_price_list(
     return {"patched": patched, "skipped_no_product_no": 0, "skipped_no_price": 0}
 
 
-def get_price_list_items_from_firestore(
-    company: str,
-    price_list_code: str | None = None,
-) -> list:
-    """Return price list items from Firestore for the given company and current GCP_ENV."""
-    collection = _items_collection()
+def get_price_list_items_from_firestore(company: str, price_list_code: str | None = None) -> list:
     db = _firestore()
-    docs = db.collection(collection).where("company", "==", company).stream()
+    docs = db.collection(_items_collection()).where("company", "==", company).stream()
     results = []
     for doc in docs:
         data = doc.to_dict()
