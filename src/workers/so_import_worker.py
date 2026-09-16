@@ -23,6 +23,7 @@ On transient failure (429/5xx/network): message.nack() for Pub/Sub redelivery
 """
 import json
 import logging
+import threading
 import time
 
 from google.cloud import pubsub_v1
@@ -38,6 +39,105 @@ _TRANSIENT_SIGNALS = ("429", "502", "503", "timeout", "ConnectionError", "ReadTi
 # UOM rules: if the source unit_of_measurement contains any of these substrings
 # (case-insensitive), treat the line as Piece/Pcs and use poQtyPcs / unitPricePcs.
 _PCS_KEYWORDS = ("pcs", "piece", "pc/s")
+
+# ---------------------------------------------------------------------------
+# Batch accumulator — consolidates per-PO successes into one email per trigger
+# ---------------------------------------------------------------------------
+
+class _BatchAccumulator:
+    """Debounces individual SO success results into one consolidated email.
+
+    A bridge trigger publishes N messages in a tight burst. Each message is
+    processed independently, but we want one summary email per trigger. We
+    collect results and start a countdown timer; each new result resets it.
+    When 60 s pass with no new results the batch is flushed as one email.
+    """
+
+    FLUSH_DELAY = 60  # seconds of silence after the last result
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._successes: list[dict] = []
+        self._timer: threading.Timer | None = None
+
+    def add(
+        self,
+        *,
+        po_ref: str,
+        order_no: str,
+        customer_name: str,
+        branch_name: str,
+        po_date: str,
+        delivery_date: str,
+        lines_created: int,
+        lines_skipped: int,
+        company: str,
+        src_company: str,
+    ) -> None:
+        with self._lock:
+            self._successes.append(
+                dict(
+                    po_ref=po_ref,
+                    order_no=order_no,
+                    customer_name=customer_name,
+                    branch_name=branch_name,
+                    po_date=po_date,
+                    delivery_date=delivery_date,
+                    lines_created=lines_created,
+                    lines_skipped=lines_skipped,
+                    company=company,
+                    src_company=src_company,
+                )
+            )
+            self._reschedule()
+
+    def _reschedule(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+        self._timer = threading.Timer(self.FLUSH_DELAY, self._flush)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _flush(self) -> None:
+        with self._lock:
+            batch = self._successes[:]
+            self._successes.clear()
+            self._timer = None
+        if not batch:
+            return
+        count = len(batch)
+        total_created = sum(r["lines_created"] for r in batch)
+        total_skipped = sum(r["lines_skipped"] for r in batch)
+        order_lines = []
+        for r in batch:
+            customer_str = r["customer_name"]
+            if r["branch_name"]:
+                customer_str += f" — {r['branch_name']}"
+            order_lines.append(
+                f"  PO Ref        : {r['po_ref']}\n"
+                f"  BC Order No.  : {r['order_no']}\n"
+                f"  Customer      : {customer_str}\n"
+                f"  PO Date       : {r['po_date']}\n"
+                f"  Delivery Date : {r['delivery_date']}\n"
+                f"  Lines Created : {r['lines_created']}  |  Lines Skipped : {r['lines_skipped']}"
+            )
+        detail = (
+            f"Orders Created  : {count}\n"
+            f"Total Lines In  : {total_created}\n"
+            f"Total Skipped   : {total_skipped}\n"
+            "\n\n"
+            + "\n\n".join(order_lines)
+        )
+        src = batch[0]["src_company"]
+        company = batch[0]["company"]
+        notify_success(
+            title=f"POUL SO Import — {count} order{'s' if count != 1 else ''} created",
+            detail=detail,
+            context=f"company={company} src_company={src}",
+        )
+
+
+_batch = _BatchAccumulator()
 
 
 def _is_pcs(uom_raw: str) -> bool:
@@ -203,19 +303,17 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             f"(company={company!r} src={company_name_src!r} "
             f"lines_created={lines_created} lines_skipped={lines_skipped})"
         )
-        notify_success(
-            title=f"POUL SO Import Success — {po_ref}",
-            detail=(
-                f"PO Reference  : {po_ref}\n"
-                f"BC Order No.  : {order_no}\n"
-                f"Customer      : {header.get('customerName', '')}\n"
-                f"Branch        : {header.get('customerBranchName', '')}\n"
-                f"PO Date       : {header.get('poDate', '')}\n"
-                f"Delivery Date : {header.get('deliveryDate', '')}\n"
-                f"Lines Created : {lines_created}\n"
-                f"Lines Skipped : {lines_skipped}"
-            ),
-            context=f"company={company} src_company={company_name_src}",
+        _batch.add(
+            po_ref=po_ref,
+            order_no=order_no,
+            customer_name=header.get("customerName", ""),
+            branch_name=header.get("customerBranchName", ""),
+            po_date=header.get("poDate", ""),
+            delivery_date=header.get("deliveryDate", ""),
+            lines_created=lines_created,
+            lines_skipped=lines_skipped,
+            company=company,
+            src_company=company_name_src,
         )
         message.ack()
 
