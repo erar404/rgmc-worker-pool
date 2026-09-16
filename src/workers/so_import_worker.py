@@ -33,7 +33,7 @@ import time
 from google.cloud import pubsub_v1
 
 from src import config
-from src.services import bc_client
+from src.services import bc_client, so_buffer
 from src.services.send_mail import notify_error, notify_success
 
 logger = logging.getLogger("worker.so_import")
@@ -226,8 +226,9 @@ def _send_batch_notification(
             customer_str = r["customer_name"]
             if r["branch_name"]:
                 customer_str += f" — {r['branch_name']}"
+            tag = "  [retried from buffer]" if r.get("from_buffer") else ""
             order_lines.append(
-                f"  PO Ref        : {r['po_ref']}\n"
+                f"  PO Ref        : {r['po_ref']}{tag}\n"
                 f"  BC Order No.  : {r['order_no']}\n"
                 f"  Customer      : {customer_str}\n"
                 f"  PO Date       : {r['po_date']}\n"
@@ -244,7 +245,8 @@ def _send_batch_notification(
         if errors:
             detail += f"\n\nFailed Orders   : {len(errors)}\n"
             for e in errors:
-                detail += f"  - {e['po_ref']}: {e['error']}\n"
+                buffered_note = "  [buffered for retry]" if e.get("buffered") else "  [dropped — max retries exceeded]"
+                detail += f"  - {e['po_ref']}: {e['error']}{buffered_note}\n"
 
         title = f"POUL SO Import — {count} order{'s' if count != 1 else ''} created"
         if errors:
@@ -252,7 +254,11 @@ def _send_batch_notification(
         notify_success(title=title, detail=detail, context=context)
 
     elif errors:
-        detail = "\n".join(f"  - {e['po_ref']}: {e['error']}" for e in errors)
+        detail = "\n".join(
+            f"  - {e['po_ref']}: {e['error']} "
+            f"({'buffered for retry' if e.get('buffered') else 'dropped — max retries exceeded'})"
+            for e in errors
+        )
         notify_error(
             title=f"POUL SO Import Failed — {len(errors)} order{'s' if len(errors) != 1 else ''}",
             detail=detail,
@@ -321,23 +327,44 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
 
     location_code: str = config.POUL_SO_DEFAULT_LOCATION
 
-    # ── Process each order in the batch ──────────────────────────────────────
+    # ── Merge new orders with any previously buffered (failed) orders ─────────
+    # Each item: {"header": ..., "lines": ..., "_buf_id": str|None}
+    all_orders: list[dict] = [
+        {"header": o.get("header", {}), "lines": o.get("lines", []), "_buf_id": None}
+        for o in orders
+    ]
+    for buf_doc_id, buf_data in so_buffer.get_buffered_orders(company):
+        all_orders.append({
+            "header": buf_data.get("header", {}),
+            "lines": buf_data.get("lines", []),
+            "_buf_id": buf_doc_id,
+        })
+
+    # ── Process every order (new + buffered) ──────────────────────────────────
     successes: list[dict] = []
     errors: list[dict] = []
 
-    for order in orders:
-        header: dict = order.get("header", {})
-        lines: list = order.get("lines", [])
+    for order_item in all_orders:
+        buf_id: str | None = order_item["_buf_id"]
+        header: dict = order_item["header"]
+        lines: list = order_item["lines"]
         po_ref: str = header.get("poRefNumber", "unknown")
         try:
             result = _create_order(header, lines, company, customer_map, ref_map, location_code)
+            result["from_buffer"] = buf_id is not None
             successes.append(result)
-        except ValueError as e:
-            logger.error(f"POUL SO permanent failure — PO {po_ref!r}: {e}")
-            errors.append({"po_ref": po_ref, "error": str(e)})
+            if buf_id:
+                so_buffer.delete_buffered_order(buf_id)
         except Exception as e:
-            logger.error(f"POUL SO error — PO {po_ref!r}: {e}")
-            errors.append({"po_ref": po_ref, "error": str(e)})
+            err_str = str(e)
+            if isinstance(e, ValueError):
+                logger.error(f"POUL SO permanent failure — PO {po_ref!r}: {e}")
+            else:
+                logger.error(f"POUL SO error — PO {po_ref!r}: {e}")
+            still_buffered = so_buffer.save_failed_order(
+                header, lines, company, src_company, err_str
+            )
+            errors.append({"po_ref": po_ref, "error": err_str, "buffered": still_buffered})
 
     # ── Send one consolidated email and ack ───────────────────────────────────
     _send_batch_notification(successes, errors, company, src_company)
