@@ -606,14 +606,16 @@ def fetch_ship_to_addresses(company_name: str, customer_no: str | None = None) -
 
 
 def fetch_item_references(company_name: str) -> list:
-    """Fetch all item references from BC standard API v2.0.
+    """Fetch all item references from the RGMC custom API v2.0 (Pag50347).
 
-    Used to resolve a customer/barcode SKU code to a BC item number.
-    Each record has: id, itemNo, referenceNo, referenceType, unitOfMeasure, description.
+    Uses the RGMC custom endpoint rather than the standard BC API v2.0
+    because the standard /itemReferences entity is not exposed on this BC instance.
+    Each record has: id, itemNo, referenceNo, referenceType, referenceTypeNo,
+    unitOfMeasure, description.
     """
     company_id = get_company_id(company_name)
     url = (
-        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0"
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
         f"/companies({company_id})/itemReferences"
     )
     logger.info(f"fetch_item_references — company={company_name!r}")
