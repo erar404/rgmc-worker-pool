@@ -19,8 +19,9 @@ Legacy single-order format is also accepted for backward compatibility:
 
 Processing per batch message:
   1. Resolve BC company from the first order's companyName.
-  2. Pre-fetch all BC customers and item references ONCE for the batch.
-  3. For each order: look up customer, create SO header, create SO lines.
+  2. Pre-fetch all BC ship-to addresses and item references ONCE for the batch.
+  3. For each order: look up customer via ship-to address (by customerBranchLookUpCode code
+     first, then customerBranchName), create SO header + lines.
   4. Send one consolidated email covering all orders in the batch.
 
 On transient failure during pre-fetch: message.nack() for Pub/Sub redelivery.
@@ -76,7 +77,9 @@ def _safe_float(val) -> float:
         return 0.0
 
 
-def _build_header_payload(header: dict, customer_no: str, location_code: str) -> dict:
+def _build_header_payload(
+    header: dict, customer_no: str, ship_to_code: str, location_code: str
+) -> dict:
     payload: dict = {
         "sellToCustomerNo": customer_no,
         "externalDocumentNo": (header.get("poRefNumber") or "")[:35],
@@ -86,6 +89,8 @@ def _build_header_payload(header: dict, customer_no: str, location_code: str) ->
         "dueDate": header.get("cancellationDate") or "",
         "postingDescription": (header.get("remark") or "")[:100],
     }
+    if ship_to_code:
+        payload["shipToCode"] = ship_to_code
     if location_code:
         payload["locationCode"] = location_code
     # Drop empty strings so BC uses its own defaults for omitted fields
@@ -118,27 +123,33 @@ def _create_order(
     header: dict,
     lines: list,
     company: str,
-    customer_map: dict[str, str],
+    ship_to_by_code: dict[str, tuple[str, str]],
+    ship_to_by_name: dict[str, tuple[str, str]],
     ref_map: dict[str, str],
     location_code: str,
 ) -> dict:
     """Create one BC Sales Order (header + lines) and return a result summary dict.
 
-    customer_map and ref_map are pre-fetched by the caller for the whole batch.
+    ship_to_by_code / ship_to_by_name map upper-cased branch code / name → (customer_no, ship_to_code).
+    ref_map is pre-fetched by the caller for the whole batch.
     Raises ValueError on permanent failures (bad data, BC rejects).
     """
     po_ref: str = header.get("poRefNumber", "unknown")
 
-    # ── Customer lookup from pre-fetched map ─────────────────────────────────
-    customer_name_raw: str = header.get("customerName") or ""
-    customer_no: str = customer_map.get(customer_name_raw.upper(), "")
-    if not customer_no:
+    # ── Customer lookup via Ship-to Address ───────────────────────────────────
+    branch_code: str = (header.get("customerBranchLookUpCode") or "").strip().upper()
+    branch_name: str = (header.get("customerBranchName") or "").strip().upper()
+
+    ship_to_match = ship_to_by_code.get(branch_code) or ship_to_by_name.get(branch_name)
+    if not ship_to_match:
         raise ValueError(
-            f"Customer not found in BC (company={company!r}): {customer_name_raw!r}"
+            f"No ship-to address in BC for branch code={branch_code!r} / "
+            f"name={branch_name!r} (company={company!r})"
         )
+    customer_no, ship_to_code = ship_to_match
 
     # ── Create Sales Order header ─────────────────────────────────────────────
-    header_payload = _build_header_payload(header, customer_no, location_code)
+    header_payload = _build_header_payload(header, customer_no, ship_to_code, location_code)
     h_status, h_data = bc_client.v2_create_record("salesOrders", header_payload, company)
     if h_status not in (200, 201):
         raise ValueError(
@@ -298,7 +309,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
 
     # ── Pre-fetch shared BC data once for the whole batch ─────────────────────
     try:
-        customers = bc_client.fetch_customers(company)
+        ship_tos = bc_client.fetch_ship_to_addresses(company)
         item_refs = bc_client.fetch_item_references(company)
     except Exception as e:
         err_str = str(e)
@@ -314,11 +325,19 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         message.ack()
         return
 
-    customer_map: dict[str, str] = {
-        c.get("name", "").upper(): c.get("customerNo", "")
-        for c in customers
-        if c.get("customerNo")
-    }
+    # Build ship-to lookup maps: upper-cased code/name → (customer_no, ship_to_code)
+    ship_to_by_code: dict[str, tuple[str, str]] = {}
+    ship_to_by_name: dict[str, tuple[str, str]] = {}
+    for st in ship_tos:
+        cust_no = st.get("customerNumber") or ""
+        st_code = (st.get("code") or "").strip()
+        st_name = (st.get("name") or "").strip()
+        if not cust_no or not st_code:
+            continue
+        ship_to_by_code[st_code.upper()] = (cust_no, st_code)
+        if st_name:
+            ship_to_by_name[st_name.upper()] = (cust_no, st_code)
+
     ref_map: dict[str, str] = {
         r.get("referenceNo", "").upper(): r["itemNo"]
         for r in item_refs
@@ -350,7 +369,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         lines: list = order_item["lines"]
         po_ref: str = header.get("poRefNumber", "unknown")
         try:
-            result = _create_order(header, lines, company, customer_map, ref_map, location_code)
+            result = _create_order(header, lines, company, ship_to_by_code, ship_to_by_name, ref_map, location_code)
             result["from_buffer"] = buf_id is not None
             successes.append(result)
             if buf_id:

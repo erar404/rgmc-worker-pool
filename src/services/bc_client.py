@@ -588,20 +588,19 @@ def fetch_locations(company_name: str) -> list:
     return _fetch_all_pages(url)
 
 
-def fetch_ship_to_addresses(company_name: str, customer_no: str | None = None) -> list:
-    """Fetch Ship-To Addresses from BC standard API v2.0.
+def fetch_ship_to_addresses(company_name: str) -> list:
+    """Fetch all ship-to addresses from the RGMC custom API v2.0 (Pag50350).
 
-    Pass customer_no to filter by customer; omit for all ship-to addresses.
-    Each record has: id, customerNumber, code, name, address, address2, city, etc.
+    Uses the RGMC custom endpoint rather than the standard BC API v2.0
+    because the standard /shipToAddresses entity may not be exposed on this BC instance.
+    Each record has: id, customerNumber, code, name, address, city, locationCode, shipmentMethodCode.
     """
     company_id = get_company_id(company_name)
     url = (
-        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0"
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
         f"/companies({company_id})/shipToAddresses"
     )
-    if customer_no:
-        url += f"?$filter=customerNumber eq '{customer_no}'"
-    logger.info(f"fetch_ship_to_addresses — company={company_name!r} customer_no={customer_no!r}")
+    logger.info(f"fetch_ship_to_addresses — company={company_name!r}")
     return _fetch_all_pages(url)
 
 
