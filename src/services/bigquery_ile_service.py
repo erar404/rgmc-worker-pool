@@ -225,7 +225,7 @@ def get_max_last_modified(company: str) -> str | None:
         return None
 
 
-def _clean(record: dict, bq_synced_at: str) -> dict:
+def _clean(record: dict, company: str, bq_synced_at: str) -> dict:
     """Return a copy of record with pagination artifacts removed and types coerced for BQ."""
     row = {k: v for k, v in record.items() if k not in _EXCLUDE_FIELDS}
     # Null out BC's default "not set" date / timestamp sentinel values
@@ -236,6 +236,7 @@ def _clean(record: dict, bq_synced_at: str) -> dict:
         val = row.get(field) or ""
         if val.startswith(_NULL_TIMESTAMP_PREFIX):
             row[field] = None
+    row["company"] = company
     row["bq_synced_at"] = bq_synced_at
     airbyte_id = str(uuid.uuid4())
     row["_airbyte_raw_id"] = airbyte_id
@@ -357,7 +358,7 @@ def backfill_ile_columns_in_bigquery(records: list[dict], company: str, fields: 
     tid = _table_id(company)
     bq_synced_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    rows = [_clean(r, bq_synced_at) for r in records if r.get("entryNo") is not None]
+    rows = [_clean(r, company, bq_synced_at) for r in records if r.get("entryNo") is not None]
     if not rows:
         logger.warning(f"[{company}] all records missing entryNo — skipping BQ backfill")
         return 0
@@ -415,7 +416,7 @@ def upsert_ile_to_bigquery(records: list[dict], company: str) -> int:
     tid = _table_id(company)
     bq_synced_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    rows = [_clean(r, bq_synced_at) for r in records if r.get("entryNo") is not None]
+    rows = [_clean(r, company, bq_synced_at) for r in records if r.get("entryNo") is not None]
     if not rows:
         logger.warning(f"[{company}] all records missing entryNo — skipping BQ write")
         return 0
