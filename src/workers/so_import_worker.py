@@ -166,6 +166,45 @@ def _build_line_payload(line: dict, item_no: str, location_code: str) -> dict:
     return {k: v for k, v in payload.items() if v != "" and v is not None}
 
 
+def _resolve_valid_lines(
+    po_ref: str, lines: list, ref_map: dict[str, str]
+) -> tuple[list[tuple[dict, str]], int]:
+    """Pre-validate lines against ref_map without touching BC.
+
+    Returns (resolved, invalid_count) where resolved is [(line, item_no), ...] for
+    lines with a known SKU, a matching item reference, and a positive quantity.
+    Used up front so an order with zero resolvable lines never gets a header
+    created in BC — see _create_order.
+    """
+    resolved: list[tuple[dict, str]] = []
+    invalid = 0
+    for i, line in enumerate(lines, start=1):
+        sku: str = (line.get("customerSKUCode") or "").strip().upper()
+        if not sku:
+            logger.warning(f"PO {po_ref} line {i}: empty SKU — invalid")
+            invalid += 1
+            continue
+
+        item_no: str | None = ref_map.get(sku)
+        if not item_no:
+            logger.warning(
+                f"PO {po_ref} line {i}: SKU {sku!r} not found in item references — invalid"
+            )
+            invalid += 1
+            continue
+
+        uom_raw = line.get("unitOfMeasurement") or ""
+        pcs = _is_pcs(uom_raw)
+        qty = _safe_float(line.get("poQtyPcs") if pcs else line.get("poQty"))
+        if qty <= 0:
+            logger.warning(f"PO {po_ref} line {i}: zero quantity — invalid")
+            invalid += 1
+            continue
+
+        resolved.append((line, item_no))
+    return resolved, invalid
+
+
 def _create_order(
     header: dict,
     lines: list,
@@ -179,7 +218,10 @@ def _create_order(
 
     ship_to_by_code / ship_to_by_name map upper-cased branch code / name → (customer_no, ship_to_code).
     ref_map is pre-fetched by the caller for the whole batch.
-    Raises ValueError on permanent failures (bad data, BC rejects).
+    Raises ValueError on permanent failures (bad data, BC rejects). Lines are fully
+    pre-validated before the header is created, so an order with zero resolvable
+    lines never leaves an empty SO sitting in BC — the whole order (header + lines)
+    is buffered for retry instead.
     """
     po_ref: str = header.get("poRefNumber", "unknown")
 
@@ -200,6 +242,18 @@ def _create_order(
         )
     customer_no, ship_to_code = ship_to_match
 
+    # ── Pre-validate lines BEFORE touching BC ──────────────────────────────────
+    # If nothing is resolvable, don't create a header at all — buffer header+lines
+    # together so the whole order retries once the data issue (missing item
+    # reference, bad qty, etc.) is fixed, instead of leaving an empty SO in BC.
+    resolved_lines, invalid_count = _resolve_valid_lines(po_ref, lines, ref_map)
+    if not resolved_lines:
+        raise ValueError(
+            f"No valid sales order lines for PO {po_ref!r} — all {len(lines)} line(s) "
+            f"invalid (missing SKU/item reference or non-positive quantity); "
+            f"buffering header + lines for retry"
+        )
+
     # ── Create Sales Order header ─────────────────────────────────────────────
     header_payload = _build_header_payload(header, customer_no, ship_to_code, location_code)
     h_status, h_data = bc_client.v2_create_record("salesOrders", header_payload, company)
@@ -213,30 +267,8 @@ def _create_order(
 
     # ── Create Sales Order lines ──────────────────────────────────────────────
     lines_created = 0
-    lines_skipped = 0
-    for i, line in enumerate(lines, start=1):
-        sku: str = (line.get("customerSKUCode") or "").strip().upper()
-        if not sku:
-            logger.warning(f"PO {po_ref} line {i}: empty SKU — skipping")
-            lines_skipped += 1
-            continue
-
-        item_no: str | None = ref_map.get(sku)
-        if not item_no:
-            logger.warning(
-                f"PO {po_ref} line {i}: SKU {sku!r} not found in item references — skipping"
-            )
-            lines_skipped += 1
-            continue
-
-        uom_raw = line.get("unitOfMeasurement") or ""
-        pcs = _is_pcs(uom_raw)
-        qty = _safe_float(line.get("poQtyPcs") if pcs else line.get("poQty"))
-        if qty <= 0:
-            logger.warning(f"PO {po_ref} line {i}: zero quantity — skipping")
-            lines_skipped += 1
-            continue
-
+    lines_skipped = invalid_count
+    for i, (line, item_no) in enumerate(resolved_lines, start=1):
         line_payload = _build_line_payload(line, item_no, location_code)
         for attempt in range(4):
             lh, ld = bc_client.v2_create_record(
@@ -254,6 +286,20 @@ def _create_order(
             )
             lines_skipped += 1
             break
+
+    if lines_created == 0:
+        # All pre-validated lines were nonetheless rejected by BC (e.g. bad posting
+        # group) — don't leave an empty SO sitting in BC. Delete the header
+        # (best-effort) and buffer the whole order for retry instead.
+        del_status = bc_client.v2_delete_record("salesOrders", order_id, company)
+        logger.warning(
+            f"PO {po_ref} → BC {order_no!r}: 0/{len(resolved_lines)} lines created — "
+            f"deleting empty header (delete status {del_status}) and buffering for retry"
+        )
+        raise ValueError(
+            f"All {len(resolved_lines)} line(s) rejected by BC for PO {po_ref!r} "
+            f"(BC order {order_no!r} created then deleted); buffering header + lines for retry"
+        )
 
     logger.info(
         f"POUL SO created — PO {po_ref!r} → BC {order_no!r} "
