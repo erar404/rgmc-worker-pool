@@ -17,6 +17,11 @@ Message format (JSON) — batch (current):
 Legacy single-order format is also accepted for backward compatibility:
   { "type": "poul-so-import", "header": {...}, "lines": [...] }
 
+A third message type triggers a buffer-only retry pass, with no fresh orders — published
+by gcp-api's POST /customerpoul/reprocess-buffer (manual "reprocess now" trigger):
+  { "type": "poul-so-reprocess-buffer", "companies": ["SBIC", "MTC"] }
+  "companies" is optional; omitted means every company in _ALL_BC_COMPANIES.
+
 Processing per batch message:
   1. Resolve BC company from the first order's companyName.
   2. Pre-fetch all BC ship-to addresses and item references ONCE for the batch.
@@ -322,8 +327,14 @@ def _send_batch_notification(
     errors: list[dict],
     company: str,
     src_company: str,
+    label: str = "POUL SO Import",
 ) -> None:
-    """Send one consolidated email covering all orders in the batch."""
+    """Send one consolidated email covering all orders in the batch.
+
+    label distinguishes a manual reprocess-buffer trigger ("POUL SO Reprocess-Buffer")
+    from a normal inbound-PO batch ("POUL SO Import") in the email subject/title, so the
+    two are easy to tell apart in an inbox.
+    """
     context = f"company={company} src_company={src_company}"
 
     if successes:
@@ -357,7 +368,7 @@ def _send_batch_notification(
                 buffered_note = "  [buffered for retry]" if e.get("buffered") else "  [dropped — max retries exceeded]"
                 detail += f"  - {e['po_ref']}: {e['error']}{buffered_note}\n"
 
-        title = f"POUL SO Import — {count} order{'s' if count != 1 else ''} created"
+        title = f"{label} — {count} order{'s' if count != 1 else ''} created"
         if errors:
             title += f", {len(errors)} failed"
         notify_success(title=title, detail=detail, context=context)
@@ -369,42 +380,36 @@ def _send_batch_notification(
             for e in errors
         )
         notify_error(
-            title=f"POUL SO Import Failed — {len(errors)} order{'s' if len(errors) != 1 else ''}",
+            title=f"{label} Failed — {len(errors)} order{'s' if len(errors) != 1 else ''}",
             detail=detail,
             context=context,
         )
 
 
-def _process(message: pubsub_v1.subscriber.message.Message) -> None:
-    # ── Parse ─────────────────────────────────────────────────────────────────
-    try:
-        data = json.loads(message.data.decode("utf-8"))
-    except Exception as e:
-        logger.error(f"POUL SO message decode failed: {e} — dropping poison pill")
-        message.ack()
-        return
+# Distinct BC company codes _resolve_bc_company can produce — used when a
+# poul-so-reprocess-buffer message doesn't name specific companies, so every
+# company's buffer gets a retry pass.
+_ALL_BC_COMPANIES: list[str] = sorted({bc_company for _, bc_company in _COMPANY_MAP})
 
-    msg_type = data.get("type", "")
-    if msg_type == "poul-so-import-batch":
-        orders: list[dict] = data.get("orders", [])
-    elif msg_type == "poul-so-import" and "header" in data:
-        # Legacy single-order format — wrap for uniform handling
-        orders = [{"header": data["header"], "lines": data.get("lines", [])}]
-    else:
-        logger.warning(f"POUL SO worker: unexpected message type {msg_type!r} — dropping")
-        message.ack()
-        return
 
-    if not orders:
-        logger.warning("POUL SO worker: empty orders list — dropping")
-        message.ack()
-        return
+def _run_batch(
+    company: str,
+    src_company: str,
+    fresh_orders: list[dict],
+    label: str = "POUL SO Import",
+) -> bool:
+    """Process fresh_orders plus anything buffered for `company`.
 
-    # ── Resolve BC company from first order ───────────────────────────────────
-    first_header: dict = orders[0].get("header", {})
-    src_company: str = first_header.get("companyName", "")
-    company: str = _resolve_bc_company(src_company)
+    Used both by normal batch delivery (fresh_orders from the inbound message) and by
+    a poul-so-reprocess-buffer trigger (fresh_orders=[], buffer-only retry pass).
 
+    label is used verbatim in every email this call can send (pre-fetch failure, empty
+    buffer, and the final batch result), so a manual reprocess trigger's outcome is
+    always visible by mail and clearly distinguishable from a normal inbound-PO import.
+
+    Returns False on a transient pre-fetch failure (caller should nack and redeliver),
+    True otherwise (caller should ack — including when there was simply nothing to do).
+    """
     # ── Pre-fetch shared BC data once for the whole batch ─────────────────────
     try:
         ship_tos = bc_client.fetch_ship_to_addresses(company)
@@ -413,15 +418,13 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         err_str = str(e)
         logger.error(f"POUL SO pre-fetch failed (company={company!r}): {e}")
         if any(sig in err_str for sig in _TRANSIENT_SIGNALS):
-            message.nack()
-            return
+            return False
         notify_error(
-            title="POUL SO Import Error — BC pre-fetch failed",
+            title=f"{label} Error — BC pre-fetch failed",
             detail=err_str,
             context=f"company={company} src_company={src_company}",
         )
-        message.ack()
-        return
+        return True
 
     # Build ship-to lookup maps
     # ship_to_by_code: exact upper-cased code → (customer_no, ship_to_code)
@@ -448,11 +451,11 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
 
     location_code: str = config.POUL_SO_DEFAULT_LOCATION
 
-    # ── Merge new orders with any previously buffered (failed) orders ─────────
+    # ── Merge fresh orders with any previously buffered (failed) orders ───────
     # Each item: {"header": ..., "lines": ..., "_buf_id": str|None}
     all_orders: list[dict] = [
         {"header": o.get("header", {}), "lines": o.get("lines", []), "_buf_id": None}
-        for o in orders
+        for o in fresh_orders
     ]
     for buf_doc_id, buf_data in so_buffer.get_buffered_orders(company):
         all_orders.append({
@@ -461,7 +464,16 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             "_buf_id": buf_doc_id,
         })
 
-    # ── Process every order (new + buffered) ──────────────────────────────────
+    if not all_orders:
+        logger.info(f"POUL SO: nothing to do for company={company!r} (no fresh orders, empty buffer)")
+        notify_success(
+            title=f"{label} — {company}: nothing to retry",
+            detail=f"Firestore buffer for company={company!r} is empty; no orders were reprocessed.",
+            context=f"company={company} src_company={src_company}",
+        )
+        return True
+
+    # ── Process every order (fresh + buffered) ─────────────────────────────────
     successes: list[dict] = []
     errors: list[dict] = []
 
@@ -487,9 +499,65 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             )
             errors.append({"po_ref": po_ref, "error": err_str, "buffered": still_buffered})
 
-    # ── Send one consolidated email and ack ───────────────────────────────────
-    _send_batch_notification(successes, errors, company, src_company)
-    message.ack()
+    # ── Send one consolidated email ────────────────────────────────────────────
+    _send_batch_notification(successes, errors, company, src_company, label=label)
+    return True
+
+
+def _process(message: pubsub_v1.subscriber.message.Message) -> None:
+    # ── Parse ─────────────────────────────────────────────────────────────────
+    try:
+        data = json.loads(message.data.decode("utf-8"))
+    except Exception as e:
+        logger.error(f"POUL SO message decode failed: {e} — dropping poison pill")
+        message.ack()
+        return
+
+    msg_type = data.get("type", "")
+
+    if msg_type == "poul-so-reprocess-buffer":
+        # Manual trigger (published by gcp-api) — buffer-only retry pass, no fresh orders.
+        companies: list[str] = data.get("companies") or _ALL_BC_COMPANIES
+        logger.info(f"POUL SO: reprocess-buffer triggered for companies={companies}")
+        all_ok = True
+        for company in companies:
+            if not _run_batch(
+                company,
+                src_company=f"manual-reprocess:{company}",
+                fresh_orders=[],
+                label="POUL SO Reprocess-Buffer",
+            ):
+                all_ok = False
+        if all_ok:
+            message.ack()
+        else:
+            message.nack()
+        return
+
+    if msg_type == "poul-so-import-batch":
+        orders: list[dict] = data.get("orders", [])
+    elif msg_type == "poul-so-import" and "header" in data:
+        # Legacy single-order format — wrap for uniform handling
+        orders = [{"header": data["header"], "lines": data.get("lines", [])}]
+    else:
+        logger.warning(f"POUL SO worker: unexpected message type {msg_type!r} — dropping")
+        message.ack()
+        return
+
+    if not orders:
+        logger.warning("POUL SO worker: empty orders list — dropping")
+        message.ack()
+        return
+
+    # ── Resolve BC company from first order ───────────────────────────────────
+    first_header: dict = orders[0].get("header", {})
+    src_company: str = first_header.get("companyName", "")
+    company: str = _resolve_bc_company(src_company)
+
+    if _run_batch(company, src_company, orders):
+        message.ack()
+    else:
+        message.nack()
 
 
 def start() -> pubsub_v1.subscriber.futures.StreamingPullFuture:
