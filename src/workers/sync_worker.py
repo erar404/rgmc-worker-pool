@@ -19,7 +19,10 @@ Message formats (JSON):
   Single company item ledger entries only (Firestore):
     { "type": "sync-item-ledger-entries", "company": "RGMC", "since_date": "YYYY-MM-DD" }
 
-  Item ledger entries → BigQuery (uses BC pagination endpoint directly):
+  Item ledger entries → BigQuery — DISABLED 2026-09-22, superseded by Airbyte's own
+  itemLedgerEntries stream (bc_custom_connector.yaml), which writes to the same
+  bc_*_raw.itemLedgerEntries tables directly from BC. See bigquery_ile_service.py and
+  the commented-out "bq-sync-ile" branch below for the code kept for reference/rollback.
     { "type": "bq-sync-ile", "company": "RGMC", "since_date": "YYYY-MM-DD" }
     Omit since_date for a full sync. "ALL" expands to all configured companies.
 
@@ -31,7 +34,8 @@ Message formats (JSON):
     { "type": "backfill-item-prices", "company": "RGMC", "on_date": "YYYY-MM-DD", "price_list_code": "PLH001" }
     Omit price_list_code to process all non-IC codes. Omit company (or pass "ALL") for all companies.
 
-  Patch target ILE columns on existing Firestore docs and BQ rows:
+  Patch target ILE columns on existing Firestore docs (BQ half disabled 2026-09-22,
+  see the bq-sync-ile note above — Airbyte now owns BigQuery for itemLedgerEntries):
     { "type": "backfill-ile-columns", "company": "RGMC", "since_date": "YYYY-MM-DD" }
 
   Connectivity test (bc-api → worker pool):
@@ -109,12 +113,15 @@ from src.services.price_overlay import (
     compact_index_lines,
     is_ic_code,
 )
-from src.services.bigquery_ile_service import (
-    backfill_ile_columns_in_bigquery,
-    ensure_table,
-    get_max_last_modified,
-    upsert_ile_to_bigquery,
-)
+# bigquery_ile_service is disabled 2026-09-22 — Airbyte's itemLedgerEntries stream now
+# writes directly to bc_*_raw.itemLedgerEntries from BC, superseding this worker-pool
+# path. Kept importable for reference/rollback; not called anywhere below.
+# from src.services.bigquery_ile_service import (
+#     backfill_ile_columns_in_bigquery,
+#     ensure_table,
+#     get_max_last_modified,
+#     upsert_ile_to_bigquery,
+# )
 from src.services.send_mail import notify_error, notify_success
 
 logger = logging.getLogger("worker.sync")
@@ -186,61 +193,65 @@ _ILE_BACKFILL_COLUMNS: set[str] = {
 
 
 def _backfill_ile_columns(company: str, since_date: str | None = None) -> dict:
-    """Re-fetch ILE from BC and patch target columns in Firestore and BigQuery."""
-    ensure_table(company)
+    """Re-fetch ILE from BC and patch target columns in Firestore.
+
+    BigQuery patching is disabled 2026-09-22 (see the "bigquery_ile_service is disabled"
+    note near the top imports) — Airbyte's itemLedgerEntries stream owns BQ now. This
+    still patches Firestore, which the pricing app/GCS catalog path still reads.
+    """
     total_fs = 0
-    total_bq = 0
+    total_bq = 0  # kept as 0 — BigQuery patching disabled, see docstring
     offset = 0
     while True:
         records = fetch_item_ledger_entries(company, since_date=since_date, limit=_ILE_PAGE_SIZE, offset=offset)
         if not records:
             break
         fs_patched = backfill_ile_columns_in_firestore(records, company, _ILE_BACKFILL_COLUMNS)
-        bq_rows = backfill_ile_columns_in_bigquery(records, company, _ILE_BACKFILL_COLUMNS)
         total_fs += fs_patched
-        total_bq += bq_rows
         logger.info(
             f"[{company}] backfill offset={offset}: {len(records)} from BC, "
-            f"{fs_patched} Firestore patched, {bq_rows} BQ upserted"
+            f"{fs_patched} Firestore patched (BQ patching disabled)"
         )
         if len(records) < _ILE_PAGE_SIZE:
             break
         offset += _ILE_PAGE_SIZE
-    logger.info(f"[{company}] backfill-ile-columns complete: {total_fs} FS patched, {total_bq} BQ rows")
+    logger.info(f"[{company}] backfill-ile-columns complete: {total_fs} FS patched (BQ patching disabled)")
     return {"firestore": total_fs, "bq": total_bq}
 
 
-def _sync_ile_to_bigquery(company: str, since_date: str | None = None) -> tuple[int, list[str]]:
-    """Fetch all ILE records for one company from BC and stream them into BigQuery."""
-    cols_added = ensure_table(company)
-
-    if since_date is None:
-        since_date = get_max_last_modified(company)
-        logger.info(f"[{company}] BQ watermark from table: {since_date!r}")
-
-    total = 0
-    offset = 0
-    while True:
-        records = fetch_item_ledger_entries(
-            company,
-            since_date=since_date,
-            limit=_BQ_ILE_PAGE_SIZE,
-            offset=offset,
-        )
-        if not records:
-            break
-        inserted = upsert_ile_to_bigquery(records, company)
-        total += inserted
-        logger.info(
-            f"[{company}] BQ ILE page offset={offset}: {len(records)} fetched, "
-            f"{inserted} inserted (since={since_date!r})"
-        )
-        if len(records) < _BQ_ILE_PAGE_SIZE:
-            break
-        offset += _BQ_ILE_PAGE_SIZE
-
-    logger.info(f"[{company}] BQ ILE sync complete: {total} rows inserted (since={since_date!r})")
-    return total, cols_added
+# _sync_ile_to_bigquery is disabled 2026-09-22 — see the "bigquery_ile_service is
+# disabled" note near the top imports. Kept for reference/rollback; not called anywhere.
+# def _sync_ile_to_bigquery(company: str, since_date: str | None = None) -> tuple[int, list[str]]:
+#     """Fetch all ILE records for one company from BC and stream them into BigQuery."""
+#     cols_added = ensure_table(company)
+#
+#     if since_date is None:
+#         since_date = get_max_last_modified(company)
+#         logger.info(f"[{company}] BQ watermark from table: {since_date!r}")
+#
+#     total = 0
+#     offset = 0
+#     while True:
+#         records = fetch_item_ledger_entries(
+#             company,
+#             since_date=since_date,
+#             limit=_BQ_ILE_PAGE_SIZE,
+#             offset=offset,
+#         )
+#         if not records:
+#             break
+#         inserted = upsert_ile_to_bigquery(records, company)
+#         total += inserted
+#         logger.info(
+#             f"[{company}] BQ ILE page offset={offset}: {len(records)} fetched, "
+#             f"{inserted} inserted (since={since_date!r})"
+#         )
+#         if len(records) < _BQ_ILE_PAGE_SIZE:
+#             break
+#         offset += _BQ_ILE_PAGE_SIZE
+#
+#     logger.info(f"[{company}] BQ ILE sync complete: {total} rows inserted (since={since_date!r})")
+#     return total, cols_added
 
 
 # ---------------------------------------------------------------------------
@@ -674,57 +685,75 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                     context=f"on_date={on_date} price_list_code={price_list_code or 'all'}",
                 )
 
+        # bq-sync-ile is disabled 2026-09-22 — Airbyte's own itemLedgerEntries stream
+        # (bc_custom_connector.yaml) now writes bc_*_raw.itemLedgerEntries directly from
+        # BC, making this worker-pool path redundant (and a dual-write risk if both ran).
+        # Original handler body kept commented for reference/rollback.
         elif msg_type == "bq-sync-ile":
-            company = data.get("company") or "ALL"
-            since_date = data.get("since_date")
-            triggered_at = data.get("triggered_at", "")
-            companies = _get_companies(company)
-            inserted_by_company: dict[str, int] = {}
-            cols_added_by_company: dict[str, list[str]] = {}
-            errors_by_company: dict[str, str] = {}
-            for c in companies:
-                try:
-                    rows, cols = _sync_ile_to_bigquery(c, since_date=since_date)
-                    inserted_by_company[c] = rows
-                    if cols:
-                        cols_added_by_company[c] = cols
-                except Exception as exc:
-                    logger.error(f"[{c}] BQ ILE sync failed: {exc}")
-                    errors_by_company[c] = str(exc)
-
-            context = (
-                f"since_date={since_date or 'auto (BQ watermark)'}"
-                + (f" | triggered_at={triggered_at}" if triggered_at else "")
+            logger.warning(
+                "bq-sync-ile received but is disabled — Airbyte's itemLedgerEntries "
+                "stream now owns this sync. Message acked without action."
             )
-
-            def _company_line(c: str) -> str:
-                rows = inserted_by_company.get(c, 0)
-                line = f"{c}: {rows} rows inserted"
-                if c in cols_added_by_company:
-                    names = ", ".join(cols_added_by_company[c])
-                    line += f" | {len(cols_added_by_company[c])} column(s) added to table ({names})"
-                return line
-
-            if errors_by_company:
-                error_lines = [f"{c}: {err}" for c, err in errors_by_company.items()]
-                success_lines = [_company_line(c) for c in inserted_by_company]
-                detail = "\n".join(
-                    (["=== FAILED ==="] + error_lines)
-                    + (["\n=== SUCCEEDED ==="] + success_lines if success_lines else [])
-                )
-                notify_error(
-                    title=f"BQ ILE Sync {'Partial Failure' if inserted_by_company else 'Failed'} — {company}",
-                    detail=detail,
-                    context=context,
-                )
-            else:
-                total = sum(inserted_by_company.values())
-                lines = [_company_line(c) for c in inserted_by_company]
-                notify_success(
-                    title=f"BQ ILE Sync Complete — {company}",
-                    detail=f"Total rows inserted: {total}\n\n" + "\n".join(lines),
-                    context=context,
-                )
+            notify_success(
+                title="BQ ILE Sync Skipped (disabled)",
+                detail=(
+                    "bq-sync-ile is disabled as of 2026-09-22 — Airbyte's itemLedgerEntries "
+                    "stream now syncs BC item ledger entries straight to bc_*_raw.itemLedgerEntries. "
+                    "No BigQuery write was performed by the worker pool for this message."
+                ),
+                context=f"company={data.get('company') or 'ALL'} since_date={data.get('since_date')}",
+            )
+        # elif msg_type == "bq-sync-ile":
+        #     company = data.get("company") or "ALL"
+        #     since_date = data.get("since_date")
+        #     triggered_at = data.get("triggered_at", "")
+        #     companies = _get_companies(company)
+        #     inserted_by_company: dict[str, int] = {}
+        #     cols_added_by_company: dict[str, list[str]] = {}
+        #     errors_by_company: dict[str, str] = {}
+        #     for c in companies:
+        #         try:
+        #             rows, cols = _sync_ile_to_bigquery(c, since_date=since_date)
+        #             inserted_by_company[c] = rows
+        #             if cols:
+        #                 cols_added_by_company[c] = cols
+        #         except Exception as exc:
+        #             logger.error(f"[{c}] BQ ILE sync failed: {exc}")
+        #             errors_by_company[c] = str(exc)
+        #
+        #     context = (
+        #         f"since_date={since_date or 'auto (BQ watermark)'}"
+        #         + (f" | triggered_at={triggered_at}" if triggered_at else "")
+        #     )
+        #
+        #     def _company_line(c: str) -> str:
+        #         rows = inserted_by_company.get(c, 0)
+        #         line = f"{c}: {rows} rows inserted"
+        #         if c in cols_added_by_company:
+        #             names = ", ".join(cols_added_by_company[c])
+        #             line += f" | {len(cols_added_by_company[c])} column(s) added to table ({names})"
+        #         return line
+        #
+        #     if errors_by_company:
+        #         error_lines = [f"{c}: {err}" for c, err in errors_by_company.items()]
+        #         success_lines = [_company_line(c) for c in inserted_by_company]
+        #         detail = "\n".join(
+        #             (["=== FAILED ==="] + error_lines)
+        #             + (["\n=== SUCCEEDED ==="] + success_lines if success_lines else [])
+        #         )
+        #         notify_error(
+        #             title=f"BQ ILE Sync {'Partial Failure' if inserted_by_company else 'Failed'} — {company}",
+        #             detail=detail,
+        #             context=context,
+        #         )
+        #     else:
+        #         total = sum(inserted_by_company.values())
+        #         lines = [_company_line(c) for c in inserted_by_company]
+        #         notify_success(
+        #             title=f"BQ ILE Sync Complete — {company}",
+        #             detail=f"Total rows inserted: {total}\n\n" + "\n".join(lines),
+        #             context=context,
+        #         )
 
         elif msg_type == "backfill-ile-columns":
             company = data.get("company") or "ALL"
