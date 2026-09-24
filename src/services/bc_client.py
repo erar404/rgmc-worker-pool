@@ -593,7 +593,10 @@ def fetch_ship_to_addresses(company_name: str) -> list:
 
     Uses the RGMC custom endpoint rather than the standard BC API v2.0
     because the standard /shipToAddresses entity may not be exposed on this BC instance.
-    Each record has: id, customerNumber, code, name, address, city, locationCode, shipmentMethodCode.
+    Each record has: id, customerNumber, code, name, address, city, locationCode,
+    shipmentMethodCode, lookupCode (added 2026-09-24 via tableextension 50458 — the
+    matching customerLookupCode from SBIC's CustomerBranch table on Cloud SQL, blank
+    until BC is published with that field and someone populates it).
     """
     company_id = get_company_id(company_name)
     url = (

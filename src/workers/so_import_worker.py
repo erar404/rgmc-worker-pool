@@ -215,14 +215,16 @@ def _create_order(
     lines: list,
     company: str,
     ship_to_by_code: dict[str, tuple[str, str]],
+    ship_to_by_lookup_code: dict[str, tuple[str, str]],
     ship_to_by_name: dict[str, tuple[str, str]],
     ref_map: dict[str, str],
     location_code: str,
 ) -> dict:
     """Create one BC Sales Order (header + lines) and return a result summary dict.
 
-    ship_to_by_code / ship_to_by_name map upper-cased branch code / name → (customer_no, ship_to_code).
-    ref_map is pre-fetched by the caller for the whole batch.
+    ship_to_by_code / ship_to_by_lookup_code / ship_to_by_name map upper-cased branch
+    code / lookup code / name → (customer_no, ship_to_code). ref_map is pre-fetched by
+    the caller for the whole batch.
     Raises ValueError on permanent failures (bad data, BC rejects). Lines are fully
     pre-validated before the header is created, so an order with zero resolvable
     lines never leaves an empty SO sitting in BC — the whole order (header + lines)
@@ -234,10 +236,16 @@ def _create_order(
     branch_code: str = (header.get("customerBranchLookUpCode") or "").strip().upper()
     branch_name: str = (header.get("customerBranchName") or "").strip()
 
-    # 1. Exact code match (fastest, most reliable)
-    # 2. Fuzzy name match (SequenceMatcher on normalized strings)
+    # 1. Exact match on BC's own native ship-to code (fastest, most reliable where it
+    #    happens to align — BC's code and SBIC's branch_code are usually different
+    #    coding schemes entirely, e.g. "DS001-C001" vs "2001").
+    # 2. Exact match on the ship-to's lookupCode field (tableextension 50458) — this
+    #    is purpose-built to hold SBIC's own CustomerBranch.lookUpCode value, so once
+    #    populated this is the reliable match for branch_code, not #1.
+    # 3. Fuzzy name match (SequenceMatcher on normalized strings) — last resort.
     ship_to_match = (
         ship_to_by_code.get(branch_code)
+        or ship_to_by_lookup_code.get(branch_code)
         or _fuzzy_ship_to_lookup(branch_name, ship_to_by_name)
     )
     if not ship_to_match:
@@ -427,17 +435,23 @@ def _run_batch(
         return True
 
     # Build ship-to lookup maps
-    # ship_to_by_code: exact upper-cased code → (customer_no, ship_to_code)
+    # ship_to_by_code: exact upper-cased BC ship-to code → (customer_no, ship_to_code)
+    # ship_to_by_lookup_code: exact upper-cased lookupCode (tableextension 50458 — SBIC's
+    #   own CustomerBranch.lookUpCode, manually populated in BC) → (customer_no, ship_to_code)
     # ship_to_by_name: normalized BC name → (customer_no, ship_to_code), used for fuzzy match
     ship_to_by_code: dict[str, tuple[str, str]] = {}
+    ship_to_by_lookup_code: dict[str, tuple[str, str]] = {}
     ship_to_by_name: dict[str, tuple[str, str]] = {}
     for st in ship_tos:
         cust_no = st.get("customerNumber") or ""
         st_code = (st.get("code") or "").strip()
+        st_lookup_code = (st.get("lookupCode") or "").strip()
         st_name = (st.get("name") or "").strip()
         if not cust_no or not st_code:
             continue
         ship_to_by_code[st_code.upper()] = (cust_no, st_code)
+        if st_lookup_code:
+            ship_to_by_lookup_code[st_lookup_code.upper()] = (cust_no, st_code)
         if st_name:
             norm_name = _normalize_name(st_name)
             if norm_name:
@@ -483,7 +497,11 @@ def _run_batch(
         lines: list = order_item["lines"]
         po_ref: str = header.get("poRefNumber", "unknown")
         try:
-            result = _create_order(header, lines, company, ship_to_by_code, ship_to_by_name, ref_map, location_code)
+            result = _create_order(
+                header, lines, company,
+                ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name,
+                ref_map, location_code,
+            )
             result["from_buffer"] = buf_id is not None
             successes.append(result)
             if buf_id:
