@@ -19,16 +19,24 @@ BC_COMPANIES = os.getenv("BC_COMPANIES", "")
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
 GCP_ENV = os.getenv("GCP_ENV", "Staging")      # "Production" or "Staging"
 
+# BigQuery
+BIGQUERY_PROJECT_ID = os.getenv("BIGQUERY_PROJECT_ID", "")
+
 # Cloud Storage
 GCS_CATALOG_BUCKET = os.getenv("GCS_CATALOG_BUCKET", "")
 
 # Pub/Sub subscriptions (pull — worker pool consumes these)
 PUBSUB_ORDER_SUBSCRIPTION = os.getenv("PUBSUB_ORDER_SUBSCRIPTION", "rgmc-orders-worker-sub")
 PUBSUB_SYNC_SUBSCRIPTION = os.getenv("PUBSUB_SYNC_SUBSCRIPTION", "rgmc-sync-worker-sub")
+PUBSUB_POUL_SO_SUBSCRIPTION = os.getenv("PUBSUB_POUL_SO_SUBSCRIPTION", "rgmc-poul-so-import-sub")
 
 # Pub/Sub topics (for publishing; used by the main API and Cloud Scheduler)
 PUBSUB_ORDER_TOPIC = os.getenv("PUBSUB_ORDER_TOPIC", "rgmc-orders")
 PUBSUB_SYNC_TOPIC = os.getenv("PUBSUB_SYNC_TOPIC", "rgmc-sync")
+
+# POUL Sales Order import
+POUL_SO_BC_COMPANY = os.getenv("POUL_SO_BC_COMPANY", "")
+POUL_SO_DEFAULT_LOCATION = os.getenv("POUL_SO_DEFAULT_LOCATION", "")
 
 revision_code = os.environ.get("K_REVISION", "00001")
 

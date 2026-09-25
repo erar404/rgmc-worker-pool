@@ -11,7 +11,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import Any, Iterable
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -48,9 +48,10 @@ _companies_lock = threading.Lock()
 _companies_cache: dict = {"value": None, "expires_at": 0.0}
 _COMPANIES_TTL = 600
 
-# Semaphore: one below BC's 5-concurrent-request cap.
-# Workers are background-only so 3 slots are sufficient; keeps head-room for the main API.
-_bc_semaphore = threading.Semaphore(3)
+# Semaphore: worker pool is a separate Cloud Run service from the main API, so it has
+# its own request budget. 4 slots runs more v3 ranges in parallel while still leaving
+# head-room for transient BC pressure.
+_bc_semaphore = threading.Semaphore(4)
 _active_bc_requests: int = 0
 _active_bc_lock = threading.Lock()
 
@@ -241,6 +242,11 @@ def get_company_id(company_name: str) -> str:
     raise ValueError(f"Company '{name}' not found in Business Central")
 
 
+def get_all_company_names() -> list[str]:
+    """Return the names of all companies registered in Business Central."""
+    return [c["name"] for c in _fetch_companies() if c.get("name")]
+
+
 # ---------------------------------------------------------------------------
 # v3 Item Price Catalog (Pag50318)
 # ---------------------------------------------------------------------------
@@ -328,10 +334,10 @@ def _fetch_v3_catalog_for_date(
         return _fetch_range_with_offset_pagination(company_id, effective_date, odata_filter, since)
 
     logger.info(
-        f"v3 catalog parallel fetch (4 ranges) — company={company_name!r} "
+        f"v3 catalog parallel fetch ({len(ranges)} ranges) — company={company_name!r} "
         f"on_date={effective_date!r} since={since!r}"
     )
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         futures = [executor.submit(_fetch_range, low, high) for low, high in ranges]
         results = [f.result() for f in as_completed(futures)]
 
@@ -371,28 +377,44 @@ def _probe_v3_date(company_id: str, on_date: str) -> str | None:
     return "active" if any(not r.get("blocked") for r in records) else "blocked"
 
 
+def _fetch_v3_catalog_incremental(
+    company_id: str, company_name: str, on_date: str, since: str
+) -> list:
+    """Fetch only records modified after `since` using a single paged request.
+
+    The 27-range split exists to avoid BC's temp-buffer 409 on large full fetches.
+    Incremental deltas are small (typically 0–few hundred records) so a single
+    OData request with nextLink paging is correct and much cheaper.
+    """
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}"
+        f"/companies({company_id})/itemPrices"
+        f"?$filter=onDate eq {on_date} and lastModifiedDateTime gt {since}"
+        f"&$select={_V3_SELECT_FIELDS}"
+    )
+    logger.info(
+        f"v3 catalog incremental fetch — company={company_name!r} "
+        f"on_date={on_date!r} since={since!r}"
+    )
+    return _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
+
+
 def fetch_v3_catalog(company_name: str, on_date: str | None = None, since: str | None = None) -> list:
-    """Fetch the v3 item price catalog using four parallel productNo range requests.
+    """Fetch the v3 item price catalog.
 
-    Splits the alphabet into four ranges (A-G, G-M, M-S, S-Z) so BC runs four
-    independent OData cursors simultaneously. Results are merged and de-duplicated on
-    productNo.
+    Incremental (since set): single request filtered by lastModifiedDateTime — fast,
+    no range splitting needed for small delta result sets.
 
-    For full fetches (since=None): probes each candidate date with a minimal single
-    request before committing to the full 4-range parallel fetch. Probe errors (4xx)
-    skip the date; full-fetch errors also skip and try the next date. This handles
-    expired price list end dates and transient BC range errors (e.g. 400 on M-S range
-    for a specific date) without aborting the entire fallback loop.
-
-    For incremental fetches (since set): fetches only records modified after that
-    timestamp on the given date — no date fallback (partial delta, not a full re-sync).
+    Full fetch (since=None): 27 parallel productNo letter-range requests to avoid
+    BC's temp-buffer 409 on large result sets. Probes each candidate date cheaply
+    before committing to the full parallel fetch.
     """
     company_id = get_company_id(company_name)
     start_date = datetime.date.fromisoformat(on_date) if on_date else datetime.date.today()
 
     if since is not None:
-        # Incremental: just fetch the delta for the given date, no fallback needed
-        return _fetch_v3_catalog_for_date(company_id, company_name, start_date.isoformat(), since=since)
+        # Incremental: single request, no range splitting, no date fallback.
+        return _fetch_v3_catalog_incremental(company_id, company_name, start_date.isoformat(), since)
 
     # Full fetch: probe each date cheaply before committing to the full 4-range parallel fetch
     for days_back in range(31):
@@ -438,6 +460,35 @@ def fetch_v3_catalog(company_name: str, on_date: str | None = None, since: str |
 # v2 Price List Headers (Pag50320)
 # ---------------------------------------------------------------------------
 
+def fetch_item_ledger_entries(
+    company_name: str,
+    since_date: str | None = None,
+    limit: int = 5000,
+    offset: int = 0,
+) -> list:
+    """Fetch one page of item ledger entries from BC (Pag50339, v2 API).
+
+    Uses the AL page's custom limit/offset filter fields for explicit pagination
+    (same pattern as the v3 price catalog). Call repeatedly with increasing offset
+    until the returned list is shorter than limit.
+
+    since_date (YYYY-MM-DD): passed as modifiedFrom to restrict to records whose
+    SystemModifiedAt >= that date. Omit for a full fetch.
+    """
+    company_id = get_company_id(company_name)
+    filters = [f"limit eq {limit}", f"offset eq {offset}"]
+    if since_date:
+        filters.append(f"modifiedFrom eq {since_date}")
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/itemLedgerEntries"
+        f"?$filter={' and '.join(filters)}"
+    )
+    resp = _bc_request("get", url, headers=_auth_headers(), timeout=120)
+    resp.raise_for_status()
+    return resp.json().get("value", [])
+
+
 def fetch_price_list_headers(company_name: str, odata_filter: str | None = None) -> list:
     """Fetch all priceListHeaders from the v2.0 RGMC custom API (Pag50320).
 
@@ -453,24 +504,123 @@ def fetch_price_list_headers(company_name: str, odata_filter: str | None = None)
     return _fetch_all_pages(url)
 
 
-def fetch_price_list_headers_with_lines(company_name: str, since: str | None = None) -> list:
-    """Fetch priceListHeaders with embedded priceListLines via OData $expand.
+def fetch_price_list_lines_for_code(company_name: str, code: str) -> list:
+    """Fetch the priceListLines of a single price list header via $expand + $filter=code.
 
-    Pass since (UTC ISO string) to fetch only headers modified after that timestamp.
-    Lines are embedded in their parent header — so a header change brings all its
-    current lines. If only a line changes without touching its header, pass since=None
-    for a full sync to pick it up.
+    One header at a time keeps memory bounded — the previous all-headers $expand pulled
+    150 MB of JSON for RGMC into a single response.
     """
     company_id = get_company_id(company_name)
-    base = (
+    code_esc = code.replace("'", "''")
+    url = (
         f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
         f"/companies({company_id})/priceListHeaders"
+        f"?$expand=priceListLines&$filter=code eq '{code_esc}'"
     )
-    if since:
-        url = f"{base}?$expand=priceListLines&$filter=lastModifiedDateTime gt {since}"
-    else:
-        url = f"{base}?$expand=priceListLines"
-    logger.info(f"fetch_price_list_headers_with_lines — company={company_name!r} since={since!r}")
+    headers = _fetch_all_pages(url)
+    lines: list = []
+    for h in headers:
+        lines.extend(h.get("priceListLines") or [])
+    return lines
+
+
+def iter_price_list_headers_with_lines(company_name: str, codes: Iterable[str] | None = None):
+    """Yield {**header, "priceListLines": [...]} one header at a time.
+
+    codes restricts which headers get their lines fetched; every header is still yielded
+    (with an empty line list) so callers see the complete header set.
+    """
+    wanted = set(codes) if codes is not None else None
+    for header in fetch_price_list_headers(company_name):
+        code = header.get("code") or ""
+        if code and (wanted is None or code in wanted):
+            lines = fetch_price_list_lines_for_code(company_name, code)
+        else:
+            lines = []
+        yield {**header, "priceListLines": lines}
+
+
+# ---------------------------------------------------------------------------
+# Customers, Contacts, Item Categories (v2 RGMC / standard BC API)
+# ---------------------------------------------------------------------------
+
+def fetch_customers(company_name: str) -> list:
+    """Fetch all customers from the v2.0 RGMC custom API (full fetch, no filter)."""
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/customers"
+    )
+    logger.info(f"fetch_customers — company={company_name!r}")
+    return _fetch_all_pages(url)
+
+
+def fetch_contacts(company_name: str) -> list:
+    """Fetch all contacts from the v2.0 RGMC custom API (full fetch, no filter)."""
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/contacts"
+    )
+    logger.info(f"fetch_contacts — company={company_name!r}")
+    return _fetch_all_pages(url)
+
+
+def fetch_item_categories(company_name: str) -> list:
+    """Fetch all item categories from the standard BC API v2.0."""
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0"
+        f"/companies({company_id})/itemCategories"
+    )
+    logger.info(f"fetch_item_categories — company={company_name!r}")
+    return _fetch_all_pages(url)
+
+
+def fetch_locations(company_name: str) -> list:
+    """Fetch all locations from BC standard API v2.0."""
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0"
+        f"/companies({company_id})/locations"
+    )
+    logger.info(f"fetch_locations — company={company_name!r}")
+    return _fetch_all_pages(url)
+
+
+def fetch_ship_to_addresses(company_name: str) -> list:
+    """Fetch all ship-to addresses from the RGMC custom API v2.0 (Pag50350).
+
+    Uses the RGMC custom endpoint rather than the standard BC API v2.0
+    because the standard /shipToAddresses entity may not be exposed on this BC instance.
+    Each record has: id, customerNumber, code, name, address, city, locationCode,
+    shipmentMethodCode, lookupCode (added 2026-09-24 via tableextension 50458 — the
+    matching customerLookupCode from SBIC's CustomerBranch table on Cloud SQL, blank
+    until BC is published with that field and someone populates it).
+    """
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/shipToAddresses"
+    )
+    logger.info(f"fetch_ship_to_addresses — company={company_name!r}")
+    return _fetch_all_pages(url)
+
+
+def fetch_item_references(company_name: str) -> list:
+    """Fetch all item references from the RGMC custom API v2.0 (Pag50349).
+
+    Uses the RGMC custom endpoint rather than the standard BC API v2.0
+    because the standard /itemReferences entity is not exposed on this BC instance.
+    Each record has: id, itemNo, referenceNo, referenceType, referenceTypeNo,
+    unitOfMeasure, description.
+    """
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/itemReferences"
+    )
+    logger.info(f"fetch_item_references — company={company_name!r}")
     return _fetch_all_pages(url)
 
 

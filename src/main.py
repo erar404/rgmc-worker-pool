@@ -14,7 +14,7 @@ import threading
 from src import config
 from src.logger import logger
 from src.health import start as start_health_server
-from src.workers import order_worker, sync_worker
+from src.workers import order_worker, sync_worker, so_import_worker
 
 
 def main() -> None:
@@ -28,6 +28,7 @@ def main() -> None:
 
     order_future = order_worker.start()
     sync_future = sync_worker.start()
+    so_import_future = so_import_worker.start()
 
     stop = threading.Event()
 
@@ -35,6 +36,7 @@ def main() -> None:
         logger.info("Worker pool shutting down — cancelling Pub/Sub subscriptions")
         order_future.cancel()
         sync_future.cancel()
+        so_import_future.cancel()
         stop.set()
 
     signal.signal(signal.SIGTERM, _shutdown)
