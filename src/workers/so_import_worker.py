@@ -41,7 +41,7 @@ from difflib import SequenceMatcher
 from google.cloud import pubsub_v1
 
 from src import config
-from src.services import bc_client, so_buffer
+from src.services import bc_client, so_buffer, reprocess_status
 from src.services.send_mail import notify_error, notify_success, notify_warning
 
 logger = logging.getLogger("worker.so_import")
@@ -468,13 +468,16 @@ def _send_unmatched_items_notification(
 _ALL_BC_COMPANIES: list[str] = sorted({bc_company for _, bc_company in _COMPANY_MAP})
 
 
+_EMPTY_SUMMARY = {"orders_created": 0, "orders_failed": 0, "lines_created": 0, "lines_skipped": 0, "unmatched_items": 0}
+
+
 def _run_batch(
     company: str,
     src_company: str,
     fresh_orders: list[dict],
     label: str = "POUL SO Import",
     notify: dict | None = None,
-) -> bool:
+) -> tuple[bool, dict]:
     """Process fresh_orders plus anything buffered for `company`.
 
     Used both by normal batch delivery (fresh_orders from the inbound message) and by
@@ -488,8 +491,10 @@ def _run_batch(
     (None for normal inbound-PO batches) — {"name", "company", "department", "email"}.
     When set, every email this call sends is also delivered to notify["email"].
 
-    Returns False on a transient pre-fetch failure (caller should nack and redeliver),
-    True otherwise (caller should ack — including when there was simply nothing to do).
+    Returns (ok, summary). ok is False only on a transient pre-fetch failure (caller
+    should nack and redeliver); True otherwise (caller should ack — including when
+    there was simply nothing to do). summary feeds reprocess_status's run tracking —
+    it's _EMPTY_SUMMARY when ok is False, since nothing was actually processed yet.
     """
     extra_recipients = [notify["email"]] if notify and notify.get("email") else None
     requested_by = (
@@ -505,14 +510,14 @@ def _run_batch(
         err_str = str(e)
         logger.error(f"POUL SO pre-fetch failed (company={company!r}): {e}")
         if any(sig in err_str for sig in _TRANSIENT_SIGNALS):
-            return False
+            return False, dict(_EMPTY_SUMMARY)
         notify_error(
             title=f"{label} Error — BC pre-fetch failed",
             detail=err_str,
             context=f"company={company} src_company={src_company}{requested_by}",
             extra_recipients=extra_recipients,
         )
-        return True
+        return True, dict(_EMPTY_SUMMARY)
 
     # Build ship-to lookup maps
     # ship_to_by_code: exact upper-cased BC ship-to code → (customer_no, ship_to_code)
@@ -566,7 +571,7 @@ def _run_batch(
             context=f"company={company} src_company={src_company}{requested_by}",
             extra_recipients=extra_recipients,
         )
-        return True
+        return True, dict(_EMPTY_SUMMARY)
 
     # ── Process every order (fresh + buffered) ─────────────────────────────────
     successes: list[dict] = []
@@ -601,7 +606,14 @@ def _run_batch(
     # ── Send one consolidated email, plus a separate flag for unmatched items ──
     _send_batch_notification(successes, errors, company, src_company, label=label, notify=notify)
     _send_unmatched_items_notification(successes, company, src_company, label=label, notify=notify)
-    return True
+    summary = {
+        "orders_created": len(successes),
+        "orders_failed": len(errors),
+        "lines_created": sum(r["lines_created"] for r in successes),
+        "lines_skipped": sum(r["lines_skipped"] for r in successes),
+        "unmatched_items": sum(len(r.get("unmatched_items") or []) for r in successes),
+    }
+    return True, summary
 
 
 def _process(message: pubsub_v1.subscriber.message.Message) -> None:
@@ -619,22 +631,46 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         # Manual trigger (published by gcp-api) — buffer-only retry pass, no fresh orders.
         # "notify" (optional) is the employee who triggered this from the reconcile page —
         # {"name", "company", "department", "email"} — CC'd on the result emails below.
+        # "run_id" (optional) is what the /reconcile page polls (via rgmc-bc-api reading
+        # Firestore reprocess_runs_{env}) to show ongoing/done/error instead of only
+        # inferring progress from watching the buffered-order count.
         companies: list[str] = data.get("companies") or _ALL_BC_COMPANIES
         notify: dict | None = data.get("notify") or None
-        logger.info(f"POUL SO: reprocess-buffer triggered for companies={companies} notify={notify}")
+        run_id: str | None = data.get("run_id") or None
+        logger.info(
+            f"POUL SO: reprocess-buffer triggered for companies={companies} "
+            f"notify={notify} run_id={run_id!r}"
+        )
+        reprocess_status.start_run(run_id, companies=companies, notify=notify)
+
         all_ok = True
-        for company in companies:
-            if not _run_batch(
-                company,
-                src_company=f"manual-reprocess:{company}",
-                fresh_orders=[],
-                label="POUL SO Reprocess-Buffer",
-                notify=notify,
-            ):
-                all_ok = False
+        run_summary = dict(_EMPTY_SUMMARY)
+        try:
+            for company in companies:
+                ok, summary = _run_batch(
+                    company,
+                    src_company=f"manual-reprocess:{company}",
+                    fresh_orders=[],
+                    label="POUL SO Reprocess-Buffer",
+                    notify=notify,
+                )
+                if not ok:
+                    all_ok = False
+                else:
+                    for k in run_summary:
+                        run_summary[k] += summary.get(k, 0)
+        except Exception as exc:
+            logger.error(f"POUL SO: reprocess-buffer run {run_id!r} crashed: {exc}")
+            reprocess_status.finish_run(run_id, status="error", summary=run_summary, error=str(exc))
+            message.nack()
+            return
+
         if all_ok:
+            reprocess_status.finish_run(run_id, status="done", summary=run_summary)
             message.ack()
         else:
+            # Transient pre-fetch failure — Pub/Sub will redeliver this same run_id, so
+            # leave the Firestore doc at "processing" rather than finalizing it here.
             message.nack()
         return
 
@@ -658,7 +694,8 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
     src_company: str = first_header.get("companyName", "")
     company: str = _resolve_bc_company(src_company)
 
-    if _run_batch(company, src_company, orders):
+    ok, _ = _run_batch(company, src_company, orders)
+    if ok:
         message.ack()
     else:
         message.nack()
