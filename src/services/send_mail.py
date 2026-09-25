@@ -10,9 +10,11 @@ import src.config as config
 logger = logging.getLogger("send_mail")
 
 
-def notify_error(title: str, detail: str, context: str = "") -> None:
+def notify_error(title: str, detail: str, context: str = "", extra_recipients: list[str] | None = None) -> None:
     """Send a developer alert email for a worker error.
 
+    extra_recipients are added alongside DEVELOPER_EMAIL (e.g. the employee who
+    triggered a manual reprocess, so they see the outcome too).
     Silently skips if DEVELOPER_EMAIL or SMTP credentials are not configured.
     Must be called from a daemon thread or directly — never blocks the Pub/Sub callback.
     """
@@ -20,14 +22,16 @@ def notify_error(title: str, detail: str, context: str = "") -> None:
         return
     threading.Thread(
         target=_send,
-        args=(title, detail, context),
+        args=(title, detail, context, extra_recipients),
         daemon=True,
-    ).start() 
+    ).start()
 
 
-def notify_success(title: str, detail: str, context: str = "") -> None:
+def notify_success(title: str, detail: str, context: str = "", extra_recipients: list[str] | None = None) -> None:
     """Send a developer notification email for a successful sync operation.
 
+    extra_recipients are added alongside DEVELOPER_EMAIL (e.g. the employee who
+    triggered a manual reprocess, so they see the outcome too).
     Silently skips if DEVELOPER_EMAIL or SMTP credentials are not configured.
     Fires in a daemon thread — never blocks the Pub/Sub callback.
     """
@@ -35,15 +39,17 @@ def notify_success(title: str, detail: str, context: str = "") -> None:
         return
     threading.Thread(
         target=_send_success,
-        args=(title, detail, context),
+        args=(title, detail, context, extra_recipients),
         daemon=True,
     ).start()
 
 
-def notify_warning(title: str, detail: str, context: str = "") -> None:
+def notify_warning(title: str, detail: str, context: str = "", extra_recipients: list[str] | None = None) -> None:
     """Send a developer notification email for a partial/needs-attention outcome
     (e.g. an order was inserted into BC but some lines were left out).
 
+    extra_recipients are added alongside DEVELOPER_EMAIL (e.g. the employee who
+    triggered a manual reprocess, so they see the outcome too).
     Silently skips if DEVELOPER_EMAIL or SMTP credentials are not configured.
     Fires in a daemon thread — never blocks the Pub/Sub callback.
     """
@@ -51,12 +57,22 @@ def notify_warning(title: str, detail: str, context: str = "") -> None:
         return
     threading.Thread(
         target=_send_warning,
-        args=(title, detail, context),
+        args=(title, detail, context, extra_recipients),
         daemon=True,
     ).start()
 
 
-def _send(title: str, detail: str, context: str) -> None:
+def _recipients(extra_recipients: list[str] | None) -> str:
+    """DEVELOPER_EMAIL plus any de-duplicated extra recipients, comma-joined for the To header."""
+    seen = [config.developer_email]
+    for addr in extra_recipients or []:
+        addr = (addr or "").strip()
+        if addr and addr.lower() not in (a.lower() for a in seen):
+            seen.append(addr)
+    return ", ".join(seen)
+
+
+def _send(title: str, detail: str, context: str, extra_recipients: list[str] | None = None) -> None:
     from email.message import EmailMessage
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -110,7 +126,7 @@ def _send(title: str, detail: str, context: str) -> None:
 
     msg = EmailMessage()
     msg["From"] = config.smtp_user
-    msg["To"] = config.developer_email
+    msg["To"] = _recipients(extra_recipients)
     msg["Subject"] = subject
     msg.set_content(f"[{timestamp}] {title}\n\nContext: {context or '—'}\n\n{detail}")
     msg.add_alternative(html_content, subtype="html")
@@ -125,7 +141,7 @@ def _send(title: str, detail: str, context: str) -> None:
         logger.error(f"notify_error: failed to send alert email: {exc}")
 
 
-def _send_success(title: str, detail: str, context: str) -> None:
+def _send_success(title: str, detail: str, context: str, extra_recipients: list[str] | None = None) -> None:
     from email.message import EmailMessage
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -179,7 +195,7 @@ def _send_success(title: str, detail: str, context: str) -> None:
 
     msg = EmailMessage()
     msg["From"] = config.smtp_user
-    msg["To"] = config.developer_email
+    msg["To"] = _recipients(extra_recipients)
     msg["Subject"] = subject
     msg.set_content(f"[{timestamp}] {title}\n\nContext: {context or '—'}\n\n{detail}")
     msg.add_alternative(html_content, subtype="html")
@@ -194,7 +210,7 @@ def _send_success(title: str, detail: str, context: str) -> None:
         logger.error(f"notify_success: failed to send alert email: {exc}")
 
 
-def _send_warning(title: str, detail: str, context: str) -> None:
+def _send_warning(title: str, detail: str, context: str, extra_recipients: list[str] | None = None) -> None:
     from email.message import EmailMessage
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -248,7 +264,7 @@ def _send_warning(title: str, detail: str, context: str) -> None:
 
     msg = EmailMessage()
     msg["From"] = config.smtp_user
-    msg["To"] = config.developer_email
+    msg["To"] = _recipients(extra_recipients)
     msg["Subject"] = subject
     msg.set_content(f"[{timestamp}] {title}\n\nContext: {context or '—'}\n\n{detail}")
     msg.add_alternative(html_content, subtype="html")

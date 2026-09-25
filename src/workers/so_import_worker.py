@@ -338,14 +338,22 @@ def _send_batch_notification(
     company: str,
     src_company: str,
     label: str = "POUL SO Import",
+    notify: dict | None = None,
 ) -> None:
     """Send one consolidated email covering all orders in the batch.
 
     label distinguishes a manual reprocess-buffer trigger ("POUL SO Reprocess-Buffer")
     from a normal inbound-PO batch ("POUL SO Import") in the email subject/title, so the
-    two are easy to tell apart in an inbox.
+    two are easy to tell apart in an inbox. notify (optional) is the employee who
+    triggered a manual reprocess — also CC'd on this email when set.
     """
+    extra_recipients = [notify["email"]] if notify and notify.get("email") else None
     context = f"company={company} src_company={src_company}"
+    if notify:
+        context += (
+            f" requested_by={notify.get('name', '')} <{notify.get('email', '')}> "
+            f"({notify.get('department', '')}, {notify.get('company', '')})"
+        )
 
     if successes:
         count = len(successes)
@@ -381,7 +389,7 @@ def _send_batch_notification(
         title = f"{label} — {count} order{'s' if count != 1 else ''} created"
         if errors:
             title += f", {len(errors)} failed"
-        notify_success(title=title, detail=detail, context=context)
+        notify_success(title=title, detail=detail, context=context, extra_recipients=extra_recipients)
 
     elif errors:
         detail = "\n".join(
@@ -393,6 +401,7 @@ def _send_batch_notification(
             title=f"{label} Failed — {len(errors)} order{'s' if len(errors) != 1 else ''}",
             detail=detail,
             context=context,
+            extra_recipients=extra_recipients,
         )
 
 
@@ -401,18 +410,26 @@ def _send_unmatched_items_notification(
     company: str,
     src_company: str,
     label: str = "POUL SO Import",
+    notify: dict | None = None,
 ) -> None:
     """Flag orders that were inserted into BC but left some lines out because their
     SKU had no matching item reference in BC (empty SKU or an unrecognized code —
     i.e. no data to match against), separate from the general success/failure email
     so these are easy to spot and reconcile (e.g. via the /reconcile page's SKU
-    linking) even when the PO itself "succeeded".
+    linking) even when the PO itself "succeeded". notify (optional) is the employee
+    who triggered a manual reprocess — also CC'd on this email when set.
     """
     flagged = [r for r in successes if r.get("unmatched_items")]
     if not flagged:
         return
 
+    extra_recipients = [notify["email"]] if notify and notify.get("email") else None
     context = f"company={company} src_company={src_company}"
+    if notify:
+        context += (
+            f" requested_by={notify.get('name', '')} <{notify.get('email', '')}> "
+            f"({notify.get('department', '')}, {notify.get('company', '')})"
+        )
     total_unmatched = sum(len(r["unmatched_items"]) for r in flagged)
     order_lines = []
     for r in flagged:
@@ -441,6 +458,7 @@ def _send_unmatched_items_notification(
         title=f"{label} — {count} order{'s' if count != 1 else ''} inserted with unmatched items",
         detail=detail,
         context=context,
+        extra_recipients=extra_recipients,
     )
 
 
@@ -455,6 +473,7 @@ def _run_batch(
     src_company: str,
     fresh_orders: list[dict],
     label: str = "POUL SO Import",
+    notify: dict | None = None,
 ) -> bool:
     """Process fresh_orders plus anything buffered for `company`.
 
@@ -465,9 +484,19 @@ def _run_batch(
     buffer, and the final batch result), so a manual reprocess trigger's outcome is
     always visible by mail and clearly distinguishable from a normal inbound-PO import.
 
+    notify is the employee who triggered a manual reprocess from the reconcile page
+    (None for normal inbound-PO batches) — {"name", "company", "department", "email"}.
+    When set, every email this call sends is also delivered to notify["email"].
+
     Returns False on a transient pre-fetch failure (caller should nack and redeliver),
     True otherwise (caller should ack — including when there was simply nothing to do).
     """
+    extra_recipients = [notify["email"]] if notify and notify.get("email") else None
+    requested_by = (
+        f" requested_by={notify.get('name', '')} <{notify.get('email', '')}> "
+        f"({notify.get('department', '')}, {notify.get('company', '')})"
+        if notify else ""
+    )
     # ── Pre-fetch shared BC data once for the whole batch ─────────────────────
     try:
         ship_tos = bc_client.fetch_ship_to_addresses(company)
@@ -480,7 +509,8 @@ def _run_batch(
         notify_error(
             title=f"{label} Error — BC pre-fetch failed",
             detail=err_str,
-            context=f"company={company} src_company={src_company}",
+            context=f"company={company} src_company={src_company}{requested_by}",
+            extra_recipients=extra_recipients,
         )
         return True
 
@@ -533,7 +563,8 @@ def _run_batch(
         notify_success(
             title=f"{label} — {company}: nothing to retry",
             detail=f"Firestore buffer for company={company!r} is empty; no orders were reprocessed.",
-            context=f"company={company} src_company={src_company}",
+            context=f"company={company} src_company={src_company}{requested_by}",
+            extra_recipients=extra_recipients,
         )
         return True
 
@@ -568,8 +599,8 @@ def _run_batch(
             errors.append({"po_ref": po_ref, "error": err_str, "buffered": still_buffered})
 
     # ── Send one consolidated email, plus a separate flag for unmatched items ──
-    _send_batch_notification(successes, errors, company, src_company, label=label)
-    _send_unmatched_items_notification(successes, company, src_company, label=label)
+    _send_batch_notification(successes, errors, company, src_company, label=label, notify=notify)
+    _send_unmatched_items_notification(successes, company, src_company, label=label, notify=notify)
     return True
 
 
@@ -586,8 +617,11 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
 
     if msg_type == "poul-so-reprocess-buffer":
         # Manual trigger (published by gcp-api) — buffer-only retry pass, no fresh orders.
+        # "notify" (optional) is the employee who triggered this from the reconcile page —
+        # {"name", "company", "department", "email"} — CC'd on the result emails below.
         companies: list[str] = data.get("companies") or _ALL_BC_COMPANIES
-        logger.info(f"POUL SO: reprocess-buffer triggered for companies={companies}")
+        notify: dict | None = data.get("notify") or None
+        logger.info(f"POUL SO: reprocess-buffer triggered for companies={companies} notify={notify}")
         all_ok = True
         for company in companies:
             if not _run_batch(
@@ -595,6 +629,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                 src_company=f"manual-reprocess:{company}",
                 fresh_orders=[],
                 label="POUL SO Reprocess-Buffer",
+                notify=notify,
             ):
                 all_ok = False
         if all_ok:
