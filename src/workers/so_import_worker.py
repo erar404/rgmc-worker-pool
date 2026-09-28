@@ -178,9 +178,11 @@ def _resolve_valid_lines(
 
     Returns (resolved, skipped) where resolved is [(line, item_no), ...] for lines
     with a known SKU, a matching item reference, and a positive quantity, and
-    skipped is [{"sku", "description", "reason"}, ...] for every line left out —
-    reason is one of "no_bc_match" (empty SKU or no item reference found in BC —
-    i.e. no data to match against) or "non_positive_qty".
+    skipped is [{"sku", "description", "reason", "line"}, ...] for every line left
+    out — reason is one of "no_bc_match" (empty SKU or no item reference found in
+    BC — i.e. no data to match against) or "non_positive_qty". "line" is the raw
+    original line dict, kept so an unresolved line can be re-buffered and retried
+    later (e.g. once a reconcile-page override resolves its SKU) instead of lost.
     """
     resolved: list[tuple[dict, str]] = []
     skipped: list[dict] = []
@@ -191,7 +193,7 @@ def _resolve_valid_lines(
 
         if not sku:
             logger.warning(f"PO {po_ref} line {i}: empty SKU — invalid")
-            skipped.append({"sku": "", "description": desc, "reason": "no_bc_match"})
+            skipped.append({"sku": "", "description": desc, "reason": "no_bc_match", "line": line})
             continue
 
         item_no: str | None = ref_map.get(sku)
@@ -199,7 +201,7 @@ def _resolve_valid_lines(
             logger.warning(
                 f"PO {po_ref} line {i}: SKU {sku!r} not found in item references — invalid"
             )
-            skipped.append({"sku": sku_raw, "description": desc, "reason": "no_bc_match"})
+            skipped.append({"sku": sku_raw, "description": desc, "reason": "no_bc_match", "line": line})
             continue
 
         uom_raw = line.get("unitOfMeasurement") or ""
@@ -207,7 +209,7 @@ def _resolve_valid_lines(
         qty = _safe_float(line.get("poQtyPcs") if pcs else line.get("poQty"))
         if qty <= 0:
             logger.warning(f"PO {po_ref} line {i}: zero quantity — invalid")
-            skipped.append({"sku": sku_raw, "description": desc, "reason": "non_positive_qty"})
+            skipped.append({"sku": sku_raw, "description": desc, "reason": "non_positive_qty", "line": line})
             continue
 
         resolved.append((line, item_no))
@@ -223,42 +225,73 @@ def _create_order(
     ship_to_by_name: dict[str, tuple[str, str]],
     ref_map: dict[str, str],
     location_code: str,
+    existing_so_number: str | None = None,
 ) -> dict:
-    """Create one BC Sales Order (header + lines) and return a result summary dict.
+    """Create (or resume) one BC Sales Order and return a result summary dict.
 
     ship_to_by_code / ship_to_by_lookup_code / ship_to_by_name map upper-cased branch
     code / lookup code / name → (customer_no, ship_to_code). ref_map is pre-fetched by
     the caller for the whole batch.
+
+    existing_so_number: when set, this PO's header was already created on a previous
+    pass (recorded as so_buffer's `so_number`) — skip ship-to resolution and header
+    creation entirely, look the order up by its number, and only attempt to add
+    whichever lines are still outstanding. This is what lets a buffered order whose
+    header succeeded but left some lines unmatched get *those specific lines* added
+    later (e.g. once a reconcile-page override resolves the SKU) instead of either
+    re-creating a duplicate header or losing the unresolved lines outright.
+
     Raises ValueError on permanent failures (bad data, BC rejects — e.g. no ship-to
-    match, or the header itself gets rejected by BC). The header is always created
-    once a ship-to match is found, regardless of how many lines resolve — an order
-    is no longer all-or-nothing; a PO with zero resolvable/acceptable lines still
-    gets its header (and PO ref number) into BC, just with no lines attached.
+    match, the header/lookup itself failing). The header is always created (or found)
+    once a ship-to match is found / so_number resolves, regardless of how many lines
+    resolve — an order is no longer all-or-nothing; a PO with zero resolvable lines
+    still gets its header (and PO ref number) into BC, just with no lines attached.
     """
     po_ref: str = header.get("poRefNumber", "unknown")
 
-    # ── Customer lookup via Ship-to Address ───────────────────────────────────
-    branch_code: str = (header.get("customerBranchLookUpCode") or "").strip().upper()
-    branch_name: str = (header.get("customerBranchName") or "").strip()
+    if existing_so_number:
+        # Header already exists in BC from a previous pass — resume it instead of
+        # resolving ship-to / creating a second header for the same PO.
+        order_no = existing_so_number
+        found = bc_client.v2_find_sales_order_by_number(order_no, company)
+        if not found:
+            raise ValueError(
+                f"Could not find existing BC sales order {order_no!r} for PO {po_ref!r} "
+                f"(company={company!r}) — buffering for retry"
+            )
+        order_id: str = found.get("id", "")
+    else:
+        # ── Customer lookup via Ship-to Address ───────────────────────────────
+        branch_code: str = (header.get("customerBranchLookUpCode") or "").strip().upper()
+        branch_name: str = (header.get("customerBranchName") or "").strip()
 
-    # 1. Exact match on BC's own native ship-to code (fastest, most reliable where it
-    #    happens to align — BC's code and SBIC's branch_code are usually different
-    #    coding schemes entirely, e.g. "DS001-C001" vs "2001").
-    # 2. Exact match on the ship-to's lookupCode field (tableextension 50458) — this
-    #    is purpose-built to hold SBIC's own CustomerBranch.lookUpCode value, so once
-    #    populated this is the reliable match for branch_code, not #1.
-    # 3. Fuzzy name match (SequenceMatcher on normalized strings) — last resort.
-    ship_to_match = (
-        ship_to_by_code.get(branch_code)
-        or ship_to_by_lookup_code.get(branch_code)
-        or _fuzzy_ship_to_lookup(branch_name, ship_to_by_name)
-    )
-    if not ship_to_match:
-        raise ValueError(
-            f"No ship-to address in BC for branch code={branch_code!r} / "
-            f"name={branch_name!r} (company={company!r})"
+        # 1. Exact match on BC's own native ship-to code (fastest, most reliable where it
+        #    happens to align — BC's code and SBIC's branch_code are usually different
+        #    coding schemes entirely, e.g. "DS001-C001" vs "2001").
+        # 2. Exact match on the ship-to's lookupCode field (tableextension 50458) — this
+        #    is purpose-built to hold SBIC's own CustomerBranch.lookUpCode value, so once
+        #    populated this is the reliable match for branch_code, not #1.
+        # 3. Fuzzy name match (SequenceMatcher on normalized strings) — last resort.
+        ship_to_match = (
+            ship_to_by_code.get(branch_code)
+            or ship_to_by_lookup_code.get(branch_code)
+            or _fuzzy_ship_to_lookup(branch_name, ship_to_by_name)
         )
-    customer_no, ship_to_code = ship_to_match
+        if not ship_to_match:
+            raise ValueError(
+                f"No ship-to address in BC for branch code={branch_code!r} / "
+                f"name={branch_name!r} (company={company!r})"
+            )
+        customer_no, ship_to_code = ship_to_match
+
+        header_payload = _build_header_payload(header, customer_no, ship_to_code, location_code)
+        h_status, h_data = bc_client.v2_create_record("salesOrders", header_payload, company)
+        if h_status not in (200, 201):
+            raise ValueError(
+                f"SO header create failed for PO {po_ref!r} (BC {h_status}): {h_data}"
+            )
+        order_id = h_data.get("id", "")
+        order_no = h_data.get("number", order_id)
 
     # ── Pre-validate lines BEFORE touching BC ──────────────────────────────────
     # No longer all-or-nothing: an order with zero resolvable lines still gets its
@@ -273,28 +306,23 @@ def _create_order(
             f"reference or non-positive quantity) — creating header with no lines"
         )
 
-    # ── Create Sales Order header ─────────────────────────────────────────────
-    header_payload = _build_header_payload(header, customer_no, ship_to_code, location_code)
-    h_status, h_data = bc_client.v2_create_record("salesOrders", header_payload, company)
-    if h_status not in (200, 201):
-        raise ValueError(
-            f"SO header create failed for PO {po_ref!r} (BC {h_status}): {h_data}"
-        )
-
-    order_id: str = h_data.get("id", "")
-    order_no: str = h_data.get("number", order_id)
-
     # ── Create Sales Order lines ──────────────────────────────────────────────
+    # remaining_lines accumulates every line still not in BC after this pass — pre-
+    # validation skips plus any that BC itself rejected — so the caller can re-buffer
+    # exactly those (and only those) for a future retry.
     lines_created = 0
     lines_skipped = len(skipped_lines)
+    remaining_lines: list[dict] = [s["line"] for s in skipped_lines]
     for i, (line, item_no) in enumerate(resolved_lines, start=1):
         line_payload = _build_line_payload(line, item_no, location_code)
+        created = False
         for attempt in range(4):
             lh, ld = bc_client.v2_create_record(
                 f"salesOrders({order_id})/salesOrderLines", line_payload, company
             )
             if lh in (200, 201):
                 lines_created += 1
+                created = True
                 break
             if lh == 409 and attempt < 3:
                 time.sleep(0.5 * (attempt + 1))
@@ -305,6 +333,8 @@ def _create_order(
             )
             lines_skipped += 1
             break
+        if not created:
+            remaining_lines.append(line)
 
     if lines_created == 0 and resolved_lines:
         # All pre-validated lines were nonetheless rejected by BC (e.g. bad posting
@@ -316,12 +346,14 @@ def _create_order(
         )
 
     logger.info(
-        f"POUL SO created — PO {po_ref!r} → BC {order_no!r} "
-        f"(lines_created={lines_created} lines_skipped={lines_skipped})"
+        f"POUL SO {'resumed' if existing_so_number else 'created'} — PO {po_ref!r} → BC {order_no!r} "
+        f"(lines_created={lines_created} lines_skipped={lines_skipped} remaining={len(remaining_lines)})"
     )
     return {
         "po_ref": po_ref,
         "order_no": order_no,
+        "so_number": order_no,
+        "remaining_lines": remaining_lines,
         "customer_name": header.get("customerName", ""),
         "branch_name": header.get("customerBranchName", ""),
         "po_date": header.get("poDate", ""),
@@ -551,9 +583,11 @@ def _run_batch(
     location_code: str = config.POUL_SO_DEFAULT_LOCATION
 
     # ── Merge fresh orders with any previously buffered (failed) orders ───────
-    # Each item: {"header": ..., "lines": ..., "_buf_id": str|None}
+    # Each item: {"header": ..., "lines": ..., "_buf_id": str|None, "so_number": str|None}
+    # so_number carries forward a header already created in BC on a previous pass
+    # (see _create_order's existing_so_number) — always None for fresh orders.
     all_orders: list[dict] = [
-        {"header": o.get("header", {}), "lines": o.get("lines", []), "_buf_id": None}
+        {"header": o.get("header", {}), "lines": o.get("lines", []), "_buf_id": None, "so_number": None}
         for o in fresh_orders
     ]
     for buf_doc_id, buf_data in so_buffer.get_buffered_orders(company):
@@ -561,6 +595,7 @@ def _run_batch(
             "header": buf_data.get("header", {}),
             "lines": buf_data.get("lines", []),
             "_buf_id": buf_doc_id,
+            "so_number": buf_data.get("so_number"),
         })
 
     if not all_orders:
@@ -581,16 +616,31 @@ def _run_batch(
         buf_id: str | None = order_item["_buf_id"]
         header: dict = order_item["header"]
         lines: list = order_item["lines"]
+        so_number: str | None = order_item.get("so_number")
         po_ref: str = header.get("poRefNumber", "unknown")
         try:
             result = _create_order(
                 header, lines, company,
                 ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name,
                 ref_map, location_code,
+                existing_so_number=so_number,
             )
             result["from_buffer"] = buf_id is not None
             successes.append(result)
-            if buf_id:
+            if result["remaining_lines"]:
+                # Header exists in BC but some lines still aren't — keep (or create)
+                # the buffer doc with just those lines and the so_number, so a future
+                # pass resumes this exact order instead of re-creating its header or
+                # losing the unresolved lines. Applies whether this order came from
+                # the buffer or was a fresh inbound PO that partially succeeded.
+                so_buffer.save_failed_order(
+                    header, result["remaining_lines"], company, src_company,
+                    f"Header {result['so_number']!r} created — "
+                    f"{len(result['remaining_lines'])} line(s) still unresolved "
+                    f"(no BC item match or rejected by BC)",
+                    so_number=result["so_number"],
+                )
+            elif buf_id:
                 so_buffer.delete_buffered_order(buf_id)
         except Exception as e:
             err_str = str(e)
@@ -599,7 +649,7 @@ def _run_batch(
             else:
                 logger.error(f"POUL SO error — PO {po_ref!r}: {e}")
             still_buffered = so_buffer.save_failed_order(
-                header, lines, company, src_company, err_str
+                header, lines, company, src_company, err_str, so_number=so_number
             )
             errors.append({"po_ref": po_ref, "error": err_str, "buffered": still_buffered})
 

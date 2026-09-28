@@ -45,26 +45,38 @@ def save_failed_order(
     company: str,
     src_company: str,
     error: str,
+    so_number: str | None = None,
 ) -> bool:
-    """Upsert a failed order into the buffer.
+    """Upsert a failed/partial order into the buffer.
+
+    `lines` here means "still outstanding" — for a fresh failure that's every line;
+    for an order whose header already exists in BC (so_number set) it's only the
+    lines that still haven't been added, so a later retry can resume adding just
+    those instead of recreating the header.
+
+    so_number: the BC sales order Document No. once the header has been created.
+    Carried forward from the existing doc when not explicitly passed, so a save
+    triggered by an unrelated later failure (e.g. a transient BC error looking up
+    the order to resume it) never silently drops the linkage to the header.
 
     Returns True if saved, False if MAX_ATTEMPTS exceeded (order permanently dropped).
     """
     try:
         doc_id = _doc_id(header)
         doc_ref = _client().collection(_COLLECTION).document(doc_id)
-        existing = doc_ref.get()
-        attempt_count = (existing.to_dict() or {}).get("attempt_count", 0) + 1
+        existing_data = doc_ref.get().to_dict() or {}
+        attempt_count = existing_data.get("attempt_count", 0) + 1
+        resolved_so_number = so_number if so_number is not None else existing_data.get("so_number")
 
         if attempt_count > MAX_ATTEMPTS:
             logger.warning(
                 f"so_buffer: {doc_id!r} exceeded {MAX_ATTEMPTS} attempts — "
-                f"removing from buffer (company={company!r})"
+                f"removing from buffer (company={company!r}, so_number={resolved_so_number!r})"
             )
             doc_ref.delete()
             return False
 
-        doc_ref.set({
+        payload = {
             "header": header,
             "lines": lines,
             "company": company,
@@ -72,10 +84,13 @@ def save_failed_order(
             "last_error": error,
             "failed_at": datetime.now(timezone.utc),
             "attempt_count": attempt_count,
-        })
+        }
+        if resolved_so_number:
+            payload["so_number"] = resolved_so_number
+        doc_ref.set(payload)
         logger.info(
             f"so_buffer: saved {doc_id!r} attempt {attempt_count}/{MAX_ATTEMPTS} "
-            f"to {_COLLECTION!r}"
+            f"to {_COLLECTION!r} (so_number={resolved_so_number!r}, {len(lines)} line(s) outstanding)"
         )
         return True
     except Exception as exc:

@@ -651,6 +651,27 @@ def v2_create_record(table_endpoint: str, payload: dict, company_name: str):
     return resp.status_code, _safe_json(resp)
 
 
+def v2_find_sales_order_by_number(number: str, company_name: str) -> dict | None:
+    """Look up an existing v2.0 salesOrders record by its Document No. (number).
+
+    Used to resume a previously-created order (its number was recorded on a buffered
+    order as so_number) instead of creating a duplicate header. Returns the first
+    matching record ({"id": ..., "number": ..., ...}) or None if no match exists.
+    """
+    company_id = get_company_id(company_name)
+    number_esc = number.replace("'", "''")
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/salesOrders"
+        f"?$filter=number eq '{number_esc}'"
+    )
+    resp = _bc_request("get", url, headers=_auth_headers())
+    if not resp.ok:
+        return None
+    records = _safe_json(resp).get("value", [])
+    return records[0] if records else None
+
+
 def v2_delete_record(table_endpoint: str, record_id: str, company_name: str):
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}({record_id})"
