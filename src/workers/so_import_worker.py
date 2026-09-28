@@ -22,6 +22,16 @@ by gcp-api's POST /customerpoul/reprocess-buffer (manual "reprocess now" trigger
   { "type": "poul-so-reprocess-buffer", "companies": ["SBIC", "MTC"] }
   "companies" is optional; omitted means every company in _ALL_BC_COMPANIES.
 
+A fourth message type backfills lines onto orders whose BC header already exists but
+whose Firestore buffer doc is gone (already deleted after a header-only success) —
+published by gcp-api's POST /customerpoul/sync-inserted-orders:
+  { "type": "poul-so-sync-from-cloudsql", "companies": [...], "create_by": "trigger" }
+  For every CustomerPOUL row matching create_by (default "trigger" — the BigQuery
+  bridge's automated inserts), finds the BC order by externalDocumentNo == poRefNumber,
+  and adds whichever CustomerPOULDetailBQ lines aren't already on it. Any line that
+  still can't be resolved (no BC item match, or BC rejects it) gets buffered with the
+  order's so_number, same as a normal reprocess-buffer entry.
+
 Processing per batch message:
   1. Resolve BC company from the first order's companyName.
   2. Pre-fetch all BC ship-to addresses and item references ONCE for the batch.
@@ -41,7 +51,7 @@ from difflib import SequenceMatcher
 from google.cloud import pubsub_v1
 
 from src import config
-from src.services import bc_client, so_buffer, reprocess_status
+from src.services import bc_client, gcp_api_client, so_buffer, reprocess_status
 from src.services.send_mail import notify_error, notify_success, notify_warning
 
 logger = logging.getLogger("worker.so_import")
@@ -503,6 +513,172 @@ _ALL_BC_COMPANIES: list[str] = sorted({bc_company for _, bc_company in _COMPANY_
 _EMPTY_SUMMARY = {"orders_created": 0, "orders_failed": 0, "lines_created": 0, "lines_skipped": 0, "unmatched_items": 0}
 
 
+def _sync_order_from_cloudsql(
+    poul_header: dict,
+    company: str,
+    src_company: str,
+    ref_map: dict[str, str],
+) -> dict | None:
+    """Backfill missing lines onto one BC sales order from Cloud SQL, using
+    externalDocumentNo == poRefNumber to find it (not so_number/buffer state — this
+    path is specifically for orders whose Firestore buffer doc is already gone).
+
+    Returns None if no BC order was ever created for this PO (nothing to sync — not
+    an error, just out of scope for this pass). Otherwise returns a summary dict.
+    Any line that can't be resolved against a BC item, or that BC itself rejects, is
+    buffered via so_buffer with the order's so_number — the same mechanism a normal
+    reprocess-buffer entry uses, so it shows up on the /reconcile page and a later
+    pass resumes adding it via _create_order's existing_so_number path.
+    """
+    po_ref: str = poul_header.get("poRefNumber", "unknown")
+    found = bc_client.v2_find_sales_order_by_external_doc_no(po_ref, company)
+    if not found:
+        return None
+    order_id: str = found.get("id", "")
+    order_no: str = found.get("number", order_id)
+
+    existing_lines = bc_client.v2_list_sales_order_lines(order_id, company)
+    existing_item_nos = {l.get("number") for l in existing_lines if l.get("number")}
+
+    detail_rows = gcp_api_client.fetch_customerpouldetailbq(po_ref)
+    resolved_lines, skipped_lines = _resolve_valid_lines(po_ref, detail_rows, ref_map)
+
+    lines_created = 0
+    already_present = 0
+    lines_skipped = len(skipped_lines)
+    remaining_lines: list[dict] = [s["line"] for s in skipped_lines]
+
+    for line, item_no in resolved_lines:
+        if item_no in existing_item_nos:
+            already_present += 1
+            continue
+        line_payload = _build_line_payload(line, item_no, config.POUL_SO_DEFAULT_LOCATION)
+        created = False
+        for attempt in range(4):
+            lh, ld = bc_client.v2_create_record(
+                f"salesOrders({order_id})/salesOrderLines", line_payload, company
+            )
+            if lh in (200, 201):
+                lines_created += 1
+                created = True
+                break
+            if lh == 409 and attempt < 3:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            logger.error(
+                f"Cloud SQL sync — PO {po_ref} item={item_no!r} failed after "
+                f"{attempt + 1} attempt(s) (BC {lh}): {ld}"
+            )
+            lines_skipped += 1
+            break
+        if not created:
+            remaining_lines.append(line)
+
+    if remaining_lines:
+        so_buffer.save_failed_order(
+            poul_header, remaining_lines, company, src_company,
+            f"Cloud SQL sync — order {order_no!r} still has {len(remaining_lines)} "
+            f"unresolved line(s) (no BC item match or rejected by BC)",
+            so_number=order_no,
+        )
+
+    logger.info(
+        f"POUL SO synced from Cloud SQL — PO {po_ref!r} → BC {order_no!r} "
+        f"(added={lines_created} already_present={already_present} "
+        f"skipped={lines_skipped})"
+    )
+    return {
+        "po_ref": po_ref,
+        "order_no": order_no,
+        "lines_created": lines_created,
+        "already_present": already_present,
+        "lines_skipped": lines_skipped,
+        "remaining_lines": len(remaining_lines),
+    }
+
+
+def _run_sync_from_cloudsql(
+    companies: list[str],
+    create_by: str,
+    notify: dict | None = None,
+) -> tuple[bool, dict]:
+    """Handle a poul-so-sync-from-cloudsql message: for every CustomerPOUL row with
+    the given create_by, find its BC order (by externalDocumentNo) and backfill
+    whatever lines are missing from Cloud SQL's CustomerPOULDetailBQ.
+
+    Always returns (True, summary) — a per-company pre-fetch failure is logged and
+    that company is skipped rather than failing the whole run, since this is an
+    on-demand maintenance pass, not something Pub/Sub needs to retry redelivering.
+    """
+    extra_recipients = [notify["email"]] if notify and notify.get("email") else None
+    requested_by = (
+        f" requested_by={notify.get('name', '')} <{notify.get('email', '')}> "
+        f"({notify.get('department', '')}, {notify.get('company', '')})"
+        if notify else ""
+    )
+
+    headers = gcp_api_client.fetch_customerpoul_by_create_by(create_by)
+    synced: list[dict] = []
+    not_found: list[str] = []
+
+    for company in companies:
+        try:
+            item_refs = bc_client.fetch_item_references(company)
+        except Exception as e:
+            logger.error(f"POUL SO sync: pre-fetch item references failed (company={company!r}): {e}")
+            continue
+        ref_map: dict[str, str] = {
+            r.get("referenceNo", "").upper(): r["itemNo"]
+            for r in item_refs
+            if r.get("itemNo") and r.get("referenceNo")
+        }
+
+        company_headers = [h for h in headers if _resolve_bc_company(h.get("companyName", "")) == company]
+        for h in company_headers:
+            po_ref = h.get("poRefNumber", "unknown")
+            try:
+                result = _sync_order_from_cloudsql(h, company, f"cloudsql-sync:{company}", ref_map)
+                if result is None:
+                    not_found.append(po_ref)
+                else:
+                    synced.append(result)
+            except Exception as e:
+                logger.error(f"Cloud SQL sync failed for PO {po_ref!r}: {e}")
+                not_found.append(po_ref)
+
+    context = f"companies={companies} create_by={create_by!r}{requested_by}"
+    if synced or not_found:
+        detail_lines = [
+            f"  PO Ref {r['po_ref']:<20} → BC {r['order_no']}: "
+            f"+{r['lines_created']} added, {r['already_present']} already present, "
+            f"{r['lines_skipped']} skipped"
+            for r in synced
+        ]
+        if not_found:
+            detail_lines.append("")
+            detail_lines.append(f"No matching BC order found for {len(not_found)} PO(s):")
+            detail_lines.extend(f"  - {ref}" for ref in not_found)
+        title = f"POUL SO Cloud SQL Sync — {len(synced)} order(s) checked"
+        if not_found:
+            title += f", {len(not_found)} not found in BC"
+        notify_success(title=title, detail="\n".join(detail_lines), context=context, extra_recipients=extra_recipients)
+    else:
+        notify_success(
+            title="POUL SO Cloud SQL Sync — nothing to sync",
+            detail=f"No CustomerPOUL rows found with create_by={create_by!r}.",
+            context=context,
+            extra_recipients=extra_recipients,
+        )
+
+    summary = {
+        "orders_synced": len(synced),
+        "orders_not_found": len(not_found),
+        "lines_created": sum(r["lines_created"] for r in synced),
+        "lines_skipped": sum(r["lines_skipped"] for r in synced),
+    }
+    return True, summary
+
+
 def _run_batch(
     company: str,
     src_company: str,
@@ -721,6 +897,32 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         else:
             # Transient pre-fetch failure — Pub/Sub will redeliver this same run_id, so
             # leave the Firestore doc at "processing" rather than finalizing it here.
+            message.nack()
+        return
+
+    if msg_type == "poul-so-sync-from-cloudsql":
+        # Manual trigger (published by gcp-api) — backfills lines onto BC orders whose
+        # Firestore buffer doc is already gone, using Cloud SQL as the source of truth.
+        companies = data.get("companies") or _ALL_BC_COMPANIES
+        create_by = data.get("create_by") or "trigger"
+        notify = data.get("notify") or None
+        run_id = data.get("run_id") or None
+        logger.info(
+            f"POUL SO: Cloud SQL sync triggered for companies={companies} "
+            f"create_by={create_by!r} notify={notify} run_id={run_id!r}"
+        )
+        reprocess_status.start_run(run_id, companies=companies, notify=notify)
+        try:
+            ok, summary = _run_sync_from_cloudsql(companies, create_by, notify=notify)
+        except Exception as exc:
+            logger.error(f"POUL SO: Cloud SQL sync run {run_id!r} crashed: {exc}")
+            reprocess_status.finish_run(run_id, status="error", summary={}, error=str(exc))
+            message.nack()
+            return
+        if ok:
+            reprocess_status.finish_run(run_id, status="done", summary=summary)
+            message.ack()
+        else:
             message.nack()
         return
 

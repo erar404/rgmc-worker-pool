@@ -38,6 +38,11 @@ PUBSUB_SYNC_TOPIC = os.getenv("PUBSUB_SYNC_TOPIC", "rgmc-sync")
 POUL_SO_BC_COMPANY = os.getenv("POUL_SO_BC_COMPANY", "")
 POUL_SO_DEFAULT_LOCATION = os.getenv("POUL_SO_DEFAULT_LOCATION", "")
 
+# rgmc-gcp-api — read-only Cloud SQL access (CustomerPOUL/CustomerPOULDetail), used by
+# the poul-so-sync-from-cloudsql handler to re-derive lines for an order already
+# inserted in BC. Worker pool has no direct MSSQL client; it reads via gcp-api's HTTP API.
+GCP_API_BASE = os.getenv("GCP_API_BASE", "https://rgmc-gcp-api-935246372408.asia-southeast1.run.app")
+
 revision_code = os.environ.get("K_REVISION", "00001")
 
 # Error notification email (leave blank to disable)
