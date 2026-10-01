@@ -24,18 +24,24 @@ def fetch_customerpoul_by_create_by(
     limit: int = 1000,
     date_from: str | None = None,
     date_to: str | None = None,
+    company_id: int | None = None,
 ) -> list[dict]:
     """GET /customerpoul?create_by=... — every header row inserted via that path.
 
     date_from/date_to (YYYY-MM-DD, both optional) scope to CustomerPOUL.poDate — used
     by the Cloud SQL backfill handler so a run can be bounded to a specific window
     instead of pulling every createBy='trigger' row ever inserted.
+
+    company_id (optional) scopes to CustomerPOUL.companyId on sbic_prod (SBIC=6,
+    MTC=12) — a clean numeric key, unlike companyName free text.
     """
     params: dict = {"create_by": create_by, "limit": limit}
     if date_from:
         params["date_from"] = date_from
     if date_to:
         params["date_to"] = date_to
+    if company_id is not None:
+        params["company_id"] = company_id
     try:
         resp = _session.get(f"{config.GCP_API_BASE}/customerpoul", params=params, timeout=60)
         resp.raise_for_status()

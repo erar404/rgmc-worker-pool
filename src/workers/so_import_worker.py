@@ -75,6 +75,13 @@ _COMPANY_MAP: list[tuple[str, str]] = [
     ("SBIC", "SBIC"),
 ]
 
+# BC company code -> CustomerPOUL.companyId on sbic_prod (MSSQL) — a clean numeric key,
+# unlike companyName (free text, and _COMPANY_MAP above has no MTC entry at all). Used
+# by the Cloud SQL backfill to scope its CustomerPOUL query to exactly the company
+# selected on the /reconcile page's dropdown, instead of relying on companyName keyword
+# matching after the fact.
+_BC_COMPANY_ID_MAP: dict[str, int] = {"SBIC": 6, "MTC": 12}
+
 # UOM rules: if the source unit_of_measurement contains any of these substrings
 # (case-insensitive), treat the line as Piece/Pcs and use poQtyPcs / unitPricePcs.
 _PCS_KEYWORDS = ("pcs", "piece", "pc/s")
@@ -783,7 +790,6 @@ def _run_backfill_from_cloudsql(
         if notify else ""
     )
 
-    headers = gcp_api_client.fetch_customerpoul_by_create_by(create_by, date_from=date_from, date_to=date_to)
     location_code: str = config.POUL_SO_DEFAULT_LOCATION
 
     # Overrides aren't scoped per BC company (so_buffer_service.save_override keys
@@ -793,6 +799,7 @@ def _run_backfill_from_cloudsql(
     successes: list[dict] = []
     errors: list[dict] = []
     skipped_existing: list[str] = []
+    total_headers_considered = 0
 
     for company in companies:
         try:
@@ -804,7 +811,19 @@ def _run_backfill_from_cloudsql(
         ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name = _build_ship_to_maps(ship_tos)
         ref_map: dict[str, str] = _build_ref_map(item_refs)
 
-        company_headers = [h for h in headers if _resolve_bc_company(h.get("companyName", "")) == company]
+        # Scope the CustomerPOUL query itself to this company's companyId (SBIC=6,
+        # MTC=12 on sbic_prod) rather than fetching every createBy row once and
+        # filtering by companyName keyword after the fact — companyId is a clean,
+        # unambiguous key (and _COMPANY_MAP above has no MTC entry at all, so the
+        # keyword approach would silently misroute or drop MTC rows here).
+        company_id = _BC_COMPANY_ID_MAP.get(company)
+        if company_id is None:
+            logger.warning(f"POUL SO backfill: no companyId mapping for BC company {company!r} — skipping")
+            continue
+        company_headers = gcp_api_client.fetch_customerpoul_by_create_by(
+            create_by, date_from=date_from, date_to=date_to, company_id=company_id,
+        )
+        total_headers_considered += len(company_headers)
         for h in company_headers:
             po_ref = h.get("poRefNumber", "unknown")
             try:
@@ -858,7 +877,7 @@ def _run_backfill_from_cloudsql(
             context=f"companies={companies} create_by={create_by!r} date_from={date_from!r} date_to={date_to!r}{requested_by}",
             extra_recipients=extra_recipients,
         )
-    if not headers:
+    if not total_headers_considered:
         notify_success(
             title="POUL SO Cloud SQL Backfill — nothing to backfill",
             detail=f"No CustomerPOUL rows found with create_by={create_by!r} "
