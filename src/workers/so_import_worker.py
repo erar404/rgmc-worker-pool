@@ -180,7 +180,7 @@ def _build_header_payload(
     return {k: v for k, v in payload.items() if v}
 
 
-def _build_line_payload(line: dict, item_no: str, location_code: str) -> dict:
+def _build_line_payload(line: dict, item_no: str, location_code: str, line_no: int) -> dict:
     uom_raw: str = line.get("unitOfMeasurement") or ""
     pcs = _is_pcs(uom_raw)
 
@@ -192,9 +192,16 @@ def _build_line_payload(line: dict, item_no: str, location_code: str) -> dict:
     # "Control 'postingGroup' is read-only" on every line insert (confirmed live,
     # 2026-10-01). BC derives it on its own from the item/customer posting setup once
     # "number" is set, so it's no longer sent at all.
+    #
+    # lineNo (Rec."Line No." on RGMCSalesOrderLinesAPIv2, made Editable=true this
+    # session) is now assigned explicitly by the caller rather than left to BC's own
+    # auto-numbering — _create_order computes it deterministically (existing max + i *
+    # 10000), matching standard BC line-number spacing without relying on BC's
+    # auto-increment to behave correctly across the retry-on-409 loop below.
     payload: dict = {
         "lineType": "Item",
         "number": item_no,
+        "lineNo": line_no,
         "unitOfMeasureCode": uom_code,
         "quantity": qty,
         "unitPrice": unit_price,
@@ -310,6 +317,7 @@ def _create_order(
     still gets its header (and PO ref number) into BC, just with no lines attached.
     """
     po_ref: str = header.get("poRefNumber", "unknown")
+    base_line_no = 0
 
     if existing_so_number:
         # Header already exists in BC from a previous pass — resume it instead of
@@ -322,6 +330,10 @@ def _create_order(
                 f"(company={company!r}) — buffering for retry"
             )
         order_id: str = found.get("id", "")
+        # New lines must continue past whatever's already on the order — base_line_no
+        # stays 0 (first new line gets 10000) only for a brand-new header below.
+        existing_lines = bc_client.v2_list_sales_order_lines(order_id, company)
+        base_line_no = max((l.get("lineNo") or 0 for l in existing_lines), default=0)
     else:
         # ── Customer lookup via Ship-to Address ───────────────────────────────
         # A reconcile-page link always wins over automatic matching: header.resolvedShipTo
@@ -396,7 +408,7 @@ def _create_order(
     lines_skipped = len(skipped_lines)
     remaining_lines: list[dict] = [s["line"] for s in skipped_lines]
     for i, (line, item_no) in enumerate(resolved_lines, start=1):
-        line_payload = _build_line_payload(line, item_no, location_code)
+        line_payload = _build_line_payload(line, item_no, location_code, base_line_no + i * 10000)
         created = False
         for attempt in range(4):
             lh, ld = bc_client.v2_create_record(
@@ -617,6 +629,7 @@ def _sync_order_from_cloudsql(
 
     existing_lines = bc_client.v2_list_sales_order_lines(order_id, company)
     existing_item_nos = {l.get("number") for l in existing_lines if l.get("number")}
+    next_line_no = max((l.get("lineNo") or 0 for l in existing_lines), default=0)
 
     detail_rows = gcp_api_client.fetch_customerpouldetailbq(po_ref)
     _apply_sku_overrides(detail_rows, sku_overrides or {})
@@ -631,7 +644,8 @@ def _sync_order_from_cloudsql(
         if item_no in existing_item_nos:
             already_present += 1
             continue
-        line_payload = _build_line_payload(line, item_no, config.POUL_SO_DEFAULT_LOCATION)
+        next_line_no += 10000
+        line_payload = _build_line_payload(line, item_no, config.POUL_SO_DEFAULT_LOCATION, next_line_no)
         created = False
         for attempt in range(4):
             lh, ld = bc_client.v2_create_record(
