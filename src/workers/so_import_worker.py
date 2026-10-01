@@ -32,6 +32,16 @@ published by gcp-api's POST /customerpoul/sync-inserted-orders:
   still can't be resolved (no BC item match, or BC rejects it) gets buffered with the
   order's so_number, same as a normal reprocess-buffer entry.
 
+A fifth message type is the exact opposite skip condition of the fourth: it creates a
+FRESH BC order (header + lines) for a CustomerPOUL row that was never inserted into BC
+at all, skipping any row whose externalDocumentNo already matches an existing BC order
+— published by gcp-api's POST /customerpoul/backfill-from-cloudsql:
+  { "type": "poul-so-backfill-from-cloudsql", "companies": [...], "create_by": "trigger",
+    "date_from": "2026-01-01", "date_to": "2026-01-31" }
+  date_from/date_to (both optional) scope the CustomerPOUL rows considered to a poDate
+  range. Any row that can't be fully resolved (no ship-to/customer/item match, or BC
+  rejects it) is buffered via so_buffer, exactly like a normal inbound batch.
+
 Processing per batch message:
   1. Resolve BC company from the first order's companyName.
   2. Pre-fetch all BC ship-to addresses and item references ONCE for the batch.
@@ -689,11 +699,7 @@ def _run_sync_from_cloudsql(
         except Exception as e:
             logger.error(f"POUL SO sync: pre-fetch item references failed (company={company!r}): {e}")
             continue
-        ref_map: dict[str, str] = {
-            r.get("referenceNo", "").upper(): r["itemNo"]
-            for r in item_refs
-            if r.get("itemNo") and r.get("referenceNo")
-        }
+        ref_map: dict[str, str] = _build_ref_map(item_refs)
 
         company_headers = [h for h in headers if _resolve_bc_company(h.get("companyName", "")) == company]
         for h in company_headers:
@@ -739,6 +745,173 @@ def _run_sync_from_cloudsql(
         "lines_skipped": sum(r["lines_skipped"] for r in synced),
     }
     return True, summary
+
+
+def _run_backfill_from_cloudsql(
+    companies: list[str],
+    create_by: str,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    notify: dict | None = None,
+) -> tuple[bool, dict]:
+    """Handle a poul-so-backfill-from-cloudsql message: for every CustomerPOUL row
+    matching create_by (and, if given, within [date_from, date_to] on poDate), create
+    a FRESH BC sales order (header + lines) from CustomerPOUL/CustomerPOULDetailBQ —
+    unless a BC order already exists for that PO's externalDocumentNo, in which case
+    it's skipped untouched. This is the exact opposite skip condition from
+    _sync_order_from_cloudsql, which only acts when the order already exists.
+
+    Reuses _create_order directly (existing_so_number=None, same as a fresh inbound
+    PO) so every already-fixed resolution path applies here too: a reconcile-page
+    branch/customer/SKU link wins over automatic matching, a partially-resolved order
+    still gets its header created, and anything left over is buffered via so_buffer —
+    same Firestore mechanism every other import path uses, so it shows up on
+    /reconcile for manual reconciliation instead of silently failing.
+
+    Always returns (True, summary) — a per-company pre-fetch failure is logged and
+    that company is skipped rather than failing the whole run, since this is an
+    on-demand maintenance pass, not something Pub/Sub needs to retry redelivering.
+    """
+    extra_recipients = [notify["email"]] if notify and notify.get("email") else None
+    requested_by = (
+        f" requested_by={notify.get('name', '')} <{notify.get('email', '')}> "
+        f"({notify.get('department', '')}, {notify.get('company', '')})"
+        if notify else ""
+    )
+
+    headers = gcp_api_client.fetch_customerpoul_by_create_by(create_by, date_from=date_from, date_to=date_to)
+    location_code: str = config.POUL_SO_DEFAULT_LOCATION
+
+    # Overrides aren't scoped per BC company (so_buffer_service.save_override keys
+    # purely by raw SKU/branch/customer text), so one fetch covers every company below.
+    sku_overrides = so_buffer_overrides.fetch_sku_item_overrides()
+
+    successes: list[dict] = []
+    errors: list[dict] = []
+    skipped_existing: list[str] = []
+
+    for company in companies:
+        try:
+            ship_tos = bc_client.fetch_ship_to_addresses(company)
+            item_refs = bc_client.fetch_item_references(company)
+        except Exception as e:
+            logger.error(f"POUL SO backfill: pre-fetch failed (company={company!r}): {e}")
+            continue
+        ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name = _build_ship_to_maps(ship_tos)
+        ref_map: dict[str, str] = _build_ref_map(item_refs)
+
+        company_headers = [h for h in headers if _resolve_bc_company(h.get("companyName", "")) == company]
+        for h in company_headers:
+            po_ref = h.get("poRefNumber", "unknown")
+            try:
+                if bc_client.v2_find_sales_order_by_external_doc_no(po_ref, company):
+                    skipped_existing.append(po_ref)
+                    continue
+            except Exception as e:
+                logger.error(f"POUL SO backfill: existence check failed for PO {po_ref!r}: {e}")
+                errors.append({"po_ref": po_ref, "error": str(e), "buffered": False})
+                continue
+
+            lines = gcp_api_client.fetch_customerpouldetailbq(po_ref)
+            _apply_sku_overrides(lines, sku_overrides)
+            try:
+                result = _create_order(
+                    h, lines, company,
+                    ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name,
+                    ref_map, location_code, existing_so_number=None,
+                )
+                result["from_buffer"] = False
+                successes.append(result)
+                if result["remaining_lines"]:
+                    so_buffer.save_failed_order(
+                        h, result["remaining_lines"], company, f"cloudsql-backfill:{company}",
+                        f"Backfill — header {result['so_number']!r} created — "
+                        f"{len(result['remaining_lines'])} line(s) still unresolved "
+                        f"(no BC item match or rejected by BC)",
+                        so_number=result["so_number"],
+                    )
+            except Exception as e:
+                err_str = str(e)
+                if isinstance(e, ValueError):
+                    logger.error(f"POUL SO backfill permanent failure — PO {po_ref!r}: {e}")
+                else:
+                    logger.error(f"POUL SO backfill error — PO {po_ref!r}: {e}")
+                so_buffer.save_failed_order(h, lines, company, f"cloudsql-backfill:{company}", err_str)
+                errors.append({"po_ref": po_ref, "error": err_str, "buffered": True})
+
+    _send_batch_notification(
+        successes, errors, "/".join(companies), f"cloudsql-backfill:{create_by}",
+        label="POUL SO Cloud SQL Backfill", notify=notify,
+    )
+    _send_unmatched_items_notification(
+        successes, "/".join(companies), f"cloudsql-backfill:{create_by}",
+        label="POUL SO Cloud SQL Backfill", notify=notify,
+    )
+    if skipped_existing:
+        notify_success(
+            title=f"POUL SO Cloud SQL Backfill — {len(skipped_existing)} PO(s) skipped (already in BC)",
+            detail="\n".join(f"  - {ref}" for ref in skipped_existing),
+            context=f"companies={companies} create_by={create_by!r} date_from={date_from!r} date_to={date_to!r}{requested_by}",
+            extra_recipients=extra_recipients,
+        )
+    if not headers:
+        notify_success(
+            title="POUL SO Cloud SQL Backfill — nothing to backfill",
+            detail=f"No CustomerPOUL rows found with create_by={create_by!r} "
+                   f"date_from={date_from!r} date_to={date_to!r}.",
+            context=f"companies={companies}{requested_by}",
+            extra_recipients=extra_recipients,
+        )
+
+    summary = {
+        "orders_created": len(successes),
+        "orders_failed": len(errors),
+        "orders_skipped_existing": len(skipped_existing),
+        "lines_created": sum(r["lines_created"] for r in successes),
+        "lines_skipped": sum(r["lines_skipped"] for r in successes),
+        "unmatched_items": sum(len(r.get("unmatched_items") or []) for r in successes),
+    }
+    return True, summary
+
+
+def _build_ship_to_maps(ship_tos: list) -> tuple[dict, dict, dict]:
+    """ship_to_by_code / ship_to_by_lookup_code / ship_to_by_name, each mapping an
+    upper-cased key to (customer_no, ship_to_code) — shared by every handler that
+    resolves a PO's customer branch against BC's ship-to addresses.
+
+    ship_to_by_code: exact upper-cased BC ship-to code.
+    ship_to_by_lookup_code: exact upper-cased lookupCode (tableextension 50458 — SBIC's
+      own CustomerBranch.lookUpCode, manually populated in BC).
+    ship_to_by_name: normalized BC name, used for fuzzy match.
+    """
+    ship_to_by_code: dict[str, tuple[str, str]] = {}
+    ship_to_by_lookup_code: dict[str, tuple[str, str]] = {}
+    ship_to_by_name: dict[str, tuple[str, str]] = {}
+    for st in ship_tos:
+        cust_no = st.get("customerNumber") or ""
+        st_code = (st.get("code") or "").strip()
+        st_lookup_code = (st.get("lookupCode") or "").strip()
+        st_name = (st.get("name") or "").strip()
+        if not cust_no or not st_code:
+            continue
+        ship_to_by_code[st_code.upper()] = (cust_no, st_code)
+        if st_lookup_code:
+            ship_to_by_lookup_code[st_lookup_code.upper()] = (cust_no, st_code)
+        if st_name:
+            norm_name = _normalize_name(st_name)
+            if norm_name:
+                ship_to_by_name[norm_name] = (cust_no, st_code)
+    return ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name
+
+
+def _build_ref_map(item_refs: list) -> dict[str, str]:
+    """Upper-cased referenceNo → itemNo, shared by every handler that resolves a
+    line's customerSKUCode against BC's item references."""
+    return {
+        r.get("referenceNo", "").upper(): r["itemNo"]
+        for r in item_refs
+        if r.get("itemNo") and r.get("referenceNo")
+    }
 
 
 def _run_batch(
@@ -789,35 +962,8 @@ def _run_batch(
         )
         return True, dict(_EMPTY_SUMMARY)
 
-    # Build ship-to lookup maps
-    # ship_to_by_code: exact upper-cased BC ship-to code → (customer_no, ship_to_code)
-    # ship_to_by_lookup_code: exact upper-cased lookupCode (tableextension 50458 — SBIC's
-    #   own CustomerBranch.lookUpCode, manually populated in BC) → (customer_no, ship_to_code)
-    # ship_to_by_name: normalized BC name → (customer_no, ship_to_code), used for fuzzy match
-    ship_to_by_code: dict[str, tuple[str, str]] = {}
-    ship_to_by_lookup_code: dict[str, tuple[str, str]] = {}
-    ship_to_by_name: dict[str, tuple[str, str]] = {}
-    for st in ship_tos:
-        cust_no = st.get("customerNumber") or ""
-        st_code = (st.get("code") or "").strip()
-        st_lookup_code = (st.get("lookupCode") or "").strip()
-        st_name = (st.get("name") or "").strip()
-        if not cust_no or not st_code:
-            continue
-        ship_to_by_code[st_code.upper()] = (cust_no, st_code)
-        if st_lookup_code:
-            ship_to_by_lookup_code[st_lookup_code.upper()] = (cust_no, st_code)
-        if st_name:
-            norm_name = _normalize_name(st_name)
-            if norm_name:
-                ship_to_by_name[norm_name] = (cust_no, st_code)
-
-    ref_map: dict[str, str] = {
-        r.get("referenceNo", "").upper(): r["itemNo"]
-        for r in item_refs
-        if r.get("itemNo") and r.get("referenceNo")
-    }
-
+    ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name = _build_ship_to_maps(ship_tos)
+    ref_map: dict[str, str] = _build_ref_map(item_refs)
     location_code: str = config.POUL_SO_DEFAULT_LOCATION
 
     # ── Merge fresh orders with any previously buffered (failed) orders ───────
@@ -988,6 +1134,35 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             ok, summary = _run_sync_from_cloudsql(companies, create_by, notify=notify)
         except Exception as exc:
             logger.error(f"POUL SO: Cloud SQL sync run {run_id!r} crashed: {exc}")
+            reprocess_status.finish_run(run_id, status="error", summary={}, error=str(exc))
+            message.nack()
+            return
+        if ok:
+            reprocess_status.finish_run(run_id, status="done", summary=summary)
+            message.ack()
+        else:
+            message.nack()
+        return
+
+    if msg_type == "poul-so-backfill-from-cloudsql":
+        # Manual trigger (published by gcp-api) — creates fresh BC orders for
+        # CustomerPOUL rows never inserted into BC at all, optionally date-ranged.
+        companies = data.get("companies") or _ALL_BC_COMPANIES
+        create_by = data.get("create_by") or "trigger"
+        date_from = data.get("date_from") or None
+        date_to = data.get("date_to") or None
+        notify = data.get("notify") or None
+        run_id = data.get("run_id") or None
+        logger.info(
+            f"POUL SO: Cloud SQL backfill triggered for companies={companies} "
+            f"create_by={create_by!r} date_from={date_from!r} date_to={date_to!r} "
+            f"notify={notify} run_id={run_id!r}"
+        )
+        reprocess_status.start_run(run_id, companies=companies, notify=notify)
+        try:
+            ok, summary = _run_backfill_from_cloudsql(companies, create_by, date_from, date_to, notify=notify)
+        except Exception as exc:
+            logger.error(f"POUL SO: Cloud SQL backfill run {run_id!r} crashed: {exc}")
             reprocess_status.finish_run(run_id, status="error", summary={}, error=str(exc))
             message.nack()
             return
