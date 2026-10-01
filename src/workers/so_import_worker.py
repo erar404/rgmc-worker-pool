@@ -149,6 +149,9 @@ def _safe_float(val) -> float:
         return 0.0
 
 
+_SUBMITTED_BY = "SBIC AI Uploading"
+
+
 def _build_header_payload(
     header: dict, customer_no: str, ship_to_code: str, location_code: str
 ) -> dict:
@@ -160,6 +163,7 @@ def _build_header_payload(
         "shipmentDate": header.get("deliveryDate") or "",
         "dueDate": header.get("cancellationDate") or "",
         "postingDescription": (header.get("remark") or "")[:100],
+        "submittedBy": _SUBMITTED_BY,
     }
     if ship_to_code:
         payload["shipToCode"] = ship_to_code
