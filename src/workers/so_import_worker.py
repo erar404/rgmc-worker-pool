@@ -167,13 +167,16 @@ def _build_line_payload(line: dict, item_no: str, location_code: str) -> dict:
     unit_price = _safe_float(line.get("unitPricePcs") if pcs else line.get("unitPrice"))
     uom_code = _uom_code(uom_raw)
 
+    # postingGroup used to be hardcoded here as "TRADE" — BC now rejects that as
+    # "Control 'postingGroup' is read-only" on every line insert (confirmed live,
+    # 2026-10-01). BC derives it on its own from the item/customer posting setup once
+    # "number" is set, so it's no longer sent at all.
     payload: dict = {
         "lineType": "Item",
         "number": item_no,
         "unitOfMeasureCode": uom_code,
         "quantity": qty,
         "unitPrice": unit_price,
-        "postingGroup": "TRADE",
         "shipmentDate": line.get("deliveryDate") or "",
     }
     if location_code:
