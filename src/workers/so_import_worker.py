@@ -51,7 +51,7 @@ from difflib import SequenceMatcher
 from google.cloud import pubsub_v1
 
 from src import config
-from src.services import bc_client, gcp_api_client, so_buffer, reprocess_status
+from src.services import bc_client, gcp_api_client, so_buffer, so_buffer_overrides, reprocess_status
 from src.services.send_mail import notify_error, notify_success, notify_warning
 
 logger = logging.getLogger("worker.so_import")
@@ -232,6 +232,26 @@ def _resolve_valid_lines(
 
         resolved.append((line, item_no))
     return resolved, skipped
+
+
+def _apply_sku_overrides(lines: list, sku_overrides: dict[str, dict]) -> None:
+    """Patch resolvedItem onto any line whose SKU (or description, if the SKU is
+    blank) matches a saved SKU override — in place.
+
+    Mirrors rgmc-bc-api's apply_resolution_to_buffer matching rule exactly (SKU code,
+    or description when blank, case-insensitive) so a reconcile-page SKU link applies
+    here too — needed because these lines came fresh from Cloud SQL
+    (_sync_order_from_cloudsql), not from a buffer doc apply_resolution_to_buffer
+    would already have patched.
+    """
+    if not sku_overrides:
+        return
+    for line in lines:
+        sku = (line.get("customerSKUCode") or "").strip()
+        match_key = (sku or (line.get("customerSKUDesc") or "").strip() or "(no SKU code, no description)").upper()
+        resolved = sku_overrides.get(match_key)
+        if resolved:
+            line["resolvedItem"] = resolved
 
 
 def _create_order(
@@ -546,10 +566,16 @@ def _sync_order_from_cloudsql(
     company: str,
     src_company: str,
     ref_map: dict[str, str],
+    sku_overrides: dict[str, dict] | None = None,
 ) -> dict | None:
     """Backfill missing lines onto one BC sales order from Cloud SQL, using
     externalDocumentNo == poRefNumber to find it (not so_number/buffer state — this
     path is specifically for orders whose Firestore buffer doc is already gone).
+
+    sku_overrides (from so_buffer_overrides.fetch_sku_item_overrides): a reconcile-page
+    SKU link saved AFTER this order's header was already created in BC would otherwise
+    never reach it — these lines come fresh from Cloud SQL, not a buffer doc
+    apply_resolution_to_buffer could have already patched line.resolvedItem onto.
 
     Returns None if no BC order was ever created for this PO (nothing to sync — not
     an error, just out of scope for this pass). Otherwise returns a summary dict.
@@ -569,6 +595,7 @@ def _sync_order_from_cloudsql(
     existing_item_nos = {l.get("number") for l in existing_lines if l.get("number")}
 
     detail_rows = gcp_api_client.fetch_customerpouldetailbq(po_ref)
+    _apply_sku_overrides(detail_rows, sku_overrides or {})
     resolved_lines, skipped_lines = _resolve_valid_lines(po_ref, detail_rows, ref_map)
 
     lines_created = 0
@@ -649,6 +676,10 @@ def _run_sync_from_cloudsql(
     synced: list[dict] = []
     not_found: list[str] = []
 
+    # Overrides aren't scoped per BC company (so_buffer_service.save_override keys
+    # purely by raw SKU/branch/customer text), so one fetch covers every company below.
+    sku_overrides = so_buffer_overrides.fetch_sku_item_overrides()
+
     for company in companies:
         try:
             item_refs = bc_client.fetch_item_references(company)
@@ -665,7 +696,7 @@ def _run_sync_from_cloudsql(
         for h in company_headers:
             po_ref = h.get("poRefNumber", "unknown")
             try:
-                result = _sync_order_from_cloudsql(h, company, f"cloudsql-sync:{company}", ref_map)
+                result = _sync_order_from_cloudsql(h, company, f"cloudsql-sync:{company}", ref_map, sku_overrides)
                 if result is None:
                     not_found.append(po_ref)
                 else:
@@ -801,6 +832,16 @@ def _run_batch(
             "_buf_id": buf_doc_id,
             "so_number": buf_data.get("so_number"),
         })
+
+    # A buffered order's lines normally already carry resolvedItem (apply_resolution_to_buffer
+    # patches it on save), but a fresh inbound order never does, and a buffer doc saved before
+    # its SKU was linked only gets patched if the override is re-saved against its exact
+    # buffer_id. Re-applying every current SKU override here, by raw SKU/description text
+    # rather than relying on that prior patch, covers both gaps — a linked item's line gets
+    # inserted whether the order is still being linked up or has already reached BC once.
+    sku_overrides = so_buffer_overrides.fetch_sku_item_overrides()
+    for order_item in all_orders:
+        _apply_sku_overrides(order_item["lines"], sku_overrides)
 
     if not all_orders:
         logger.info(f"POUL SO: nothing to do for company={company!r} (no fresh orders, empty buffer)")
