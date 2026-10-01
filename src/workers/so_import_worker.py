@@ -201,18 +201,26 @@ def _resolve_valid_lines(
         sku: str = sku_raw.upper()
         desc: str = (line.get("customerSKUDesc") or "").strip()
 
-        if not sku:
+        # A reconcile-page SKU link always wins over ref_map lookup — resolvedItem is
+        # the denormalized copy rgmc-bc-api's apply_resolution_to_buffer writes onto this
+        # exact line when a human resolves its SKU group on /reconcile. Previously written
+        # but never read back here, so a resolved SKU link never actually changed the retry.
+        resolved_item: dict = line.get("resolvedItem") or {}
+        item_no: str | None = resolved_item.get("itemNo")
+        if item_no:
+            logger.info(f"PO {po_ref} line {i}: using reconcile-page SKU link → item={item_no!r}")
+        elif not sku:
             logger.warning(f"PO {po_ref} line {i}: empty SKU — invalid")
             skipped.append({"sku": "", "description": desc, "reason": "no_bc_match", "line": line})
             continue
-
-        item_no: str | None = ref_map.get(sku)
-        if not item_no:
-            logger.warning(
-                f"PO {po_ref} line {i}: SKU {sku!r} not found in item references — invalid"
-            )
-            skipped.append({"sku": sku_raw, "description": desc, "reason": "no_bc_match", "line": line})
-            continue
+        else:
+            item_no = ref_map.get(sku)
+            if not item_no:
+                logger.warning(
+                    f"PO {po_ref} line {i}: SKU {sku!r} not found in item references — invalid"
+                )
+                skipped.append({"sku": sku_raw, "description": desc, "reason": "no_bc_match", "line": line})
+                continue
 
         uom_raw = line.get("unitOfMeasurement") or ""
         pcs = _is_pcs(uom_raw)
@@ -272,27 +280,47 @@ def _create_order(
         order_id: str = found.get("id", "")
     else:
         # ── Customer lookup via Ship-to Address ───────────────────────────────
-        branch_code: str = (header.get("customerBranchLookUpCode") or "").strip().upper()
-        branch_name: str = (header.get("customerBranchName") or "").strip()
+        # A reconcile-page link always wins over automatic matching: header.resolvedShipTo
+        # (saved against the "branch" override type) and header.resolvedCustomer (saved
+        # against "customer") are denormalized copies rgmc-bc-api's apply_resolution_to_buffer
+        # writes directly onto this buffer doc when a human resolves the branch/customer
+        # group on /reconcile — previously written but never read back here, so a resolved
+        # link never actually changed what got retried. resolvedShipTo (customerNo +
+        # shipToCode) takes priority since it pins the exact ship-to; resolvedCustomer alone
+        # (no branch link saved) still lets the order in with just a customer, no ship-to code.
+        resolved_ship_to: dict = header.get("resolvedShipTo") or {}
+        resolved_customer: dict = header.get("resolvedCustomer") or {}
 
-        # 1. Exact match on BC's own native ship-to code (fastest, most reliable where it
-        #    happens to align — BC's code and SBIC's branch_code are usually different
-        #    coding schemes entirely, e.g. "DS001-C001" vs "2001").
-        # 2. Exact match on the ship-to's lookupCode field (tableextension 50458) — this
-        #    is purpose-built to hold SBIC's own CustomerBranch.lookUpCode value, so once
-        #    populated this is the reliable match for branch_code, not #1.
-        # 3. Fuzzy name match (SequenceMatcher on normalized strings) — last resort.
-        ship_to_match = (
-            ship_to_by_code.get(branch_code)
-            or ship_to_by_lookup_code.get(branch_code)
-            or _fuzzy_ship_to_lookup(branch_name, ship_to_by_name)
-        )
-        if not ship_to_match:
-            raise ValueError(
-                f"No ship-to address in BC for branch code={branch_code!r} / "
-                f"name={branch_name!r} (company={company!r})"
+        if resolved_ship_to.get("customerNo"):
+            customer_no = resolved_ship_to["customerNo"]
+            ship_to_code = resolved_ship_to.get("shipToCode", "")
+            logger.info(f"PO {po_ref}: using reconcile-page branch link → customer={customer_no!r} shipTo={ship_to_code!r}")
+        elif resolved_customer.get("customerNo"):
+            customer_no = resolved_customer["customerNo"]
+            ship_to_code = ""
+            logger.info(f"PO {po_ref}: using reconcile-page customer link → customer={customer_no!r} (no ship-to)")
+        else:
+            branch_code: str = (header.get("customerBranchLookUpCode") or "").strip().upper()
+            branch_name: str = (header.get("customerBranchName") or "").strip()
+
+            # 1. Exact match on BC's own native ship-to code (fastest, most reliable where it
+            #    happens to align — BC's code and SBIC's branch_code are usually different
+            #    coding schemes entirely, e.g. "DS001-C001" vs "2001").
+            # 2. Exact match on the ship-to's lookupCode field (tableextension 50458) — this
+            #    is purpose-built to hold SBIC's own CustomerBranch.lookUpCode value, so once
+            #    populated this is the reliable match for branch_code, not #1.
+            # 3. Fuzzy name match (SequenceMatcher on normalized strings) — last resort.
+            ship_to_match = (
+                ship_to_by_code.get(branch_code)
+                or ship_to_by_lookup_code.get(branch_code)
+                or _fuzzy_ship_to_lookup(branch_name, ship_to_by_name)
             )
-        customer_no, ship_to_code = ship_to_match
+            if not ship_to_match:
+                raise ValueError(
+                    f"No ship-to address in BC for branch code={branch_code!r} / "
+                    f"name={branch_name!r} (company={company!r})"
+                )
+            customer_no, ship_to_code = ship_to_match
 
         header_payload = _build_header_payload(header, customer_no, ship_to_code, location_code)
         h_status, h_data = bc_client.v2_create_record("salesOrders", header_payload, company)
