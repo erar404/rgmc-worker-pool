@@ -158,6 +158,33 @@ def _safe_float(val) -> float:
         return 0.0
 
 
+def _resolve_line_qty(line: dict) -> float:
+    """The real order quantity for one line, picking the UOM-implied field first
+    (poQtyPcs for a PCS unit, else poQty) and falling back to the other field when
+    that one is non-positive.
+
+    Needed because CustomerPOULDetailBQ (Cloud SQL) can carry the real quantity in
+    the "wrong" field relative to its own unitOfMeasurement label — confirmed live
+    2026-10-02 against CustomerPOULDetail (the clean, non-Document-AI table for the
+    same PO): CustomerPOULDetailBQ had poQty=0/poQtyPcs=288/uom="Cases" for a line
+    whose CustomerPOULDetail counterpart has the unambiguous poQty=288 (no uom/pcs
+    split at all). Traced as far as this repo can see: the swap is already present in
+    BigQuery's int_document_ai_detail (Document AI's OCR extraction, built by a dbt
+    model outside any of these repos), not introduced by rgmc-gcp-api's bridge, whose
+    own column rename is a straightforward 1:1 po_qty->poQty / po_qty_pcs->poQtyPcs.
+    Rejecting the line outright in that case would silently drop an otherwise fully-
+    and correctly-linked line forever — this still trusts the UOM label for which
+    unit code/price to submit (see _build_line_payload), just not which physical
+    field the quantity landed in.
+    """
+    uom_raw = line.get("unitOfMeasurement") or ""
+    pcs = _is_pcs(uom_raw)
+    primary = _safe_float(line.get("poQtyPcs") if pcs else line.get("poQty"))
+    if primary > 0:
+        return primary
+    return _safe_float(line.get("poQty") if pcs else line.get("poQtyPcs"))
+
+
 _SUBMITTED_BY = "SBIC AI Uploading"
 
 
@@ -186,7 +213,7 @@ def _build_line_payload(line: dict, item_no: str, location_code: str, line_no: i
     uom_raw: str = line.get("unitOfMeasurement") or ""
     pcs = _is_pcs(uom_raw)
 
-    qty = _safe_float(line.get("poQtyPcs") if pcs else line.get("poQty"))
+    qty = _resolve_line_qty(line)
     unit_price = _safe_float(line.get("unitPricePcs") if pcs else line.get("unitPrice"))
     uom_code = _uom_code(uom_raw)
 
@@ -255,9 +282,7 @@ def _resolve_valid_lines(
                 skipped.append({"sku": sku_raw, "description": desc, "reason": "no_bc_match", "line": line})
                 continue
 
-        uom_raw = line.get("unitOfMeasurement") or ""
-        pcs = _is_pcs(uom_raw)
-        qty = _safe_float(line.get("poQtyPcs") if pcs else line.get("poQty"))
+        qty = _resolve_line_qty(line)
         if qty <= 0:
             logger.warning(f"PO {po_ref} line {i}: zero quantity — invalid")
             skipped.append({"sku": sku_raw, "description": desc, "reason": "non_positive_qty", "line": line})
