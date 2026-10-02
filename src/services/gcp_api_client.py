@@ -28,9 +28,10 @@ def fetch_customerpoul_by_create_by(
 ) -> list[dict]:
     """GET /customerpoul?create_by=... — every header row inserted via that path.
 
-    date_from/date_to (YYYY-MM-DD, both optional) scope to CustomerPOUL.poDate — used
-    by the Cloud SQL backfill handler so a run can be bounded to a specific window
-    instead of pulling every createBy='trigger' row ever inserted.
+    date_from/date_to (YYYY-MM-DD, both optional) scope to CustomerPOUL.createDate (when
+    the row was inserted into CustomerPOUL, not poDate, the original PO date from the
+    source ERP) — used by the Cloud SQL backfill handler so a run can be bounded to a
+    specific window instead of pulling every createBy='trigger' row ever inserted.
 
     company_id (optional) scopes to CustomerPOUL.companyId on sbic_prod (SBIC=6,
     MTC=12) — a clean numeric key, unlike companyName free text.

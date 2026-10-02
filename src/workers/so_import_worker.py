@@ -38,9 +38,11 @@ at all, skipping any row whose externalDocumentNo already matches an existing BC
 — published by gcp-api's POST /customerpoul/backfill-from-cloudsql:
   { "type": "poul-so-backfill-from-cloudsql", "companies": [...], "create_by": "trigger",
     "date_from": "2026-01-01", "date_to": "2026-01-31" }
-  date_from/date_to (both optional) scope the CustomerPOUL rows considered to a poDate
-  range. Any row that can't be fully resolved (no ship-to/customer/item match, or BC
-  rejects it) is buffered via so_buffer, exactly like a normal inbound batch.
+  date_from/date_to (both optional) scope the CustomerPOUL rows considered to a
+  createDate range (when the row was inserted into CustomerPOUL, not poDate, the
+  original PO date from the source ERP). Any row that can't be fully resolved (no
+  ship-to/customer/item match, or BC rejects it) is buffered via so_buffer, exactly
+  like a normal inbound batch.
 
 Processing per batch message:
   1. Resolve BC company from the first order's companyName.
@@ -815,7 +817,8 @@ def _run_backfill_from_cloudsql(
     notify: dict | None = None,
 ) -> tuple[bool, dict]:
     """Handle a poul-so-backfill-from-cloudsql message: for every CustomerPOUL row
-    matching create_by (and, if given, within [date_from, date_to] on poDate), create
+    matching create_by (and, if given, within [date_from, date_to] on createDate —
+    when the row was inserted into CustomerPOUL, not poDate), create
     a FRESH BC sales order (header + lines) from CustomerPOUL/CustomerPOULDetailBQ —
     unless a BC order already exists for that PO's externalDocumentNo, in which case
     it's skipped untouched. This is the exact opposite skip condition from
