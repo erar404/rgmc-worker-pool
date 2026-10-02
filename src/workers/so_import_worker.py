@@ -699,6 +699,17 @@ def _run_sync_from_cloudsql(
     the given create_by, find its BC order (by externalDocumentNo) and backfill
     whatever lines are missing from Cloud SQL's CustomerPOULDetailBQ.
 
+    A PO is reported as exactly one of:
+      - synced     — checked successfully (lines added and/or already present).
+      - not_found  — no BC order exists for this PO's externalDocumentNo. Genuine.
+      - errored    — the check itself failed (e.g. BC returned 503 after exhausting
+        bc_client's own retries) and was never actually resolved either way. Kept
+        strictly separate from not_found — conflating the two previously made a
+        transient BC outage during a manual sync (2026-10-01) look identical to "these
+        1000 POs have no BC order yet", which isn't true and isn't actionable the same
+        way. Each PO gets one immediate retry before landing here, since the kind of
+        blip that causes this is often already gone a few seconds later.
+
     Always returns (True, summary) — a per-company pre-fetch failure is logged and
     that company is skipped rather than failing the whole run, since this is an
     on-demand maintenance pass, not something Pub/Sub needs to retry redelivering.
@@ -713,6 +724,7 @@ def _run_sync_from_cloudsql(
     headers = gcp_api_client.fetch_customerpoul_by_create_by(create_by)
     synced: list[dict] = []
     not_found: list[str] = []
+    errored: list[dict] = []
 
     # Overrides aren't scoped per BC company (so_buffer_service.save_override keys
     # purely by raw SKU/branch/customer text), so one fetch covers every company below.
@@ -727,6 +739,7 @@ def _run_sync_from_cloudsql(
         ref_map: dict[str, str] = _build_ref_map(item_refs)
 
         company_headers = [h for h in headers if _resolve_bc_company(h.get("companyName", "")) == company]
+        retry_headers: list[dict] = []
         for h in company_headers:
             po_ref = h.get("poRefNumber", "unknown")
             try:
@@ -736,17 +749,36 @@ def _run_sync_from_cloudsql(
                 else:
                     synced.append(result)
             except Exception as e:
-                logger.error(f"Cloud SQL sync failed for PO {po_ref!r}: {e}")
-                not_found.append(po_ref)
+                logger.warning(f"Cloud SQL sync: PO {po_ref!r} errored, will retry once: {e}")
+                retry_headers.append(h)
+
+        # One retry per PO that raised above — gives a transient BC blip (the kind
+        # that caused this fix) a second chance before it's reported as a real error,
+        # since the rest of this company's pass has often given BC time to recover.
+        for h in retry_headers:
+            po_ref = h.get("poRefNumber", "unknown")
+            try:
+                result = _sync_order_from_cloudsql(h, company, f"cloudsql-sync:{company}", ref_map, sku_overrides)
+                if result is None:
+                    not_found.append(po_ref)
+                else:
+                    synced.append(result)
+            except Exception as e:
+                logger.error(f"Cloud SQL sync failed for PO {po_ref!r} (after retry): {e}")
+                errored.append({"po_ref": po_ref, "error": str(e)})
 
     context = f"companies={companies} create_by={create_by!r}{requested_by}"
-    if synced or not_found:
+    if synced or not_found or errored:
         detail_lines = [
             f"  PO Ref {r['po_ref']:<20} → BC {r['order_no']}: "
             f"+{r['lines_created']} added, {r['already_present']} already present, "
             f"{r['lines_skipped']} skipped"
             for r in synced
         ]
+        if errored:
+            detail_lines.append("")
+            detail_lines.append(f"Could not be checked due to an error (NOT necessarily missing from BC — retry this sync) — {len(errored)} PO(s):")
+            detail_lines.extend(f"  - {e['po_ref']}: {e['error']}" for e in errored)
         if not_found:
             detail_lines.append("")
             detail_lines.append(f"No matching BC order found for {len(not_found)} PO(s):")
@@ -754,6 +786,8 @@ def _run_sync_from_cloudsql(
         title = f"POUL SO Cloud SQL Sync — {len(synced)} order(s) checked"
         if not_found:
             title += f", {len(not_found)} not found in BC"
+        if errored:
+            title += f", {len(errored)} errored"
         notify_success(title=title, detail="\n".join(detail_lines), context=context, extra_recipients=extra_recipients)
     else:
         notify_success(
@@ -766,6 +800,7 @@ def _run_sync_from_cloudsql(
     summary = {
         "orders_synced": len(synced),
         "orders_not_found": len(not_found),
+        "orders_errored": len(errored),
         "lines_created": sum(r["lines_created"] for r in synced),
         "lines_skipped": sum(r["lines_skipped"] for r in synced),
     }
