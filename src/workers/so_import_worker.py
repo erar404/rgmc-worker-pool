@@ -296,6 +296,8 @@ def _create_order(
     ship_to_by_name: dict[str, tuple[str, str]],
     ref_map: dict[str, str],
     location_code: str,
+    branch_overrides: dict[str, dict],
+    customer_overrides: dict[str, dict],
     existing_so_number: str | None = None,
 ) -> dict:
     """Create (or resume) one BC Sales Order and return a result summary dict.
@@ -303,6 +305,12 @@ def _create_order(
     ship_to_by_code / ship_to_by_lookup_code / ship_to_by_name map upper-cased branch
     code / lookup code / name → (customer_no, ship_to_code). ref_map is pre-fetched by
     the caller for the whole batch.
+
+    branch_overrides / customer_overrides: so_buffer_overrides.fetch_branch_overrides()
+    / fetch_customer_overrides() — every saved reconcile-page branch/customer link,
+    keyed by raw upper-cased customerBranchName/customerName text, fetched fresh by
+    the caller for the whole batch (see this function's own "Customer lookup via
+    Ship-to Address" section for why this is needed alongside header.resolvedShipTo).
 
     existing_so_number: when set, this PO's header was already created on a previous
     pass (recorded as so_buffer's `so_number`) — skip ship-to resolution and header
@@ -338,16 +346,28 @@ def _create_order(
         base_line_no = max((l.get("lineNo") or 0 for l in existing_lines), default=0)
     else:
         # ── Customer lookup via Ship-to Address ───────────────────────────────
-        # A reconcile-page link always wins over automatic matching: header.resolvedShipTo
-        # (saved against the "branch" override type) and header.resolvedCustomer (saved
-        # against "customer") are denormalized copies rgmc-bc-api's apply_resolution_to_buffer
-        # writes directly onto this buffer doc when a human resolves the branch/customer
-        # group on /reconcile — previously written but never read back here, so a resolved
-        # link never actually changed what got retried. resolvedShipTo (customerNo +
-        # shipToCode) takes priority since it pins the exact ship-to; resolvedCustomer alone
-        # (no branch link saved) still lets the order in with just a customer, no ship-to code.
-        resolved_ship_to: dict = header.get("resolvedShipTo") or {}
-        resolved_customer: dict = header.get("resolvedCustomer") or {}
+        # A reconcile-page link always wins over automatic matching. Two independent
+        # sources feed resolved_ship_to/resolved_customer — either is enough:
+        #   1. header.resolvedShipTo / header.resolvedCustomer — denormalized copies
+        #      rgmc-bc-api's apply_resolution_to_buffer writes directly onto a buffer
+        #      doc at the moment a human resolves it on /reconcile.
+        #   2. branch_overrides / customer_overrides — the SAME saved override,
+        #      looked up fresh by raw customerBranchName/customerName text. #1 alone
+        #      misses any order whose buffer doc didn't exist yet (or was replaced by
+        #      a fresh re-import from source) when the override was saved — the exact
+        #      gap that let a resolved branch link keep failing with "No ship-to
+        #      address" forever (confirmed live 2026-10-02: an override saved a day
+        #      earlier, buffer docs re-created afterward with neither denormalized
+        #      field, same error every retry). Mirrors how sku_overrides is already
+        #      re-applied fresh on every pass instead of relying solely on
+        #      line.resolvedItem, for the identical reason.
+        # resolvedShipTo (customerNo + shipToCode) takes priority since it pins the
+        # exact ship-to; resolvedCustomer alone (no branch link saved) still lets the
+        # order in with just a customer, no ship-to code.
+        branch_key = (header.get("customerBranchName") or "").strip().upper()
+        customer_key = (header.get("customerName") or "").strip().upper()
+        resolved_ship_to: dict = header.get("resolvedShipTo") or branch_overrides.get(branch_key) or {}
+        resolved_customer: dict = header.get("resolvedCustomer") or customer_overrides.get(customer_key) or {}
 
         if resolved_ship_to.get("customerNo"):
             customer_no = resolved_ship_to["customerNo"]
@@ -460,6 +480,25 @@ def _create_order(
     }
 
 
+def _buffer_status_note(attempt_count: int | None) -> str:
+    """Email-detail suffix for one failed order, from save_failed_order's return value.
+
+    None means the failure never reached save_failed_order at all (e.g. backfill's
+    existence check erroring out before an order was ever buffered) — distinct from
+    0, which means the Firestore write itself failed (a real infra problem). Past
+    so_buffer.MAX_ATTEMPTS the order is still kept (see save_failed_order's docstring
+    — it's never dropped just for repeated failures), so this only changes the
+    wording into a nudge to go resolve it on /reconcile, never the underlying data.
+    """
+    if attempt_count is None:
+        return "  [not buffered — never attempted]"
+    if attempt_count <= 0:
+        return "  [NOT buffered — Firestore write failed, will not auto-retry]"
+    if attempt_count > so_buffer.MAX_ATTEMPTS:
+        return f"  [buffered for retry — failed {attempt_count}x, needs a manual link on /reconcile]"
+    return "  [buffered for retry]"
+
+
 def _send_batch_notification(
     successes: list[dict],
     errors: list[dict],
@@ -511,8 +550,7 @@ def _send_batch_notification(
         if errors:
             detail += f"\n\nFailed Orders   : {len(errors)}\n"
             for e in errors:
-                buffered_note = "  [buffered for retry]" if e.get("buffered") else "  [dropped — max retries exceeded]"
-                detail += f"  - {e['po_ref']}: {e['error']}{buffered_note}\n"
+                detail += f"  - {e['po_ref']}: {e['error']}{_buffer_status_note(e.get('attempt_count'))}\n"
 
         title = f"{label} — {count} order{'s' if count != 1 else ''} created"
         if errors:
@@ -521,8 +559,7 @@ def _send_batch_notification(
 
     elif errors:
         detail = "\n".join(
-            f"  - {e['po_ref']}: {e['error']} "
-            f"({'buffered for retry' if e.get('buffered') else 'dropped — max retries exceeded'})"
+            f"  - {e['po_ref']}: {e['error']}{_buffer_status_note(e.get('attempt_count'))}"
             for e in errors
         )
         notify_error(
@@ -847,6 +884,8 @@ def _run_backfill_from_cloudsql(
     # Overrides aren't scoped per BC company (so_buffer_service.save_override keys
     # purely by raw SKU/branch/customer text), so one fetch covers every company below.
     sku_overrides = so_buffer_overrides.fetch_sku_item_overrides()
+    branch_overrides = so_buffer_overrides.fetch_branch_overrides()
+    customer_overrides = so_buffer_overrides.fetch_customer_overrides()
 
     successes: list[dict] = []
     errors: list[dict] = []
@@ -884,7 +923,7 @@ def _run_backfill_from_cloudsql(
                     continue
             except Exception as e:
                 logger.error(f"POUL SO backfill: existence check failed for PO {po_ref!r}: {e}")
-                errors.append({"po_ref": po_ref, "error": str(e), "buffered": False})
+                errors.append({"po_ref": po_ref, "error": str(e)})  # never buffered — the check itself failed
                 continue
 
             lines = gcp_api_client.fetch_customerpouldetailbq(po_ref)
@@ -893,7 +932,8 @@ def _run_backfill_from_cloudsql(
                 result = _create_order(
                     h, lines, company,
                     ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name,
-                    ref_map, location_code, existing_so_number=None,
+                    ref_map, location_code, branch_overrides, customer_overrides,
+                    existing_so_number=None,
                 )
                 result["from_buffer"] = False
                 successes.append(result)
@@ -911,8 +951,8 @@ def _run_backfill_from_cloudsql(
                     logger.error(f"POUL SO backfill permanent failure — PO {po_ref!r}: {e}")
                 else:
                     logger.error(f"POUL SO backfill error — PO {po_ref!r}: {e}")
-                so_buffer.save_failed_order(h, lines, company, f"cloudsql-backfill:{company}", err_str)
-                errors.append({"po_ref": po_ref, "error": err_str, "buffered": True})
+                attempt_count = so_buffer.save_failed_order(h, lines, company, f"cloudsql-backfill:{company}", err_str)
+                errors.append({"po_ref": po_ref, "error": err_str, "attempt_count": attempt_count})
 
     _send_batch_notification(
         successes, errors, "/".join(companies), f"cloudsql-backfill:{create_by}",
@@ -1060,10 +1100,13 @@ def _run_batch(
     # A buffered order's lines normally already carry resolvedItem (apply_resolution_to_buffer
     # patches it on save), but a fresh inbound order never does, and a buffer doc saved before
     # its SKU was linked only gets patched if the override is re-saved against its exact
-    # buffer_id. Re-applying every current SKU override here, by raw SKU/description text
-    # rather than relying on that prior patch, covers both gaps — a linked item's line gets
-    # inserted whether the order is still being linked up or has already reached BC once.
+    # buffer_id. Re-applying every current SKU/branch/customer override here, by raw text
+    # rather than relying on that prior patch, covers both gaps — a linked item/branch/
+    # customer takes effect whether the order is still being linked up or has already
+    # reached BC once (branch/customer are read inside _create_order, below).
     sku_overrides = so_buffer_overrides.fetch_sku_item_overrides()
+    branch_overrides = so_buffer_overrides.fetch_branch_overrides()
+    customer_overrides = so_buffer_overrides.fetch_customer_overrides()
     for order_item in all_orders:
         _apply_sku_overrides(order_item["lines"], sku_overrides)
 
@@ -1091,7 +1134,7 @@ def _run_batch(
             result = _create_order(
                 header, lines, company,
                 ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name,
-                ref_map, location_code,
+                ref_map, location_code, branch_overrides, customer_overrides,
                 existing_so_number=so_number,
             )
             result["from_buffer"] = buf_id is not None
@@ -1117,10 +1160,10 @@ def _run_batch(
                 logger.error(f"POUL SO permanent failure — PO {po_ref!r}: {e}")
             else:
                 logger.error(f"POUL SO error — PO {po_ref!r}: {e}")
-            still_buffered = so_buffer.save_failed_order(
+            attempt_count = so_buffer.save_failed_order(
                 header, lines, company, src_company, err_str, so_number=so_number
             )
-            errors.append({"po_ref": po_ref, "error": err_str, "buffered": still_buffered})
+            errors.append({"po_ref": po_ref, "error": err_str, "attempt_count": attempt_count})
 
     # ── Send one consolidated email, plus a separate flag for unmatched items ──
     _send_batch_notification(successes, errors, company, src_company, label=label, notify=notify)

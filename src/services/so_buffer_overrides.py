@@ -5,11 +5,15 @@ Collection name: so_buffer_overrides_{env} — same project and env-slug convent
 so_buffer.py's so_buffer_{env}, read directly via Firestore rather than an HTTP call to
 rgmc-bc-api, since worker-pool already owns a Firestore client for the buffer itself.
 
-Needed specifically for _sync_order_from_cloudsql (so_import_worker.py): that path
-re-derives a PO's lines fresh from Cloud SQL for orders whose Firestore buffer doc is
-already gone, so it never sees the line.resolvedItem field apply_resolution_to_buffer
-only patches onto a *buffer* doc. Without this, a SKU link saved on /reconcile after an
-order's header was already created in BC would never actually get its lines inserted.
+Needed because apply_resolution_to_buffer (rgmc-bc-api) only ever patches the
+resolved/resolvedShipTo/resolvedCustomer fields onto a buffer doc that already exists
+at the moment a human saves the link on /reconcile — a PO whose doc wasn't there yet
+(a fresh inbound order sharing an already-resolved key, or a doc later recreated from
+source) never carries that patch and would keep failing the exact same way forever,
+even though the link is saved. Re-deriving each link fresh here, by raw SKU/branch/
+customer text instead of relying on that one-time patch, closes that gap for every
+caller: _sync_order_from_cloudsql (lines, orders whose header's already in BC) and
+_create_order (lines + branch/customer, new headers).
 """
 import logging
 
@@ -48,4 +52,51 @@ def fetch_sku_item_overrides() -> dict[str, dict]:
         return out
     except Exception as exc:
         logger.warning(f"so_buffer_overrides: fetch_sku_item_overrides failed — continuing without overrides: {exc}")
+        return {}
+
+
+def fetch_branch_overrides() -> dict[str, dict]:
+    """Return {BRANCH_NAME_UPPER: {"customerNo": ..., "shipToCode": ..., "name": ...}}
+    for every saved "branch" override.
+
+    Same rationale as fetch_sku_item_overrides, for the same underlying gap:
+    apply_resolution_to_buffer only patches header.resolvedShipTo onto a buffer doc
+    that already existed at the moment a human resolved it on /reconcile. A PO whose
+    buffer doc didn't exist yet then — a fresh inbound order sharing an
+    already-resolved branch, or a buffer doc later recreated from source — never
+    carries that patch and would keep failing ship-to resolution forever even though
+    the link is saved. Re-deriving the same link fresh, by raw branch name, covers
+    that gap the same way fetch_sku_item_overrides already does for SKUs.
+    """
+    try:
+        docs = _client().collection(_COLLECTION).where("type", "==", "branch").stream()
+        out: dict[str, dict] = {}
+        for doc in docs:
+            data = doc.to_dict() or {}
+            key = (data.get("key") or "").strip().upper()
+            resolved = data.get("resolved") or {}
+            if key and resolved.get("customerNo"):
+                out[key] = resolved
+        return out
+    except Exception as exc:
+        logger.warning(f"so_buffer_overrides: fetch_branch_overrides failed — continuing without overrides: {exc}")
+        return {}
+
+
+def fetch_customer_overrides() -> dict[str, dict]:
+    """Return {CUSTOMER_NAME_UPPER: {"customerNo": ..., "displayName": ...}} for every
+    saved "customer" override. Same rationale as fetch_branch_overrides.
+    """
+    try:
+        docs = _client().collection(_COLLECTION).where("type", "==", "customer").stream()
+        out: dict[str, dict] = {}
+        for doc in docs:
+            data = doc.to_dict() or {}
+            key = (data.get("key") or "").strip().upper()
+            resolved = data.get("resolved") or {}
+            if key and resolved.get("customerNo"):
+                out[key] = resolved
+        return out
+    except Exception as exc:
+        logger.warning(f"so_buffer_overrides: fetch_customer_overrides failed — continuing without overrides: {exc}")
         return {}

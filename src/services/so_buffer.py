@@ -5,9 +5,10 @@ Document ID   : poRefNumber (slugified) — idempotent; re-saves overwrite stale
 
 Lifecycle:
   save_failed_order()    → called when _create_order() raises for a new or retried order.
-                           Increments attempt_count each time. Once MAX_ATTEMPTS is
-                           exceeded the document is deleted and the caller gets False,
-                           signalling that the order should be treated as a final failure.
+                           Increments attempt_count each time and always keeps the
+                           document — it's never deleted just for exceeding
+                           MAX_ATTEMPTS, since this buffer's whole purpose is letting a
+                           human resolve exactly the failures that keep recurring.
   get_buffered_orders()  → called at the start of each batch to pull pending retries.
   delete_buffered_order()→ called after a buffered order is successfully created in BC.
 
@@ -46,7 +47,7 @@ def save_failed_order(
     src_company: str,
     error: str,
     so_number: str | None = None,
-) -> bool:
+) -> int:
     """Upsert a failed/partial order into the buffer.
 
     `lines` here means "still outstanding" — for a fresh failure that's every line;
@@ -59,7 +60,18 @@ def save_failed_order(
     triggered by an unrelated later failure (e.g. a transient BC error looking up
     the order to resume it) never silently drops the linkage to the header.
 
-    Returns True if saved, False if MAX_ATTEMPTS exceeded (order permanently dropped).
+    A persistently failing order is NEVER deleted here just for exceeding
+    MAX_ATTEMPTS (that used to happen, and silently erased the one record /reconcile
+    needs to fix a genuinely unresolvable SKU/branch/customer mismatch — the exact
+    class of failure this buffer exists to let a human resolve. A branch/ship-to
+    mismatch that can't auto-resolve fails the same way on every single retry, so it
+    reliably hit that cap and vanished with no trace beyond one easily-missed email,
+    permanently out of reach of the one tool that could actually fix it). MAX_ATTEMPTS
+    now only changes _send_batch_notification's email wording (a nudge to go
+    reconcile it), never the stored data.
+
+    Returns the new attempt_count (always >= 1) once saved, or 0 if the Firestore
+    write itself failed (a real infra problem, not a retry-count cutoff).
     """
     try:
         doc_id = _doc_id(header)
@@ -67,14 +79,6 @@ def save_failed_order(
         existing_data = doc_ref.get().to_dict() or {}
         attempt_count = existing_data.get("attempt_count", 0) + 1
         resolved_so_number = so_number if so_number is not None else existing_data.get("so_number")
-
-        if attempt_count > MAX_ATTEMPTS:
-            logger.warning(
-                f"so_buffer: {doc_id!r} exceeded {MAX_ATTEMPTS} attempts — "
-                f"removing from buffer (company={company!r}, so_number={resolved_so_number!r})"
-            )
-            doc_ref.delete()
-            return False
 
         payload = {
             "header": header,
@@ -88,14 +92,21 @@ def save_failed_order(
         if resolved_so_number:
             payload["so_number"] = resolved_so_number
         doc_ref.set(payload)
-        logger.info(
-            f"so_buffer: saved {doc_id!r} attempt {attempt_count}/{MAX_ATTEMPTS} "
-            f"to {_COLLECTION!r} (so_number={resolved_so_number!r}, {len(lines)} line(s) outstanding)"
-        )
-        return True
+        if attempt_count > MAX_ATTEMPTS:
+            logger.warning(
+                f"so_buffer: {doc_id!r} has now failed {attempt_count} times (company={company!r}, "
+                f"so_number={resolved_so_number!r}) — likely needs a manual link on /reconcile, "
+                f"kept in the buffer regardless"
+            )
+        else:
+            logger.info(
+                f"so_buffer: saved {doc_id!r} attempt {attempt_count}/{MAX_ATTEMPTS} "
+                f"to {_COLLECTION!r} (so_number={resolved_so_number!r}, {len(lines)} line(s) outstanding)"
+            )
+        return attempt_count
     except Exception as exc:
         logger.warning(f"so_buffer: save_failed_order failed for {_doc_id(header)!r}: {exc}")
-        return False
+        return 0
 
 
 def get_buffered_orders(company: str) -> list[tuple[str, dict]]:
