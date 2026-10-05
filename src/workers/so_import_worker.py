@@ -63,7 +63,7 @@ from difflib import SequenceMatcher
 from google.cloud import pubsub_v1
 
 from src import config
-from src.services import bc_client, gcp_api_client, so_buffer, so_buffer_overrides, reprocess_status
+from src.services import bc_client, gcp_api_client, so_buffer, so_buffer_history, so_buffer_overrides, reprocess_status
 from src.services.send_mail import notify_error, notify_success, notify_warning
 
 logger = logging.getLogger("worker.so_import")
@@ -372,27 +372,34 @@ def _create_order(
     else:
         # ── Customer lookup via Ship-to Address ───────────────────────────────
         # A reconcile-page link always wins over automatic matching. Two independent
-        # sources feed resolved_ship_to/resolved_customer — either is enough:
-        #   1. header.resolvedShipTo / header.resolvedCustomer — denormalized copies
+        # sources feed resolved_ship_to/resolved_customer:
+        #   1. branch_overrides / customer_overrides — the saved override, fetched
+        #      fresh from so_buffer_overrides_{env} by the caller for this whole pass
+        #      (so_buffer_overrides.fetch_branch_overrides/fetch_customer_overrides).
+        #   2. header.resolvedShipTo / header.resolvedCustomer — denormalized copies
         #      rgmc-bc-api's apply_resolution_to_buffer writes directly onto a buffer
         #      doc at the moment a human resolves it on /reconcile.
-        #   2. branch_overrides / customer_overrides — the SAME saved override,
-        #      looked up fresh by raw customerBranchName/customerName text. #1 alone
-        #      misses any order whose buffer doc didn't exist yet (or was replaced by
-        #      a fresh re-import from source) when the override was saved — the exact
-        #      gap that let a resolved branch link keep failing with "No ship-to
-        #      address" forever (confirmed live 2026-10-02: an override saved a day
-        #      earlier, buffer docs re-created afterward with neither denormalized
-        #      field, same error every retry). Mirrors how sku_overrides is already
-        #      re-applied fresh on every pass instead of relying solely on
-        #      line.resolvedItem, for the identical reason.
+        # #1 takes priority over #2 — a buffer doc's denormalized field is a one-time
+        # patch applied only to the buffer_ids known at save time, so if a user later
+        # re-links the same branch/customer text to a different value (the UI's
+        # "Change…" action) while some buffer doc with the OLD patched value was missed
+        # by that save (e.g. page wasn't refreshed, or the doc didn't exist/was
+        # recreated after the first link), the doc keeps the stale value forever and
+        # #2-first would silently keep routing to the wrong customer/ship-to on every
+        # retry, with no error. #1 is always the current truth for that branch/customer
+        # text (fetch_branch_overrides/fetch_customer_overrides re-read it fresh on
+        # every pass — same self-healing pattern _apply_sku_overrides already uses for
+        # SKU links), so it must win whenever it has a value. #2 only still matters as
+        # a fallback for a buffer doc whose branch/customer text no longer has ANY
+        # saved override (e.g. the override was deleted outright via /reconcile's
+        # "unlink", but the doc was already patched beforehand).
         # resolvedShipTo (customerNo + shipToCode) takes priority since it pins the
         # exact ship-to; resolvedCustomer alone (no branch link saved) still lets the
         # order in with just a customer, no ship-to code.
         branch_key = (header.get("customerBranchName") or "").strip().upper()
         customer_key = (header.get("customerName") or "").strip().upper()
-        resolved_ship_to: dict = header.get("resolvedShipTo") or branch_overrides.get(branch_key) or {}
-        resolved_customer: dict = header.get("resolvedCustomer") or customer_overrides.get(customer_key) or {}
+        resolved_ship_to: dict = branch_overrides.get(branch_key) or header.get("resolvedShipTo") or {}
+        resolved_customer: dict = customer_overrides.get(customer_key) or header.get("resolvedCustomer") or {}
 
         if resolved_ship_to.get("customerNo"):
             customer_no = resolved_ship_to["customerNo"]
@@ -1060,6 +1067,8 @@ def _run_batch(
     fresh_orders: list[dict],
     label: str = "POUL SO Import",
     notify: dict | None = None,
+    record_history: bool = False,
+    run_id: str | None = None,
 ) -> tuple[bool, dict]:
     """Process fresh_orders plus anything buffered for `company`.
 
@@ -1073,6 +1082,14 @@ def _run_batch(
     notify is the employee who triggered a manual reprocess from the reconcile page
     (None for normal inbound-PO batches) — {"name", "company", "department", "email"}.
     When set, every email this call sends is also delivered to notify["email"].
+
+    record_history (True only for the poul-so-reprocess-buffer caller) appends one
+    so_buffer_history_{env} record per PO processed here — header, lines, outcome,
+    `notify`, and the current timestamp — so a PO's buffer reconciliation is still
+    visible after the fact even once its so_buffer_{env} doc is deleted. Never set for
+    normal inbound-PO batches, which have no triggering user to record. run_id (the
+    same id reprocess_status tracks this run under) is carried onto each record so
+    every PO reconciled by one reprocess-buffer run can be correlated back to it.
 
     Returns (ok, summary). ok is False only on a transient pre-fetch failure (caller
     should nack and redeliver); True otherwise (caller should ack — including when
@@ -1177,8 +1194,16 @@ def _run_batch(
                     f"(no BC item match or rejected by BC)",
                     so_number=result["so_number"],
                 )
-            elif buf_id:
-                so_buffer.delete_buffered_order(buf_id)
+                outcome = "still_buffered"
+            else:
+                if buf_id:
+                    so_buffer.delete_buffered_order(buf_id)
+                outcome = "resolved"
+            if record_history:
+                so_buffer_history.record_reconciliation(
+                    header, lines, company, outcome, notify,
+                    run_id=run_id, so_number=result.get("so_number"),
+                )
         except Exception as e:
             err_str = str(e)
             if isinstance(e, ValueError):
@@ -1189,6 +1214,11 @@ def _run_batch(
                 header, lines, company, src_company, err_str, so_number=so_number
             )
             errors.append({"po_ref": po_ref, "error": err_str, "attempt_count": attempt_count})
+            if record_history:
+                so_buffer_history.record_reconciliation(
+                    header, lines, company, "failed", notify,
+                    run_id=run_id, so_number=so_number, detail=err_str,
+                )
 
     # ── Send one consolidated email, plus a separate flag for unmatched items ──
     _send_batch_notification(successes, errors, company, src_company, label=label, notify=notify)
@@ -1240,6 +1270,8 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                     fresh_orders=[],
                     label="POUL SO Reprocess-Buffer",
                     notify=notify,
+                    record_history=True,
+                    run_id=run_id,
                 )
                 if not ok:
                     all_ok = False
