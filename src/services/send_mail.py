@@ -62,14 +62,26 @@ def notify_warning(title: str, detail: str, context: str = "", extra_recipients:
     ).start()
 
 
-def _recipients(extra_recipients: list[str] | None) -> str:
-    """DEVELOPER_EMAIL plus any de-duplicated extra recipients, comma-joined for the To header."""
-    seen = [config.developer_email]
+def _headers(extra_recipients: list[str] | None) -> tuple[str, str]:
+    """Return (to, cc).
+
+    When extra_recipients (e.g. the employee who triggered a manual reprocess/sync)
+    are given, they become the To — the developer is always Cc'd instead of blended
+    into To, so the employee sees themselves as the primary recipient and the
+    developer as an observer, on every single notification a trigger can produce.
+    With no extra_recipients (a purely internal/automatic notification — no one
+    "triggered" this), DEVELOPER_EMAIL is the sole To, unchanged from before.
+    """
+    extras: list[str] = []
+    seen_lower: set[str] = set()
     for addr in extra_recipients or []:
         addr = (addr or "").strip()
-        if addr and addr.lower() not in (a.lower() for a in seen):
-            seen.append(addr)
-    return ", ".join(seen)
+        if addr and addr.lower() not in seen_lower:
+            seen_lower.add(addr.lower())
+            extras.append(addr)
+    if extras:
+        return ", ".join(extras), config.developer_email
+    return config.developer_email, ""
 
 
 def _send(title: str, detail: str, context: str, extra_recipients: list[str] | None = None) -> None:
@@ -124,9 +136,12 @@ def _send(title: str, detail: str, context: str, extra_recipients: list[str] | N
     </html>
     """
 
+    to_addr, cc_addr = _headers(extra_recipients)
     msg = EmailMessage()
     msg["From"] = config.smtp_user
-    msg["To"] = _recipients(extra_recipients)
+    msg["To"] = to_addr
+    if cc_addr:
+        msg["Cc"] = cc_addr
     msg["Subject"] = subject
     msg.set_content(f"[{timestamp}] {title}\n\nContext: {context or '—'}\n\n{detail}")
     msg.add_alternative(html_content, subtype="html")
@@ -193,9 +208,12 @@ def _send_success(title: str, detail: str, context: str, extra_recipients: list[
     </html>
     """
 
+    to_addr, cc_addr = _headers(extra_recipients)
     msg = EmailMessage()
     msg["From"] = config.smtp_user
-    msg["To"] = _recipients(extra_recipients)
+    msg["To"] = to_addr
+    if cc_addr:
+        msg["Cc"] = cc_addr
     msg["Subject"] = subject
     msg.set_content(f"[{timestamp}] {title}\n\nContext: {context or '—'}\n\n{detail}")
     msg.add_alternative(html_content, subtype="html")
@@ -262,9 +280,12 @@ def _send_warning(title: str, detail: str, context: str, extra_recipients: list[
     </html>
     """
 
+    to_addr, cc_addr = _headers(extra_recipients)
     msg = EmailMessage()
     msg["From"] = config.smtp_user
-    msg["To"] = _recipients(extra_recipients)
+    msg["To"] = to_addr
+    if cc_addr:
+        msg["Cc"] = cc_addr
     msg["Subject"] = subject
     msg.set_content(f"[{timestamp}] {title}\n\nContext: {context or '—'}\n\n{detail}")
     msg.add_alternative(html_content, subtype="html")

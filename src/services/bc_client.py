@@ -651,6 +651,61 @@ def v2_create_record(table_endpoint: str, payload: dict, company_name: str):
     return resp.status_code, _safe_json(resp)
 
 
+def v2_find_sales_order_by_number(number: str, company_name: str) -> dict | None:
+    """Look up an existing v2.0 salesOrders record by its Document No. (number).
+
+    Used to resume a previously-created order (its number was recorded on a buffered
+    order as so_number) instead of creating a duplicate header. Returns the first
+    matching record ({"id": ..., "number": ..., ...}) or None if no match exists.
+    """
+    company_id = get_company_id(company_name)
+    number_esc = number.replace("'", "''")
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/salesOrders"
+        f"?$filter=number eq '{number_esc}'"
+    )
+    resp = _bc_request("get", url, headers=_auth_headers())
+    if not resp.ok:
+        return None
+    records = _safe_json(resp).get("value", [])
+    return records[0] if records else None
+
+
+def v2_find_sales_order_by_external_doc_no(po_ref: str, company_name: str) -> dict | None:
+    """Look up an existing v2.0 salesOrders record by its External Document No. — the
+    PO ref number every POUL-imported order is tagged with (see _build_header_payload).
+
+    Used by the Cloud SQL sync path to find an order whose Firestore buffer doc no
+    longer exists (already deleted after the header succeeded) so its lines can still
+    be backfilled from CustomerPOUL/CustomerPOULDetailBQ. Returns the first match
+    ({"id": ..., "number": ..., ...}) or None if no order was ever created for it.
+    """
+    company_id = get_company_id(company_name)
+    po_ref_esc = po_ref.replace("'", "''")
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/salesOrders"
+        f"?$filter=externalDocumentNo eq '{po_ref_esc}'"
+    )
+    resp = _bc_request("get", url, headers=_auth_headers())
+    if not resp.ok:
+        return None
+    records = _safe_json(resp).get("value", [])
+    return records[0] if records else None
+
+
+def v2_list_sales_order_lines(order_id: str, company_name: str) -> list:
+    """GET every existing salesOrderLines for one order — used by the Cloud SQL sync
+    path to avoid re-adding a line whose item is already on the order."""
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/salesOrders({order_id})/salesOrderLines"
+    )
+    return _fetch_all_pages(url)
+
+
 def v2_delete_record(table_endpoint: str, record_id: str, company_name: str):
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}({record_id})"

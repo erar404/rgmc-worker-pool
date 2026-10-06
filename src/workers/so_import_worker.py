@@ -22,6 +22,28 @@ by gcp-api's POST /customerpoul/reprocess-buffer (manual "reprocess now" trigger
   { "type": "poul-so-reprocess-buffer", "companies": ["SBIC", "MTC"] }
   "companies" is optional; omitted means every company in _ALL_BC_COMPANIES.
 
+A fourth message type backfills lines onto orders whose BC header already exists but
+whose Firestore buffer doc is gone (already deleted after a header-only success) —
+published by gcp-api's POST /customerpoul/sync-inserted-orders:
+  { "type": "poul-so-sync-from-cloudsql", "companies": [...], "create_by": "trigger" }
+  For every CustomerPOUL row matching create_by (default "trigger" — the BigQuery
+  bridge's automated inserts), finds the BC order by externalDocumentNo == poRefNumber,
+  and adds whichever CustomerPOULDetailBQ lines aren't already on it. Any line that
+  still can't be resolved (no BC item match, or BC rejects it) gets buffered with the
+  order's so_number, same as a normal reprocess-buffer entry.
+
+A fifth message type is the exact opposite skip condition of the fourth: it creates a
+FRESH BC order (header + lines) for a CustomerPOUL row that was never inserted into BC
+at all, skipping any row whose externalDocumentNo already matches an existing BC order
+— published by gcp-api's POST /customerpoul/backfill-from-cloudsql:
+  { "type": "poul-so-backfill-from-cloudsql", "companies": [...], "create_by": "trigger",
+    "date_from": "2026-01-01", "date_to": "2026-01-31" }
+  date_from/date_to (both optional) scope the CustomerPOUL rows considered to a
+  createDate range (when the row was inserted into CustomerPOUL, not poDate, the
+  original PO date from the source ERP). Any row that can't be fully resolved (no
+  ship-to/customer/item match, or BC rejects it) is buffered via so_buffer, exactly
+  like a normal inbound batch.
+
 Processing per batch message:
   1. Resolve BC company from the first order's companyName.
   2. Pre-fetch all BC ship-to addresses and item references ONCE for the batch.
@@ -41,7 +63,7 @@ from difflib import SequenceMatcher
 from google.cloud import pubsub_v1
 
 from src import config
-from src.services import bc_client, so_buffer, reprocess_status
+from src.services import bc_client, gcp_api_client, so_buffer, so_buffer_history, so_buffer_overrides, reprocess_status
 from src.services.send_mail import notify_error, notify_success, notify_warning
 
 logger = logging.getLogger("worker.so_import")
@@ -54,6 +76,13 @@ _COMPANY_MAP: list[tuple[str, str]] = [
     ("SUNCOAST", "SBIC"),
     ("SBIC", "SBIC"),
 ]
+
+# BC company code -> CustomerPOUL.companyId on sbic_prod (MSSQL) — a clean numeric key,
+# unlike companyName (free text, and _COMPANY_MAP above has no MTC entry at all). Used
+# by the Cloud SQL backfill to scope its CustomerPOUL query to exactly the company
+# selected on the /reconcile page's dropdown, instead of relying on companyName keyword
+# matching after the fact.
+_BC_COMPANY_ID_MAP: dict[str, int] = {"SBIC": 6, "MTC": 12}
 
 # UOM rules: if the source unit_of_measurement contains any of these substrings
 # (case-insensitive), treat the line as Piece/Pcs and use poQtyPcs / unitPricePcs.
@@ -129,6 +158,36 @@ def _safe_float(val) -> float:
         return 0.0
 
 
+def _resolve_line_qty(line: dict) -> float:
+    """The real order quantity for one line, picking the UOM-implied field first
+    (poQtyPcs for a PCS unit, else poQty) and falling back to the other field when
+    that one is non-positive.
+
+    Needed because CustomerPOULDetailBQ (Cloud SQL) can carry the real quantity in
+    the "wrong" field relative to its own unitOfMeasurement label — confirmed live
+    2026-10-02 against CustomerPOULDetail (the clean, non-Document-AI table for the
+    same PO): CustomerPOULDetailBQ had poQty=0/poQtyPcs=288/uom="Cases" for a line
+    whose CustomerPOULDetail counterpart has the unambiguous poQty=288 (no uom/pcs
+    split at all). Traced as far as this repo can see: the swap is already present in
+    BigQuery's int_document_ai_detail (Document AI's OCR extraction, built by a dbt
+    model outside any of these repos), not introduced by rgmc-gcp-api's bridge, whose
+    own column rename is a straightforward 1:1 po_qty->poQty / po_qty_pcs->poQtyPcs.
+    Rejecting the line outright in that case would silently drop an otherwise fully-
+    and correctly-linked line forever — this still trusts the UOM label for which
+    unit code/price to submit (see _build_line_payload), just not which physical
+    field the quantity landed in.
+    """
+    uom_raw = line.get("unitOfMeasurement") or ""
+    pcs = _is_pcs(uom_raw)
+    primary = _safe_float(line.get("poQtyPcs") if pcs else line.get("poQty"))
+    if primary > 0:
+        return primary
+    return _safe_float(line.get("poQty") if pcs else line.get("poQtyPcs"))
+
+
+_SUBMITTED_BY = "SBIC AI Uploading"
+
+
 def _build_header_payload(
     header: dict, customer_no: str, ship_to_code: str, location_code: str
 ) -> dict:
@@ -140,6 +199,7 @@ def _build_header_payload(
         "shipmentDate": header.get("deliveryDate") or "",
         "dueDate": header.get("cancellationDate") or "",
         "postingDescription": (header.get("remark") or "")[:100],
+        "submittedBy": _SUBMITTED_BY,
     }
     if ship_to_code:
         payload["shipToCode"] = ship_to_code
@@ -149,21 +209,31 @@ def _build_header_payload(
     return {k: v for k, v in payload.items() if v}
 
 
-def _build_line_payload(line: dict, item_no: str, location_code: str) -> dict:
+def _build_line_payload(line: dict, item_no: str, location_code: str, line_no: int) -> dict:
     uom_raw: str = line.get("unitOfMeasurement") or ""
     pcs = _is_pcs(uom_raw)
 
-    qty = _safe_float(line.get("poQtyPcs") if pcs else line.get("poQty"))
+    qty = _resolve_line_qty(line)
     unit_price = _safe_float(line.get("unitPricePcs") if pcs else line.get("unitPrice"))
     uom_code = _uom_code(uom_raw)
 
+    # postingGroup used to be hardcoded here as "TRADE" — BC now rejects that as
+    # "Control 'postingGroup' is read-only" on every line insert (confirmed live,
+    # 2026-10-01). BC derives it on its own from the item/customer posting setup once
+    # "number" is set, so it's no longer sent at all.
+    #
+    # lineNo (Rec."Line No." on RGMCSalesOrderLinesAPIv2, made Editable=true this
+    # session) is now assigned explicitly by the caller rather than left to BC's own
+    # auto-numbering — _create_order computes it deterministically (existing max + i *
+    # 10000), matching standard BC line-number spacing without relying on BC's
+    # auto-increment to behave correctly across the retry-on-409 loop below.
     payload: dict = {
         "lineType": "Item",
         "number": item_no,
+        "lineNo": line_no,
         "unitOfMeasureCode": uom_code,
         "quantity": qty,
         "unitPrice": unit_price,
-        "postingGroup": "TRADE",
         "shipmentDate": line.get("deliveryDate") or "",
     }
     if location_code:
@@ -178,9 +248,11 @@ def _resolve_valid_lines(
 
     Returns (resolved, skipped) where resolved is [(line, item_no), ...] for lines
     with a known SKU, a matching item reference, and a positive quantity, and
-    skipped is [{"sku", "description", "reason"}, ...] for every line left out —
-    reason is one of "no_bc_match" (empty SKU or no item reference found in BC —
-    i.e. no data to match against) or "non_positive_qty".
+    skipped is [{"sku", "description", "reason", "line"}, ...] for every line left
+    out — reason is one of "no_bc_match" (empty SKU or no item reference found in
+    BC — i.e. no data to match against) or "non_positive_qty". "line" is the raw
+    original line dict, kept so an unresolved line can be re-buffered and retried
+    later (e.g. once a reconcile-page override resolves its SKU) instead of lost.
     """
     resolved: list[tuple[dict, str]] = []
     skipped: list[dict] = []
@@ -189,29 +261,55 @@ def _resolve_valid_lines(
         sku: str = sku_raw.upper()
         desc: str = (line.get("customerSKUDesc") or "").strip()
 
-        if not sku:
+        # A reconcile-page SKU link always wins over ref_map lookup — resolvedItem is
+        # the denormalized copy rgmc-bc-api's apply_resolution_to_buffer writes onto this
+        # exact line when a human resolves its SKU group on /reconcile. Previously written
+        # but never read back here, so a resolved SKU link never actually changed the retry.
+        resolved_item: dict = line.get("resolvedItem") or {}
+        item_no: str | None = resolved_item.get("itemNo")
+        if item_no:
+            logger.info(f"PO {po_ref} line {i}: using reconcile-page SKU link → item={item_no!r}")
+        elif not sku:
             logger.warning(f"PO {po_ref} line {i}: empty SKU — invalid")
-            skipped.append({"sku": "", "description": desc, "reason": "no_bc_match"})
+            skipped.append({"sku": "", "description": desc, "reason": "no_bc_match", "line": line})
             continue
+        else:
+            item_no = ref_map.get(sku)
+            if not item_no:
+                logger.warning(
+                    f"PO {po_ref} line {i}: SKU {sku!r} not found in item references — invalid"
+                )
+                skipped.append({"sku": sku_raw, "description": desc, "reason": "no_bc_match", "line": line})
+                continue
 
-        item_no: str | None = ref_map.get(sku)
-        if not item_no:
-            logger.warning(
-                f"PO {po_ref} line {i}: SKU {sku!r} not found in item references — invalid"
-            )
-            skipped.append({"sku": sku_raw, "description": desc, "reason": "no_bc_match"})
-            continue
-
-        uom_raw = line.get("unitOfMeasurement") or ""
-        pcs = _is_pcs(uom_raw)
-        qty = _safe_float(line.get("poQtyPcs") if pcs else line.get("poQty"))
+        qty = _resolve_line_qty(line)
         if qty <= 0:
             logger.warning(f"PO {po_ref} line {i}: zero quantity — invalid")
-            skipped.append({"sku": sku_raw, "description": desc, "reason": "non_positive_qty"})
+            skipped.append({"sku": sku_raw, "description": desc, "reason": "non_positive_qty", "line": line})
             continue
 
         resolved.append((line, item_no))
     return resolved, skipped
+
+
+def _apply_sku_overrides(lines: list, sku_overrides: dict[str, dict]) -> None:
+    """Patch resolvedItem onto any line whose SKU (or description, if the SKU is
+    blank) matches a saved SKU override — in place.
+
+    Mirrors rgmc-bc-api's apply_resolution_to_buffer matching rule exactly (SKU code,
+    or description when blank, case-insensitive) so a reconcile-page SKU link applies
+    here too — needed because these lines came fresh from Cloud SQL
+    (_sync_order_from_cloudsql), not from a buffer doc apply_resolution_to_buffer
+    would already have patched.
+    """
+    if not sku_overrides:
+        return
+    for line in lines:
+        sku = (line.get("customerSKUCode") or "").strip()
+        match_key = (sku or (line.get("customerSKUDesc") or "").strip() or "(no SKU code, no description)").upper()
+        resolved = sku_overrides.get(match_key)
+        if resolved:
+            line["resolvedItem"] = resolved
 
 
 def _create_order(
@@ -223,42 +321,125 @@ def _create_order(
     ship_to_by_name: dict[str, tuple[str, str]],
     ref_map: dict[str, str],
     location_code: str,
+    branch_overrides: dict[str, dict],
+    customer_overrides: dict[str, dict],
+    existing_so_number: str | None = None,
 ) -> dict:
-    """Create one BC Sales Order (header + lines) and return a result summary dict.
+    """Create (or resume) one BC Sales Order and return a result summary dict.
 
     ship_to_by_code / ship_to_by_lookup_code / ship_to_by_name map upper-cased branch
     code / lookup code / name → (customer_no, ship_to_code). ref_map is pre-fetched by
     the caller for the whole batch.
+
+    branch_overrides / customer_overrides: so_buffer_overrides.fetch_branch_overrides()
+    / fetch_customer_overrides() — every saved reconcile-page branch/customer link,
+    keyed by raw upper-cased customerBranchName/customerName text, fetched fresh by
+    the caller for the whole batch (see this function's own "Customer lookup via
+    Ship-to Address" section for why this is needed alongside header.resolvedShipTo).
+
+    existing_so_number: when set, this PO's header was already created on a previous
+    pass (recorded as so_buffer's `so_number`) — skip ship-to resolution and header
+    creation entirely, look the order up by its number, and only attempt to add
+    whichever lines are still outstanding. This is what lets a buffered order whose
+    header succeeded but left some lines unmatched get *those specific lines* added
+    later (e.g. once a reconcile-page override resolves the SKU) instead of either
+    re-creating a duplicate header or losing the unresolved lines outright.
+
     Raises ValueError on permanent failures (bad data, BC rejects — e.g. no ship-to
-    match, or the header itself gets rejected by BC). The header is always created
-    once a ship-to match is found, regardless of how many lines resolve — an order
-    is no longer all-or-nothing; a PO with zero resolvable/acceptable lines still
-    gets its header (and PO ref number) into BC, just with no lines attached.
+    match, the header/lookup itself failing). The header is always created (or found)
+    once a ship-to match is found / so_number resolves, regardless of how many lines
+    resolve — an order is no longer all-or-nothing; a PO with zero resolvable lines
+    still gets its header (and PO ref number) into BC, just with no lines attached.
     """
     po_ref: str = header.get("poRefNumber", "unknown")
+    base_line_no = 0
 
-    # ── Customer lookup via Ship-to Address ───────────────────────────────────
-    branch_code: str = (header.get("customerBranchLookUpCode") or "").strip().upper()
-    branch_name: str = (header.get("customerBranchName") or "").strip()
+    if existing_so_number:
+        # Header already exists in BC from a previous pass — resume it instead of
+        # resolving ship-to / creating a second header for the same PO.
+        order_no = existing_so_number
+        found = bc_client.v2_find_sales_order_by_number(order_no, company)
+        if not found:
+            raise ValueError(
+                f"Could not find existing BC sales order {order_no!r} for PO {po_ref!r} "
+                f"(company={company!r}) — buffering for retry"
+            )
+        order_id: str = found.get("id", "")
+        # New lines must continue past whatever's already on the order — base_line_no
+        # stays 0 (first new line gets 10000) only for a brand-new header below.
+        existing_lines = bc_client.v2_list_sales_order_lines(order_id, company)
+        base_line_no = max((l.get("lineNo") or 0 for l in existing_lines), default=0)
+    else:
+        # ── Customer lookup via Ship-to Address ───────────────────────────────
+        # A reconcile-page link always wins over automatic matching. Two independent
+        # sources feed resolved_ship_to/resolved_customer:
+        #   1. branch_overrides / customer_overrides — the saved override, fetched
+        #      fresh from so_buffer_overrides_{env} by the caller for this whole pass
+        #      (so_buffer_overrides.fetch_branch_overrides/fetch_customer_overrides).
+        #   2. header.resolvedShipTo / header.resolvedCustomer — denormalized copies
+        #      rgmc-bc-api's apply_resolution_to_buffer writes directly onto a buffer
+        #      doc at the moment a human resolves it on /reconcile.
+        # #1 takes priority over #2 — a buffer doc's denormalized field is a one-time
+        # patch applied only to the buffer_ids known at save time, so if a user later
+        # re-links the same branch/customer text to a different value (the UI's
+        # "Change…" action) while some buffer doc with the OLD patched value was missed
+        # by that save (e.g. page wasn't refreshed, or the doc didn't exist/was
+        # recreated after the first link), the doc keeps the stale value forever and
+        # #2-first would silently keep routing to the wrong customer/ship-to on every
+        # retry, with no error. #1 is always the current truth for that branch/customer
+        # text (fetch_branch_overrides/fetch_customer_overrides re-read it fresh on
+        # every pass — same self-healing pattern _apply_sku_overrides already uses for
+        # SKU links), so it must win whenever it has a value. #2 only still matters as
+        # a fallback for a buffer doc whose branch/customer text no longer has ANY
+        # saved override (e.g. the override was deleted outright via /reconcile's
+        # "unlink", but the doc was already patched beforehand).
+        # resolvedShipTo (customerNo + shipToCode) takes priority since it pins the
+        # exact ship-to; resolvedCustomer alone (no branch link saved) still lets the
+        # order in with just a customer, no ship-to code.
+        branch_key = (header.get("customerBranchName") or "").strip().upper()
+        customer_key = (header.get("customerName") or "").strip().upper()
+        resolved_ship_to: dict = branch_overrides.get(branch_key) or header.get("resolvedShipTo") or {}
+        resolved_customer: dict = customer_overrides.get(customer_key) or header.get("resolvedCustomer") or {}
 
-    # 1. Exact match on BC's own native ship-to code (fastest, most reliable where it
-    #    happens to align — BC's code and SBIC's branch_code are usually different
-    #    coding schemes entirely, e.g. "DS001-C001" vs "2001").
-    # 2. Exact match on the ship-to's lookupCode field (tableextension 50458) — this
-    #    is purpose-built to hold SBIC's own CustomerBranch.lookUpCode value, so once
-    #    populated this is the reliable match for branch_code, not #1.
-    # 3. Fuzzy name match (SequenceMatcher on normalized strings) — last resort.
-    ship_to_match = (
-        ship_to_by_code.get(branch_code)
-        or ship_to_by_lookup_code.get(branch_code)
-        or _fuzzy_ship_to_lookup(branch_name, ship_to_by_name)
-    )
-    if not ship_to_match:
-        raise ValueError(
-            f"No ship-to address in BC for branch code={branch_code!r} / "
-            f"name={branch_name!r} (company={company!r})"
-        )
-    customer_no, ship_to_code = ship_to_match
+        if resolved_ship_to.get("customerNo"):
+            customer_no = resolved_ship_to["customerNo"]
+            ship_to_code = resolved_ship_to.get("shipToCode", "")
+            logger.info(f"PO {po_ref}: using reconcile-page branch link → customer={customer_no!r} shipTo={ship_to_code!r}")
+        elif resolved_customer.get("customerNo"):
+            customer_no = resolved_customer["customerNo"]
+            ship_to_code = ""
+            logger.info(f"PO {po_ref}: using reconcile-page customer link → customer={customer_no!r} (no ship-to)")
+        else:
+            branch_code: str = (header.get("customerBranchLookUpCode") or "").strip().upper()
+            branch_name: str = (header.get("customerBranchName") or "").strip()
+
+            # 1. Exact match on BC's own native ship-to code (fastest, most reliable where it
+            #    happens to align — BC's code and SBIC's branch_code are usually different
+            #    coding schemes entirely, e.g. "DS001-C001" vs "2001").
+            # 2. Exact match on the ship-to's lookupCode field (tableextension 50458) — this
+            #    is purpose-built to hold SBIC's own CustomerBranch.lookUpCode value, so once
+            #    populated this is the reliable match for branch_code, not #1.
+            # 3. Fuzzy name match (SequenceMatcher on normalized strings) — last resort.
+            ship_to_match = (
+                ship_to_by_code.get(branch_code)
+                or ship_to_by_lookup_code.get(branch_code)
+                or _fuzzy_ship_to_lookup(branch_name, ship_to_by_name)
+            )
+            if not ship_to_match:
+                raise ValueError(
+                    f"No ship-to address in BC for branch code={branch_code!r} / "
+                    f"name={branch_name!r} (company={company!r})"
+                )
+            customer_no, ship_to_code = ship_to_match
+
+        header_payload = _build_header_payload(header, customer_no, ship_to_code, location_code)
+        h_status, h_data = bc_client.v2_create_record("salesOrders", header_payload, company)
+        if h_status not in (200, 201):
+            raise ValueError(
+                f"SO header create failed for PO {po_ref!r} (BC {h_status}): {h_data}"
+            )
+        order_id = h_data.get("id", "")
+        order_no = h_data.get("number", order_id)
 
     # ── Pre-validate lines BEFORE touching BC ──────────────────────────────────
     # No longer all-or-nothing: an order with zero resolvable lines still gets its
@@ -273,28 +454,23 @@ def _create_order(
             f"reference or non-positive quantity) — creating header with no lines"
         )
 
-    # ── Create Sales Order header ─────────────────────────────────────────────
-    header_payload = _build_header_payload(header, customer_no, ship_to_code, location_code)
-    h_status, h_data = bc_client.v2_create_record("salesOrders", header_payload, company)
-    if h_status not in (200, 201):
-        raise ValueError(
-            f"SO header create failed for PO {po_ref!r} (BC {h_status}): {h_data}"
-        )
-
-    order_id: str = h_data.get("id", "")
-    order_no: str = h_data.get("number", order_id)
-
     # ── Create Sales Order lines ──────────────────────────────────────────────
+    # remaining_lines accumulates every line still not in BC after this pass — pre-
+    # validation skips plus any that BC itself rejected — so the caller can re-buffer
+    # exactly those (and only those) for a future retry.
     lines_created = 0
     lines_skipped = len(skipped_lines)
+    remaining_lines: list[dict] = [s["line"] for s in skipped_lines]
     for i, (line, item_no) in enumerate(resolved_lines, start=1):
-        line_payload = _build_line_payload(line, item_no, location_code)
+        line_payload = _build_line_payload(line, item_no, location_code, base_line_no + i * 10000)
+        created = False
         for attempt in range(4):
             lh, ld = bc_client.v2_create_record(
                 f"salesOrders({order_id})/salesOrderLines", line_payload, company
             )
             if lh in (200, 201):
                 lines_created += 1
+                created = True
                 break
             if lh == 409 and attempt < 3:
                 time.sleep(0.5 * (attempt + 1))
@@ -305,6 +481,8 @@ def _create_order(
             )
             lines_skipped += 1
             break
+        if not created:
+            remaining_lines.append(line)
 
     if lines_created == 0 and resolved_lines:
         # All pre-validated lines were nonetheless rejected by BC (e.g. bad posting
@@ -316,12 +494,14 @@ def _create_order(
         )
 
     logger.info(
-        f"POUL SO created — PO {po_ref!r} → BC {order_no!r} "
-        f"(lines_created={lines_created} lines_skipped={lines_skipped})"
+        f"POUL SO {'resumed' if existing_so_number else 'created'} — PO {po_ref!r} → BC {order_no!r} "
+        f"(lines_created={lines_created} lines_skipped={lines_skipped} remaining={len(remaining_lines)})"
     )
     return {
         "po_ref": po_ref,
         "order_no": order_no,
+        "so_number": order_no,
+        "remaining_lines": remaining_lines,
         "customer_name": header.get("customerName", ""),
         "branch_name": header.get("customerBranchName", ""),
         "po_date": header.get("poDate", ""),
@@ -330,6 +510,25 @@ def _create_order(
         "lines_skipped": lines_skipped,
         "unmatched_items": unmatched_items,
     }
+
+
+def _buffer_status_note(attempt_count: int | None) -> str:
+    """Email-detail suffix for one failed order, from save_failed_order's return value.
+
+    None means the failure never reached save_failed_order at all (e.g. backfill's
+    existence check erroring out before an order was ever buffered) — distinct from
+    0, which means the Firestore write itself failed (a real infra problem). Past
+    so_buffer.MAX_ATTEMPTS the order is still kept (see save_failed_order's docstring
+    — it's never dropped just for repeated failures), so this only changes the
+    wording into a nudge to go resolve it on /reconcile, never the underlying data.
+    """
+    if attempt_count is None:
+        return "  [not buffered — never attempted]"
+    if attempt_count <= 0:
+        return "  [NOT buffered — Firestore write failed, will not auto-retry]"
+    if attempt_count > so_buffer.MAX_ATTEMPTS:
+        return f"  [buffered for retry — failed {attempt_count}x, needs a manual link on /reconcile]"
+    return "  [buffered for retry]"
 
 
 def _send_batch_notification(
@@ -383,8 +582,7 @@ def _send_batch_notification(
         if errors:
             detail += f"\n\nFailed Orders   : {len(errors)}\n"
             for e in errors:
-                buffered_note = "  [buffered for retry]" if e.get("buffered") else "  [dropped — max retries exceeded]"
-                detail += f"  - {e['po_ref']}: {e['error']}{buffered_note}\n"
+                detail += f"  - {e['po_ref']}: {e['error']}{_buffer_status_note(e.get('attempt_count'))}\n"
 
         title = f"{label} — {count} order{'s' if count != 1 else ''} created"
         if errors:
@@ -393,8 +591,7 @@ def _send_batch_notification(
 
     elif errors:
         detail = "\n".join(
-            f"  - {e['po_ref']}: {e['error']} "
-            f"({'buffered for retry' if e.get('buffered') else 'dropped — max retries exceeded'})"
+            f"  - {e['po_ref']}: {e['error']}{_buffer_status_note(e.get('attempt_count'))}"
             for e in errors
         )
         notify_error(
@@ -471,12 +668,407 @@ _ALL_BC_COMPANIES: list[str] = sorted({bc_company for _, bc_company in _COMPANY_
 _EMPTY_SUMMARY = {"orders_created": 0, "orders_failed": 0, "lines_created": 0, "lines_skipped": 0, "unmatched_items": 0}
 
 
+def _sync_order_from_cloudsql(
+    poul_header: dict,
+    company: str,
+    src_company: str,
+    ref_map: dict[str, str],
+    sku_overrides: dict[str, dict] | None = None,
+) -> dict | None:
+    """Backfill missing lines onto one BC sales order from Cloud SQL, using
+    externalDocumentNo == poRefNumber to find it (not so_number/buffer state — this
+    path is specifically for orders whose Firestore buffer doc is already gone).
+
+    sku_overrides (from so_buffer_overrides.fetch_sku_item_overrides): a reconcile-page
+    SKU link saved AFTER this order's header was already created in BC would otherwise
+    never reach it — these lines come fresh from Cloud SQL, not a buffer doc
+    apply_resolution_to_buffer could have already patched line.resolvedItem onto.
+
+    Returns None if no BC order was ever created for this PO (nothing to sync — not
+    an error, just out of scope for this pass). Otherwise returns a summary dict.
+    Any line that can't be resolved against a BC item, or that BC itself rejects, is
+    buffered via so_buffer with the order's so_number — the same mechanism a normal
+    reprocess-buffer entry uses, so it shows up on the /reconcile page and a later
+    pass resumes adding it via _create_order's existing_so_number path.
+    """
+    po_ref: str = poul_header.get("poRefNumber", "unknown")
+    found = bc_client.v2_find_sales_order_by_external_doc_no(po_ref, company)
+    if not found:
+        return None
+    order_id: str = found.get("id", "")
+    order_no: str = found.get("number", order_id)
+
+    existing_lines = bc_client.v2_list_sales_order_lines(order_id, company)
+    existing_item_nos = {l.get("number") for l in existing_lines if l.get("number")}
+    next_line_no = max((l.get("lineNo") or 0 for l in existing_lines), default=0)
+
+    detail_rows = gcp_api_client.fetch_customerpouldetailbq(po_ref)
+    _apply_sku_overrides(detail_rows, sku_overrides or {})
+    resolved_lines, skipped_lines = _resolve_valid_lines(po_ref, detail_rows, ref_map)
+
+    lines_created = 0
+    already_present = 0
+    lines_skipped = len(skipped_lines)
+    remaining_lines: list[dict] = [s["line"] for s in skipped_lines]
+
+    for line, item_no in resolved_lines:
+        if item_no in existing_item_nos:
+            already_present += 1
+            continue
+        next_line_no += 10000
+        line_payload = _build_line_payload(line, item_no, config.POUL_SO_DEFAULT_LOCATION, next_line_no)
+        created = False
+        for attempt in range(4):
+            lh, ld = bc_client.v2_create_record(
+                f"salesOrders({order_id})/salesOrderLines", line_payload, company
+            )
+            if lh in (200, 201):
+                lines_created += 1
+                created = True
+                break
+            if lh == 409 and attempt < 3:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            logger.error(
+                f"Cloud SQL sync — PO {po_ref} item={item_no!r} failed after "
+                f"{attempt + 1} attempt(s) (BC {lh}): {ld}"
+            )
+            lines_skipped += 1
+            break
+        if not created:
+            remaining_lines.append(line)
+
+    if remaining_lines:
+        so_buffer.save_failed_order(
+            poul_header, remaining_lines, company, src_company,
+            f"Cloud SQL sync — order {order_no!r} still has {len(remaining_lines)} "
+            f"unresolved line(s) (no BC item match or rejected by BC)",
+            so_number=order_no,
+        )
+
+    logger.info(
+        f"POUL SO synced from Cloud SQL — PO {po_ref!r} → BC {order_no!r} "
+        f"(added={lines_created} already_present={already_present} "
+        f"skipped={lines_skipped})"
+    )
+    return {
+        "po_ref": po_ref,
+        "order_no": order_no,
+        "lines_created": lines_created,
+        "already_present": already_present,
+        "lines_skipped": lines_skipped,
+        "remaining_lines": len(remaining_lines),
+    }
+
+
+def _run_sync_from_cloudsql(
+    companies: list[str],
+    create_by: str,
+    notify: dict | None = None,
+) -> tuple[bool, dict]:
+    """Handle a poul-so-sync-from-cloudsql message: for every CustomerPOUL row with
+    the given create_by, find its BC order (by externalDocumentNo) and backfill
+    whatever lines are missing from Cloud SQL's CustomerPOULDetailBQ.
+
+    A PO is reported as exactly one of:
+      - synced     — checked successfully (lines added and/or already present).
+      - not_found  — no BC order exists for this PO's externalDocumentNo. Genuine.
+      - errored    — the check itself failed (e.g. BC returned 503 after exhausting
+        bc_client's own retries) and was never actually resolved either way. Kept
+        strictly separate from not_found — conflating the two previously made a
+        transient BC outage during a manual sync (2026-10-01) look identical to "these
+        1000 POs have no BC order yet", which isn't true and isn't actionable the same
+        way. Each PO gets one immediate retry before landing here, since the kind of
+        blip that causes this is often already gone a few seconds later.
+
+    Always returns (True, summary) — a per-company pre-fetch failure is logged and
+    that company is skipped rather than failing the whole run, since this is an
+    on-demand maintenance pass, not something Pub/Sub needs to retry redelivering.
+    """
+    extra_recipients = [notify["email"]] if notify and notify.get("email") else None
+    requested_by = (
+        f" requested_by={notify.get('name', '')} <{notify.get('email', '')}> "
+        f"({notify.get('department', '')}, {notify.get('company', '')})"
+        if notify else ""
+    )
+
+    headers = gcp_api_client.fetch_customerpoul_by_create_by(create_by)
+    synced: list[dict] = []
+    not_found: list[str] = []
+    errored: list[dict] = []
+
+    # Overrides aren't scoped per BC company (so_buffer_service.save_override keys
+    # purely by raw SKU/branch/customer text), so one fetch covers every company below.
+    sku_overrides = so_buffer_overrides.fetch_sku_item_overrides()
+
+    for company in companies:
+        try:
+            item_refs = bc_client.fetch_item_references(company)
+        except Exception as e:
+            logger.error(f"POUL SO sync: pre-fetch item references failed (company={company!r}): {e}")
+            continue
+        ref_map: dict[str, str] = _build_ref_map(item_refs)
+
+        company_headers = [h for h in headers if _resolve_bc_company(h.get("companyName", "")) == company]
+        retry_headers: list[dict] = []
+        for h in company_headers:
+            po_ref = h.get("poRefNumber", "unknown")
+            try:
+                result = _sync_order_from_cloudsql(h, company, f"cloudsql-sync:{company}", ref_map, sku_overrides)
+                if result is None:
+                    not_found.append(po_ref)
+                else:
+                    synced.append(result)
+            except Exception as e:
+                logger.warning(f"Cloud SQL sync: PO {po_ref!r} errored, will retry once: {e}")
+                retry_headers.append(h)
+
+        # One retry per PO that raised above — gives a transient BC blip (the kind
+        # that caused this fix) a second chance before it's reported as a real error,
+        # since the rest of this company's pass has often given BC time to recover.
+        for h in retry_headers:
+            po_ref = h.get("poRefNumber", "unknown")
+            try:
+                result = _sync_order_from_cloudsql(h, company, f"cloudsql-sync:{company}", ref_map, sku_overrides)
+                if result is None:
+                    not_found.append(po_ref)
+                else:
+                    synced.append(result)
+            except Exception as e:
+                logger.error(f"Cloud SQL sync failed for PO {po_ref!r} (after retry): {e}")
+                errored.append({"po_ref": po_ref, "error": str(e)})
+
+    context = f"companies={companies} create_by={create_by!r}{requested_by}"
+    if synced or not_found or errored:
+        detail_lines = [
+            f"  PO Ref {r['po_ref']:<20} → BC {r['order_no']}: "
+            f"+{r['lines_created']} added, {r['already_present']} already present, "
+            f"{r['lines_skipped']} skipped"
+            for r in synced
+        ]
+        if errored:
+            detail_lines.append("")
+            detail_lines.append(f"Could not be checked due to an error (NOT necessarily missing from BC — retry this sync) — {len(errored)} PO(s):")
+            detail_lines.extend(f"  - {e['po_ref']}: {e['error']}" for e in errored)
+        if not_found:
+            detail_lines.append("")
+            detail_lines.append(f"No matching BC order found for {len(not_found)} PO(s):")
+            detail_lines.extend(f"  - {ref}" for ref in not_found)
+        title = f"POUL SO Cloud SQL Sync — {len(synced)} order(s) checked"
+        if not_found:
+            title += f", {len(not_found)} not found in BC"
+        if errored:
+            title += f", {len(errored)} errored"
+        notify_success(title=title, detail="\n".join(detail_lines), context=context, extra_recipients=extra_recipients)
+    else:
+        notify_success(
+            title="POUL SO Cloud SQL Sync — nothing to sync",
+            detail=f"No CustomerPOUL rows found with create_by={create_by!r}.",
+            context=context,
+            extra_recipients=extra_recipients,
+        )
+
+    summary = {
+        "orders_synced": len(synced),
+        "orders_not_found": len(not_found),
+        "orders_errored": len(errored),
+        "lines_created": sum(r["lines_created"] for r in synced),
+        "lines_skipped": sum(r["lines_skipped"] for r in synced),
+    }
+    return True, summary
+
+
+def _run_backfill_from_cloudsql(
+    companies: list[str],
+    create_by: str,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    notify: dict | None = None,
+) -> tuple[bool, dict]:
+    """Handle a poul-so-backfill-from-cloudsql message: for every CustomerPOUL row
+    matching create_by (and, if given, within [date_from, date_to] on createDate —
+    when the row was inserted into CustomerPOUL, not poDate), create
+    a FRESH BC sales order (header + lines) from CustomerPOUL/CustomerPOULDetailBQ —
+    unless a BC order already exists for that PO's externalDocumentNo, in which case
+    it's skipped untouched. This is the exact opposite skip condition from
+    _sync_order_from_cloudsql, which only acts when the order already exists.
+
+    Reuses _create_order directly (existing_so_number=None, same as a fresh inbound
+    PO) so every already-fixed resolution path applies here too: a reconcile-page
+    branch/customer/SKU link wins over automatic matching, a partially-resolved order
+    still gets its header created, and anything left over is buffered via so_buffer —
+    same Firestore mechanism every other import path uses, so it shows up on
+    /reconcile for manual reconciliation instead of silently failing.
+
+    Always returns (True, summary) — a per-company pre-fetch failure is logged and
+    that company is skipped rather than failing the whole run, since this is an
+    on-demand maintenance pass, not something Pub/Sub needs to retry redelivering.
+    """
+    extra_recipients = [notify["email"]] if notify and notify.get("email") else None
+    requested_by = (
+        f" requested_by={notify.get('name', '')} <{notify.get('email', '')}> "
+        f"({notify.get('department', '')}, {notify.get('company', '')})"
+        if notify else ""
+    )
+
+    location_code: str = config.POUL_SO_DEFAULT_LOCATION
+
+    # Overrides aren't scoped per BC company (so_buffer_service.save_override keys
+    # purely by raw SKU/branch/customer text), so one fetch covers every company below.
+    sku_overrides = so_buffer_overrides.fetch_sku_item_overrides()
+    branch_overrides = so_buffer_overrides.fetch_branch_overrides()
+    customer_overrides = so_buffer_overrides.fetch_customer_overrides()
+
+    successes: list[dict] = []
+    errors: list[dict] = []
+    skipped_existing: list[str] = []
+    total_headers_considered = 0
+
+    for company in companies:
+        try:
+            ship_tos = bc_client.fetch_ship_to_addresses(company)
+            item_refs = bc_client.fetch_item_references(company)
+        except Exception as e:
+            logger.error(f"POUL SO backfill: pre-fetch failed (company={company!r}): {e}")
+            continue
+        ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name = _build_ship_to_maps(ship_tos)
+        ref_map: dict[str, str] = _build_ref_map(item_refs)
+
+        # Scope the CustomerPOUL query itself to this company's companyId (SBIC=6,
+        # MTC=12 on sbic_prod) rather than fetching every createBy row once and
+        # filtering by companyName keyword after the fact — companyId is a clean,
+        # unambiguous key (and _COMPANY_MAP above has no MTC entry at all, so the
+        # keyword approach would silently misroute or drop MTC rows here).
+        company_id = _BC_COMPANY_ID_MAP.get(company)
+        if company_id is None:
+            logger.warning(f"POUL SO backfill: no companyId mapping for BC company {company!r} — skipping")
+            continue
+        company_headers = gcp_api_client.fetch_customerpoul_by_create_by(
+            create_by, date_from=date_from, date_to=date_to, company_id=company_id,
+        )
+        total_headers_considered += len(company_headers)
+        for h in company_headers:
+            po_ref = h.get("poRefNumber", "unknown")
+            try:
+                if bc_client.v2_find_sales_order_by_external_doc_no(po_ref, company):
+                    skipped_existing.append(po_ref)
+                    continue
+            except Exception as e:
+                logger.error(f"POUL SO backfill: existence check failed for PO {po_ref!r}: {e}")
+                errors.append({"po_ref": po_ref, "error": str(e)})  # never buffered — the check itself failed
+                continue
+
+            lines = gcp_api_client.fetch_customerpouldetailbq(po_ref)
+            _apply_sku_overrides(lines, sku_overrides)
+            try:
+                result = _create_order(
+                    h, lines, company,
+                    ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name,
+                    ref_map, location_code, branch_overrides, customer_overrides,
+                    existing_so_number=None,
+                )
+                result["from_buffer"] = False
+                successes.append(result)
+                if result["remaining_lines"]:
+                    so_buffer.save_failed_order(
+                        h, result["remaining_lines"], company, f"cloudsql-backfill:{company}",
+                        f"Backfill — header {result['so_number']!r} created — "
+                        f"{len(result['remaining_lines'])} line(s) still unresolved "
+                        f"(no BC item match or rejected by BC)",
+                        so_number=result["so_number"],
+                    )
+            except Exception as e:
+                err_str = str(e)
+                if isinstance(e, ValueError):
+                    logger.error(f"POUL SO backfill permanent failure — PO {po_ref!r}: {e}")
+                else:
+                    logger.error(f"POUL SO backfill error — PO {po_ref!r}: {e}")
+                attempt_count = so_buffer.save_failed_order(h, lines, company, f"cloudsql-backfill:{company}", err_str)
+                errors.append({"po_ref": po_ref, "error": err_str, "attempt_count": attempt_count})
+
+    _send_batch_notification(
+        successes, errors, "/".join(companies), f"cloudsql-backfill:{create_by}",
+        label="POUL SO Cloud SQL Backfill", notify=notify,
+    )
+    _send_unmatched_items_notification(
+        successes, "/".join(companies), f"cloudsql-backfill:{create_by}",
+        label="POUL SO Cloud SQL Backfill", notify=notify,
+    )
+    if skipped_existing:
+        notify_success(
+            title=f"POUL SO Cloud SQL Backfill — {len(skipped_existing)} PO(s) skipped (already in BC)",
+            detail="\n".join(f"  - {ref}" for ref in skipped_existing),
+            context=f"companies={companies} create_by={create_by!r} date_from={date_from!r} date_to={date_to!r}{requested_by}",
+            extra_recipients=extra_recipients,
+        )
+    if not total_headers_considered:
+        notify_success(
+            title="POUL SO Cloud SQL Backfill — nothing to backfill",
+            detail=f"No CustomerPOUL rows found with create_by={create_by!r} "
+                   f"date_from={date_from!r} date_to={date_to!r}.",
+            context=f"companies={companies}{requested_by}",
+            extra_recipients=extra_recipients,
+        )
+
+    summary = {
+        "orders_created": len(successes),
+        "orders_failed": len(errors),
+        "orders_skipped_existing": len(skipped_existing),
+        "lines_created": sum(r["lines_created"] for r in successes),
+        "lines_skipped": sum(r["lines_skipped"] for r in successes),
+        "unmatched_items": sum(len(r.get("unmatched_items") or []) for r in successes),
+    }
+    return True, summary
+
+
+def _build_ship_to_maps(ship_tos: list) -> tuple[dict, dict, dict]:
+    """ship_to_by_code / ship_to_by_lookup_code / ship_to_by_name, each mapping an
+    upper-cased key to (customer_no, ship_to_code) — shared by every handler that
+    resolves a PO's customer branch against BC's ship-to addresses.
+
+    ship_to_by_code: exact upper-cased BC ship-to code.
+    ship_to_by_lookup_code: exact upper-cased lookupCode (tableextension 50458 — SBIC's
+      own CustomerBranch.lookUpCode, manually populated in BC).
+    ship_to_by_name: normalized BC name, used for fuzzy match.
+    """
+    ship_to_by_code: dict[str, tuple[str, str]] = {}
+    ship_to_by_lookup_code: dict[str, tuple[str, str]] = {}
+    ship_to_by_name: dict[str, tuple[str, str]] = {}
+    for st in ship_tos:
+        cust_no = st.get("customerNumber") or ""
+        st_code = (st.get("code") or "").strip()
+        st_lookup_code = (st.get("lookupCode") or "").strip()
+        st_name = (st.get("name") or "").strip()
+        if not cust_no or not st_code:
+            continue
+        ship_to_by_code[st_code.upper()] = (cust_no, st_code)
+        if st_lookup_code:
+            ship_to_by_lookup_code[st_lookup_code.upper()] = (cust_no, st_code)
+        if st_name:
+            norm_name = _normalize_name(st_name)
+            if norm_name:
+                ship_to_by_name[norm_name] = (cust_no, st_code)
+    return ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name
+
+
+def _build_ref_map(item_refs: list) -> dict[str, str]:
+    """Upper-cased referenceNo → itemNo, shared by every handler that resolves a
+    line's customerSKUCode against BC's item references."""
+    return {
+        r.get("referenceNo", "").upper(): r["itemNo"]
+        for r in item_refs
+        if r.get("itemNo") and r.get("referenceNo")
+    }
+
+
 def _run_batch(
     company: str,
     src_company: str,
     fresh_orders: list[dict],
     label: str = "POUL SO Import",
     notify: dict | None = None,
+    record_history: bool = False,
+    run_id: str | None = None,
 ) -> tuple[bool, dict]:
     """Process fresh_orders plus anything buffered for `company`.
 
@@ -490,6 +1082,14 @@ def _run_batch(
     notify is the employee who triggered a manual reprocess from the reconcile page
     (None for normal inbound-PO batches) — {"name", "company", "department", "email"}.
     When set, every email this call sends is also delivered to notify["email"].
+
+    record_history (True only for the poul-so-reprocess-buffer caller) appends one
+    so_buffer_history_{env} record per PO processed here — header, lines, outcome,
+    `notify`, and the current timestamp — so a PO's buffer reconciliation is still
+    visible after the fact even once its so_buffer_{env} doc is deleted. Never set for
+    normal inbound-PO batches, which have no triggering user to record. run_id (the
+    same id reprocess_status tracks this run under) is carried onto each record so
+    every PO reconciled by one reprocess-buffer run can be correlated back to it.
 
     Returns (ok, summary). ok is False only on a transient pre-fetch failure (caller
     should nack and redeliver); True otherwise (caller should ack — including when
@@ -519,41 +1119,16 @@ def _run_batch(
         )
         return True, dict(_EMPTY_SUMMARY)
 
-    # Build ship-to lookup maps
-    # ship_to_by_code: exact upper-cased BC ship-to code → (customer_no, ship_to_code)
-    # ship_to_by_lookup_code: exact upper-cased lookupCode (tableextension 50458 — SBIC's
-    #   own CustomerBranch.lookUpCode, manually populated in BC) → (customer_no, ship_to_code)
-    # ship_to_by_name: normalized BC name → (customer_no, ship_to_code), used for fuzzy match
-    ship_to_by_code: dict[str, tuple[str, str]] = {}
-    ship_to_by_lookup_code: dict[str, tuple[str, str]] = {}
-    ship_to_by_name: dict[str, tuple[str, str]] = {}
-    for st in ship_tos:
-        cust_no = st.get("customerNumber") or ""
-        st_code = (st.get("code") or "").strip()
-        st_lookup_code = (st.get("lookupCode") or "").strip()
-        st_name = (st.get("name") or "").strip()
-        if not cust_no or not st_code:
-            continue
-        ship_to_by_code[st_code.upper()] = (cust_no, st_code)
-        if st_lookup_code:
-            ship_to_by_lookup_code[st_lookup_code.upper()] = (cust_no, st_code)
-        if st_name:
-            norm_name = _normalize_name(st_name)
-            if norm_name:
-                ship_to_by_name[norm_name] = (cust_no, st_code)
-
-    ref_map: dict[str, str] = {
-        r.get("referenceNo", "").upper(): r["itemNo"]
-        for r in item_refs
-        if r.get("itemNo") and r.get("referenceNo")
-    }
-
+    ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name = _build_ship_to_maps(ship_tos)
+    ref_map: dict[str, str] = _build_ref_map(item_refs)
     location_code: str = config.POUL_SO_DEFAULT_LOCATION
 
     # ── Merge fresh orders with any previously buffered (failed) orders ───────
-    # Each item: {"header": ..., "lines": ..., "_buf_id": str|None}
+    # Each item: {"header": ..., "lines": ..., "_buf_id": str|None, "so_number": str|None}
+    # so_number carries forward a header already created in BC on a previous pass
+    # (see _create_order's existing_so_number) — always None for fresh orders.
     all_orders: list[dict] = [
-        {"header": o.get("header", {}), "lines": o.get("lines", []), "_buf_id": None}
+        {"header": o.get("header", {}), "lines": o.get("lines", []), "_buf_id": None, "so_number": None}
         for o in fresh_orders
     ]
     for buf_doc_id, buf_data in so_buffer.get_buffered_orders(company):
@@ -561,7 +1136,21 @@ def _run_batch(
             "header": buf_data.get("header", {}),
             "lines": buf_data.get("lines", []),
             "_buf_id": buf_doc_id,
+            "so_number": buf_data.get("so_number"),
         })
+
+    # A buffered order's lines normally already carry resolvedItem (apply_resolution_to_buffer
+    # patches it on save), but a fresh inbound order never does, and a buffer doc saved before
+    # its SKU was linked only gets patched if the override is re-saved against its exact
+    # buffer_id. Re-applying every current SKU/branch/customer override here, by raw text
+    # rather than relying on that prior patch, covers both gaps — a linked item/branch/
+    # customer takes effect whether the order is still being linked up or has already
+    # reached BC once (branch/customer are read inside _create_order, below).
+    sku_overrides = so_buffer_overrides.fetch_sku_item_overrides()
+    branch_overrides = so_buffer_overrides.fetch_branch_overrides()
+    customer_overrides = so_buffer_overrides.fetch_customer_overrides()
+    for order_item in all_orders:
+        _apply_sku_overrides(order_item["lines"], sku_overrides)
 
     if not all_orders:
         logger.info(f"POUL SO: nothing to do for company={company!r} (no fresh orders, empty buffer)")
@@ -581,27 +1170,55 @@ def _run_batch(
         buf_id: str | None = order_item["_buf_id"]
         header: dict = order_item["header"]
         lines: list = order_item["lines"]
+        so_number: str | None = order_item.get("so_number")
         po_ref: str = header.get("poRefNumber", "unknown")
         try:
             result = _create_order(
                 header, lines, company,
                 ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name,
-                ref_map, location_code,
+                ref_map, location_code, branch_overrides, customer_overrides,
+                existing_so_number=so_number,
             )
             result["from_buffer"] = buf_id is not None
             successes.append(result)
-            if buf_id:
-                so_buffer.delete_buffered_order(buf_id)
+            if result["remaining_lines"]:
+                # Header exists in BC but some lines still aren't — keep (or create)
+                # the buffer doc with just those lines and the so_number, so a future
+                # pass resumes this exact order instead of re-creating its header or
+                # losing the unresolved lines. Applies whether this order came from
+                # the buffer or was a fresh inbound PO that partially succeeded.
+                so_buffer.save_failed_order(
+                    header, result["remaining_lines"], company, src_company,
+                    f"Header {result['so_number']!r} created — "
+                    f"{len(result['remaining_lines'])} line(s) still unresolved "
+                    f"(no BC item match or rejected by BC)",
+                    so_number=result["so_number"],
+                )
+                outcome = "still_buffered"
+            else:
+                if buf_id:
+                    so_buffer.delete_buffered_order(buf_id)
+                outcome = "resolved"
+            if record_history:
+                so_buffer_history.record_reconciliation(
+                    header, lines, company, outcome, notify,
+                    run_id=run_id, so_number=result.get("so_number"),
+                )
         except Exception as e:
             err_str = str(e)
             if isinstance(e, ValueError):
                 logger.error(f"POUL SO permanent failure — PO {po_ref!r}: {e}")
             else:
                 logger.error(f"POUL SO error — PO {po_ref!r}: {e}")
-            still_buffered = so_buffer.save_failed_order(
-                header, lines, company, src_company, err_str
+            attempt_count = so_buffer.save_failed_order(
+                header, lines, company, src_company, err_str, so_number=so_number
             )
-            errors.append({"po_ref": po_ref, "error": err_str, "buffered": still_buffered})
+            errors.append({"po_ref": po_ref, "error": err_str, "attempt_count": attempt_count})
+            if record_history:
+                so_buffer_history.record_reconciliation(
+                    header, lines, company, "failed", notify,
+                    run_id=run_id, so_number=so_number, detail=err_str,
+                )
 
     # ── Send one consolidated email, plus a separate flag for unmatched items ──
     _send_batch_notification(successes, errors, company, src_company, label=label, notify=notify)
@@ -653,6 +1270,8 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                     fresh_orders=[],
                     label="POUL SO Reprocess-Buffer",
                     notify=notify,
+                    record_history=True,
+                    run_id=run_id,
                 )
                 if not ok:
                     all_ok = False
@@ -671,6 +1290,61 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         else:
             # Transient pre-fetch failure — Pub/Sub will redeliver this same run_id, so
             # leave the Firestore doc at "processing" rather than finalizing it here.
+            message.nack()
+        return
+
+    if msg_type == "poul-so-sync-from-cloudsql":
+        # Manual trigger (published by gcp-api) — backfills lines onto BC orders whose
+        # Firestore buffer doc is already gone, using Cloud SQL as the source of truth.
+        companies = data.get("companies") or _ALL_BC_COMPANIES
+        create_by = data.get("create_by") or "trigger"
+        notify = data.get("notify") or None
+        run_id = data.get("run_id") or None
+        logger.info(
+            f"POUL SO: Cloud SQL sync triggered for companies={companies} "
+            f"create_by={create_by!r} notify={notify} run_id={run_id!r}"
+        )
+        reprocess_status.start_run(run_id, companies=companies, notify=notify)
+        try:
+            ok, summary = _run_sync_from_cloudsql(companies, create_by, notify=notify)
+        except Exception as exc:
+            logger.error(f"POUL SO: Cloud SQL sync run {run_id!r} crashed: {exc}")
+            reprocess_status.finish_run(run_id, status="error", summary={}, error=str(exc))
+            message.nack()
+            return
+        if ok:
+            reprocess_status.finish_run(run_id, status="done", summary=summary)
+            message.ack()
+        else:
+            message.nack()
+        return
+
+    if msg_type == "poul-so-backfill-from-cloudsql":
+        # Manual trigger (published by gcp-api) — creates fresh BC orders for
+        # CustomerPOUL rows never inserted into BC at all, optionally date-ranged.
+        companies = data.get("companies") or _ALL_BC_COMPANIES
+        create_by = data.get("create_by") or "trigger"
+        date_from = data.get("date_from") or None
+        date_to = data.get("date_to") or None
+        notify = data.get("notify") or None
+        run_id = data.get("run_id") or None
+        logger.info(
+            f"POUL SO: Cloud SQL backfill triggered for companies={companies} "
+            f"create_by={create_by!r} date_from={date_from!r} date_to={date_to!r} "
+            f"notify={notify} run_id={run_id!r}"
+        )
+        reprocess_status.start_run(run_id, companies=companies, notify=notify)
+        try:
+            ok, summary = _run_backfill_from_cloudsql(companies, create_by, date_from, date_to, notify=notify)
+        except Exception as exc:
+            logger.error(f"POUL SO: Cloud SQL backfill run {run_id!r} crashed: {exc}")
+            reprocess_status.finish_run(run_id, status="error", summary={}, error=str(exc))
+            message.nack()
+            return
+        if ok:
+            reprocess_status.finish_run(run_id, status="done", summary=summary)
+            message.ack()
+        else:
             message.nack()
         return
 
