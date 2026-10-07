@@ -345,6 +345,13 @@ def _create_order(
     later (e.g. once a reconcile-page override resolves the SKU) instead of either
     re-creating a duplicate header or losing the unresolved lines outright.
 
+    When left unset (every fresh inbound order, and any buffered order whose doc was
+    never stamped with a so_number), a fresh externalDocumentNo lookup runs before
+    deciding to create a new header — the same defensive check
+    _backfill_from_cloudsql/_sync_order_from_cloudsql already make — so an order
+    created through some other path for this PO ref (a manual BC entry, backfill, the
+    BigQuery-lookup manual-buffer-insert feature) is resumed instead of duplicated.
+
     Raises ValueError on permanent failures (bad data, BC rejects — e.g. no ship-to
     match, the header/lookup itself failing). The header is always created (or found)
     once a ship-to match is found / so_number resolves, regardless of how many lines
@@ -354,6 +361,33 @@ def _create_order(
     po_ref: str = header.get("poRefNumber", "unknown")
     base_line_no = 0
 
+    if not existing_so_number:
+        # Defensive fresh check — the caller may not already know about an order
+        # created through some OTHER path for this exact PO ref (a manual BC entry,
+        # the backfill-from-cloudsql path, the manual-trigger page's BigQuery-lookup
+        # buffer-insert feature, or simply a buffer doc that was never stamped with
+        # so_number). Without this, a fresh inbound order — or ANY buffered order with
+        # no recorded so_number, which _run_batch always treats as existing_so_number
+        # None — would sail straight into creating a DUPLICATE Sales Order under the
+        # same externalDocumentNo. Mirrors the identical check _backfill_from_cloudsql
+        # (skips entirely) and _sync_order_from_cloudsql (backfills only missing
+        # lines) already make before acting on a PO — this makes _create_order itself
+        # just as safe regardless of which caller reaches it. Best-effort: a failed
+        # check here falls back to the normal create-new-header path rather than
+        # blocking the whole order on an unrelated BC outage.
+        try:
+            found_existing = bc_client.v2_find_sales_order_by_external_doc_no(po_ref, company)
+        except Exception as e:
+            found_existing = None
+            logger.warning(f"PO {po_ref}: existing-order check failed ({e}) — proceeding as if none exists")
+        if found_existing:
+            existing_so_number = found_existing.get("number")
+            logger.info(
+                f"PO {po_ref}: found existing BC order {existing_so_number!r} via externalDocumentNo "
+                f"check — resuming it instead of creating a new header"
+            )
+
+    existing_item_nos: set[str] = set()
     if existing_so_number:
         # Header already exists in BC from a previous pass — resume it instead of
         # resolving ship-to / creating a second header for the same PO.
@@ -369,6 +403,15 @@ def _create_order(
         # stays 0 (first new line gets 10000) only for a brand-new header below.
         existing_lines = bc_client.v2_list_sales_order_lines(order_id, company)
         base_line_no = max((l.get("lineNo") or 0 for l in existing_lines), default=0)
+        # Same existing_item_nos check _sync_order_from_cloudsql already makes before
+        # backfilling a line — resuming an order (whether via a recorded so_number or
+        # the fresh externalDocumentNo fallback above) must not re-POST a line whose
+        # item is already on it. Covers a raw SKU resolved via an exact ref_map match
+        # AND one resolved via a saved reconcile-page override identically — both are
+        # just (line, item_no) pairs by the time the line-creation loop below runs, so
+        # one check here covers every line source this function is ever called with
+        # (CustomerPOULDetail, int_document_ai_detail, or anywhere else).
+        existing_item_nos = {l.get("number") for l in existing_lines if l.get("number")}
     else:
         # ── Customer lookup via Ship-to Address ───────────────────────────────
         # A reconcile-page link always wins over automatic matching. Two independent
@@ -460,9 +503,20 @@ def _create_order(
     # exactly those (and only those) for a future retry.
     lines_created = 0
     lines_skipped = len(skipped_lines)
+    lines_already_present = 0
     remaining_lines: list[dict] = [s["line"] for s in skipped_lines]
-    for i, (line, item_no) in enumerate(resolved_lines, start=1):
-        line_payload = _build_line_payload(line, item_no, location_code, base_line_no + i * 10000)
+    next_line_no = base_line_no
+    for line, item_no in resolved_lines:
+        if item_no in existing_item_nos:
+            # Already on the order from an earlier pass (or from whatever created it
+            # before this run even found it via the fresh externalDocumentNo check) —
+            # POSTing it again would create a duplicate line, not update one. Line
+            # numbering intentionally only advances for lines actually submitted below,
+            # same as _sync_order_from_cloudsql's equivalent loop.
+            lines_already_present += 1
+            continue
+        next_line_no += 10000
+        line_payload = _build_line_payload(line, item_no, location_code, next_line_no)
         created = False
         for attempt in range(4):
             lh, ld = bc_client.v2_create_record(
@@ -476,7 +530,7 @@ def _create_order(
                 time.sleep(0.5 * (attempt + 1))
                 continue
             logger.error(
-                f"PO {po_ref} line {i} (item={item_no!r}) failed after {attempt + 1} attempt(s) "
+                f"PO {po_ref} item={item_no!r} failed after {attempt + 1} attempt(s) "
                 f"(BC {lh}): {ld}"
             )
             lines_skipped += 1
@@ -484,24 +538,28 @@ def _create_order(
         if not created:
             remaining_lines.append(line)
 
-    if lines_created == 0 and resolved_lines:
-        # All pre-validated lines were nonetheless rejected by BC (e.g. bad posting
-        # group). No longer rolled back — the header (and PO ref number) stays in
-        # BC with no lines, same as the zero-resolvable-lines case above.
+    attempted_lines = len(resolved_lines) - lines_already_present
+    if lines_created == 0 and attempted_lines > 0:
+        # All ATTEMPTED lines were nonetheless rejected by BC (e.g. bad posting group)
+        # — distinct from lines_already_present, which were never attempted at all, not
+        # rejected. No longer rolled back — the header (and PO ref number) stays in BC
+        # with no lines, same as the zero-resolvable-lines case above.
         logger.warning(
-            f"PO {po_ref} → BC {order_no!r}: 0/{len(resolved_lines)} lines created "
+            f"PO {po_ref} → BC {order_no!r}: 0/{attempted_lines} lines created "
             f"(all rejected by BC) — header kept with no lines"
         )
 
     logger.info(
         f"POUL SO {'resumed' if existing_so_number else 'created'} — PO {po_ref!r} → BC {order_no!r} "
-        f"(lines_created={lines_created} lines_skipped={lines_skipped} remaining={len(remaining_lines)})"
+        f"(lines_created={lines_created} lines_already_present={lines_already_present} "
+        f"lines_skipped={lines_skipped} remaining={len(remaining_lines)})"
     )
     return {
         "po_ref": po_ref,
         "order_no": order_no,
         "so_number": order_no,
         "remaining_lines": remaining_lines,
+        "lines_already_present": lines_already_present,
         "customer_name": header.get("customerName", ""),
         "branch_name": header.get("customerBranchName", ""),
         "po_date": header.get("poDate", ""),
