@@ -312,6 +312,65 @@ def _apply_sku_overrides(lines: list, sku_overrides: dict[str, dict]) -> None:
             line["resolvedItem"] = resolved
 
 
+_ORDER_NOT_OPEN_RE = re.compile(r"Status must be equal to 'Open'.*?Current value is '([^']+)'")
+
+
+def _order_status_lock_reason(bc_error_body) -> str | None:
+    """If a line-create rejection is BC's "Status must be equal to 'Open'" guard, the
+    order's header was changed (e.g. Released, Invoiced) in Business Central sometime
+    after it was created here — every other line on this same order will be rejected
+    identically, no matter how well-matched the item is, and no number of retries will
+    ever change that; only a human changing the order's status back in BC can. Returns
+    the BC-reported current status (e.g. "Released"), or None if this isn't that error.
+    """
+    try:
+        message = (bc_error_body or {}).get("error", {}).get("message", "")
+    except AttributeError:
+        return None
+    match = _ORDER_NOT_OPEN_RE.search(message)
+    return match.group(1) if match else None
+
+
+_INVALID_TABLE_RELATION_RE = re.compile(
+    r"field (.+?) of table .+? contains a value \(([^)]+)\) that cannot be found in the related table \(([^)]+)\)"
+)
+
+
+def _describe_invalid_table_relation(bc_error_body, resolution_source: str) -> str | None:
+    """If a sales-header-create rejection is BC's Internal_InvalidTableRelation (a
+    field's value — most often Ship-to Code — doesn't exist in its related table FOR
+    THE CUSTOMER THIS HEADER USES), returns a clear explanation naming the bad value,
+    where it was resolved from, and where to fix it. Returns None if this isn't that
+    error, so the caller falls back to BC's raw error body.
+
+    This is almost always a stale/incorrect saved override, not a transient BC issue —
+    e.g. a branch override on /reconcile whose shipToCode actually belongs to a
+    DIFFERENT customer than its own customerNo (so "the ship-to exists in BC" is true,
+    just not for this sell-to customer, which is exactly what BC's "related table"
+    check is enforcing). Retrying changes nothing; only correcting the override does —
+    the very next retry then succeeds automatically, since overrides are re-read fresh
+    on every pass (no other buffer/history action is taken here, unlike
+    _order_status_lock_reason's case — there's no reason to stop retrying something
+    that self-heals the moment the override is fixed).
+    """
+    try:
+        err = (bc_error_body or {}).get("error", {})
+    except AttributeError:
+        return None
+    if err.get("code") != "Internal_InvalidTableRelation":
+        return None
+    match = _INVALID_TABLE_RELATION_RE.search(err.get("message", ""))
+    if not match:
+        return None
+    field, bad_value, related_table = match.groups()
+    return (
+        f"{field} {bad_value!r} (from {resolution_source}) does not exist in {related_table!r} "
+        f"for this order's customer in BC. This is a bad/stale saved override, not a transient "
+        f"failure — it will keep failing every retry until the override is corrected (or deleted) "
+        f"on /reconcile's Overrides tab; the next retry then succeeds automatically."
+    )
+
+
 def _create_order(
     header: dict,
     lines: list,
@@ -447,10 +506,18 @@ def _create_order(
         if resolved_ship_to.get("customerNo"):
             customer_no = resolved_ship_to["customerNo"]
             ship_to_code = resolved_ship_to.get("shipToCode", "")
+            resolution_source = (
+                f"the saved branch override for {header.get('customerBranchName')!r} on /reconcile's "
+                f"Overrides tab (customerNo={customer_no!r}, shipToCode={ship_to_code!r})"
+            )
             logger.info(f"PO {po_ref}: using reconcile-page branch link → customer={customer_no!r} shipTo={ship_to_code!r}")
         elif resolved_customer.get("customerNo"):
             customer_no = resolved_customer["customerNo"]
             ship_to_code = ""
+            resolution_source = (
+                f"the saved customer override for {header.get('customerName')!r} on /reconcile's "
+                f"Overrides tab (customerNo={customer_no!r})"
+            )
             logger.info(f"PO {po_ref}: using reconcile-page customer link → customer={customer_no!r} (no ship-to)")
         else:
             branch_code: str = (header.get("customerBranchLookUpCode") or "").strip().upper()
@@ -474,13 +541,14 @@ def _create_order(
                     f"name={branch_name!r} (company={company!r})"
                 )
             customer_no, ship_to_code = ship_to_match
+            resolution_source = f"automatic ship-to matching for branch {branch_name!r} (no saved override)"
 
         header_payload = _build_header_payload(header, customer_no, ship_to_code, location_code)
         h_status, h_data = bc_client.v2_create_record("salesOrders", header_payload, company)
         if h_status not in (200, 201):
-            raise ValueError(
-                f"SO header create failed for PO {po_ref!r} (BC {h_status}): {h_data}"
-            )
+            clearer = _describe_invalid_table_relation(h_data, resolution_source)
+            detail = f"— {clearer}" if clearer else f"(BC {h_status}): {h_data}"
+            raise ValueError(f"SO header create failed for PO {po_ref!r} {detail}")
         order_id = h_data.get("id", "")
         order_no = h_data.get("number", order_id)
 
@@ -505,6 +573,7 @@ def _create_order(
     lines_skipped = len(skipped_lines)
     lines_already_present = 0
     remaining_lines: list[dict] = [s["line"] for s in skipped_lines]
+    order_locked_reason: str | None = None
     next_line_no = base_line_no
     for line, item_no in resolved_lines:
         if item_no in existing_item_nos:
@@ -514,6 +583,12 @@ def _create_order(
             # numbering intentionally only advances for lines actually submitted below,
             # same as _sync_order_from_cloudsql's equivalent loop.
             lines_already_present += 1
+            continue
+        if order_locked_reason:
+            # Already confirmed this order's own status blocks every further line —
+            # no BC call can possibly succeed for the rest, so just record them as not
+            # added instead of repeating the same rejection line by line.
+            remaining_lines.append(line)
             continue
         next_line_no += 10000
         line_payload = _build_line_payload(line, item_no, location_code, next_line_no)
@@ -534,12 +609,19 @@ def _create_order(
                 f"(BC {lh}): {ld}"
             )
             lines_skipped += 1
+            lock_reason = _order_status_lock_reason(ld)
+            if lock_reason:
+                order_locked_reason = lock_reason
+                logger.warning(
+                    f"PO {po_ref} → BC {order_no!r}: order status is {lock_reason!r} (not 'Open') — "
+                    f"no further lines will be attempted; see order_locked_reason in the caller"
+                )
             break
         if not created:
             remaining_lines.append(line)
 
     attempted_lines = len(resolved_lines) - lines_already_present
-    if lines_created == 0 and attempted_lines > 0:
+    if lines_created == 0 and attempted_lines > 0 and not order_locked_reason:
         # All ATTEMPTED lines were nonetheless rejected by BC (e.g. bad posting group)
         # — distinct from lines_already_present, which were never attempted at all, not
         # rejected. No longer rolled back — the header (and PO ref number) stays in BC
@@ -567,7 +649,54 @@ def _create_order(
         "lines_created": lines_created,
         "lines_skipped": lines_skipped,
         "unmatched_items": unmatched_items,
+        "order_locked_reason": order_locked_reason,
     }
+
+
+def _describe_unresolved_line(line: dict) -> str:
+    resolved = line.get("resolvedItem") or {}
+    item_no = resolved.get("itemNo")
+    sku = line.get("customerSKUCode") or line.get("customerSKUDesc") or "(no SKU)"
+    return f"{item_no} (SKU {sku})" if item_no else f"SKU {sku} (no BC item match)"
+
+
+def _handle_order_locked(
+    header: dict,
+    lines: list,
+    remaining_lines: list,
+    company: str,
+    so_number: str,
+    lock_reason: str,
+    buf_id: str | None,
+    notify: dict | None,
+    run_id: str | None,
+) -> None:
+    """A PO whose BC order can never accept more lines automatically (see
+    _order_status_lock_reason — its status was changed to something other than 'Open'
+    in BC after the header was created here, e.g. Released or Invoiced). Retrying this
+    forever is pointless — only a human reopening the order in BC can ever fix it — so
+    this removes the PO from the buffer for good (rather than endlessly re-buffering
+    it, the previous behavior) and records the WHOLE order (every line, not just the
+    unresolved ones) to so_buffer_history_{env} so there's a durable record of exactly
+    which items never made it in. A human who later reopens the order in BC re-triggers
+    this PO themselves via Sync/Backfill from Cloud SQL on /reconcile — same as every
+    other buffer resolution path, deliberately never automatic.
+    """
+    po_ref = header.get("poRefNumber", "unknown")
+    unresolved_desc = ", ".join(_describe_unresolved_line(line) for line in remaining_lines) or "(none)"
+    detail = (
+        f"BC order {so_number!r}'s status is {lock_reason!r} (not 'Open') — further lines cannot be "
+        f"added automatically. Removed from the buffer; {len(remaining_lines)} item(s) never added to BC: "
+        f"{unresolved_desc}. Reopen the order in BC, then use Sync/Backfill from Cloud SQL on /reconcile "
+        f"to add them."
+    )
+    logger.warning(f"PO {po_ref!r} → BC {so_number!r}: {detail}")
+    so_buffer_history.record_reconciliation(
+        header, lines, company, "blocked_in_bc", notify,
+        run_id=run_id, so_number=so_number, detail=detail,
+    )
+    if buf_id:
+        so_buffer.delete_buffered_order(buf_id)
 
 
 def _buffer_status_note(attempt_count: int | None) -> str:
@@ -768,10 +897,14 @@ def _sync_order_from_cloudsql(
     already_present = 0
     lines_skipped = len(skipped_lines)
     remaining_lines: list[dict] = [s["line"] for s in skipped_lines]
+    order_locked_reason: str | None = None
 
     for line, item_no in resolved_lines:
         if item_no in existing_item_nos:
             already_present += 1
+            continue
+        if order_locked_reason:
+            remaining_lines.append(line)
             continue
         next_line_no += 10000
         line_payload = _build_line_payload(line, item_no, config.POUL_SO_DEFAULT_LOCATION, next_line_no)
@@ -792,11 +925,28 @@ def _sync_order_from_cloudsql(
                 f"{attempt + 1} attempt(s) (BC {lh}): {ld}"
             )
             lines_skipped += 1
+            lock_reason = _order_status_lock_reason(ld)
+            if lock_reason:
+                order_locked_reason = lock_reason
+                logger.warning(
+                    f"Cloud SQL sync — PO {po_ref!r} → BC {order_no!r}: order status is "
+                    f"{lock_reason!r} (not 'Open') — no further lines will be attempted"
+                )
             break
         if not created:
             remaining_lines.append(line)
 
-    if remaining_lines:
+    if order_locked_reason:
+        # Same reasoning as _create_order's equivalent branch — this order's own BC
+        # status blocks every further line, so there's no point re-buffering it (which
+        # save_failed_order would otherwise do here, since this path runs specifically
+        # for orders whose buffer doc is already gone — it would recreate one that can
+        # never succeed). Record the whole order to history instead.
+        _handle_order_locked(
+            poul_header, detail_rows, remaining_lines, company,
+            order_no, order_locked_reason, so_buffer._doc_id(poul_header), None, None,
+        )
+    elif remaining_lines:
         so_buffer.save_failed_order(
             poul_header, remaining_lines, company, src_company,
             f"Cloud SQL sync — order {order_no!r} still has {len(remaining_lines)} "
@@ -1038,7 +1188,18 @@ def _run_backfill_from_cloudsql(
                 )
                 result["from_buffer"] = False
                 successes.append(result)
-                if result["remaining_lines"]:
+                if result.get("order_locked_reason"):
+                    # Freshly-created header got Released/Invoiced/etc. in BC before
+                    # its lines could all be added — no retry will ever succeed; never
+                    # buffer it, just record the whole order to history (buf_id is
+                    # None here, backfill never reads from the buffer in the first
+                    # place, so there's nothing to delete).
+                    _handle_order_locked(
+                        h, lines, result["remaining_lines"], company,
+                        result["so_number"], result["order_locked_reason"],
+                        None, notify, None,
+                    )
+                elif result["remaining_lines"]:
                     so_buffer.save_failed_order(
                         h, result["remaining_lines"], company, f"cloudsql-backfill:{company}",
                         f"Backfill — header {result['so_number']!r} created — "
@@ -1250,6 +1411,17 @@ def _run_batch(
             )
             result["from_buffer"] = buf_id is not None
             successes.append(result)
+            if result.get("order_locked_reason"):
+                # The order's own BC status (Released, Invoiced, ...) blocks any
+                # further lines — no retry will ever succeed. Remove it from the
+                # buffer for good and record the whole order to history instead of
+                # re-buffering it forever (see _handle_order_locked).
+                _handle_order_locked(
+                    header, lines, result["remaining_lines"], company,
+                    result["so_number"], result["order_locked_reason"],
+                    buf_id, notify, run_id,
+                )
+                continue
             if result["remaining_lines"]:
                 # Header exists in BC but some lines still aren't — keep (or create)
                 # the buffer doc with just those lines and the so_number, so a future
