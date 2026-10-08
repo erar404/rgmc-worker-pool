@@ -100,3 +100,28 @@ def fetch_customer_overrides() -> dict[str, dict]:
     except Exception as exc:
         logger.warning(f"so_buffer_overrides: fetch_customer_overrides failed — continuing without overrides: {exc}")
         return {}
+
+
+_INACTIVE_SKUS_COLLECTION = f"so_buffer_inactive_skus_{config.GCP_ENV.lower()}"
+
+
+def fetch_inactive_skus() -> set[str]:
+    """Return the set of raw SKU codes (or descriptions, for a blank-SKU group) a human
+    has marked inactive on /reconcile's Inactive Items tab (rgmc-bc-api's
+    mark_sku_inactive) — e.g. a discontinued item that will never get a real BC link.
+
+    Before this existed, marking a SKU inactive only ever changed what /reconcile
+    displayed (it drops the group from the Items (SKU) tab and its resolved/total
+    counts) — the worker itself had no idea and kept retrying the exact same
+    unresolvable line forever, so an order could show "All links resolved" (every
+    *visible* SKU group was 0/0, i.e. none left to resolve) while silently stuck in
+    the buffer on a line marked inactive weeks earlier. _resolve_valid_lines now reads
+    this set and drops those lines outright (never retried, never re-buffered) so
+    marking a SKU inactive actually does what its name implies.
+    """
+    try:
+        docs = _client().collection(_INACTIVE_SKUS_COLLECTION).stream()
+        return {(doc.to_dict() or {}).get("key", "").strip().upper() for doc in docs} - {""}
+    except Exception as exc:
+        logger.warning(f"so_buffer_overrides: fetch_inactive_skus failed — continuing without exclusions: {exc}")
+        return set()

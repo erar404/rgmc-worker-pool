@@ -241,25 +241,50 @@ def _build_line_payload(line: dict, item_no: str, location_code: str, line_no: i
     return {k: v for k, v in payload.items() if v != "" and v is not None}
 
 
+_NO_SKU_KEY = "(no SKU code, no description)".upper()
+
+
 def _resolve_valid_lines(
-    po_ref: str, lines: list, ref_map: dict[str, str]
-) -> tuple[list[tuple[dict, str]], list[dict]]:
+    po_ref: str, lines: list, ref_map: dict[str, str], inactive_skus: set[str] | None = None
+) -> tuple[list[tuple[dict, str]], list[dict], list[dict]]:
     """Pre-validate lines against ref_map without touching BC.
 
-    Returns (resolved, skipped) where resolved is [(line, item_no), ...] for lines
-    with a known SKU, a matching item reference, and a positive quantity, and
-    skipped is [{"sku", "description", "reason", "line"}, ...] for every line left
-    out — reason is one of "no_bc_match" (empty SKU or no item reference found in
-    BC — i.e. no data to match against) or "non_positive_qty". "line" is the raw
-    original line dict, kept so an unresolved line can be re-buffered and retried
-    later (e.g. once a reconcile-page override resolves its SKU) instead of lost.
+    Returns (resolved, skipped, dropped_inactive):
+      - resolved: [(line, item_no), ...] for lines with a known SKU, a matching item
+        reference, and a positive quantity.
+      - skipped: [{"sku", "description", "reason", "line"}, ...] for every line left
+        out that might still become resolvable later — reason is "no_bc_match" (empty
+        SKU or no item reference found in BC) or "non_positive_qty". "line" is the raw
+        original line dict, kept so it can be re-buffered and retried (e.g. once a
+        reconcile-page override resolves its SKU) instead of lost.
+      - dropped_inactive: [{"sku", "description", "line"}, ...] for every line whose raw
+        SKU (or description, if blank) matches a key saved on /reconcile's Inactive
+        Items tab. These are deliberately excluded from both resolved AND skipped —
+        never retried, never re-buffered, never counted toward unmatched_items —
+        because marking a SKU inactive is a human's explicit "never resolve this"
+        decision. Before this, that mark only ever changed what /reconcile displayed
+        (dropped the group from the Items (SKU) tab's resolved/total counts); the
+        worker itself had no idea and kept retrying the exact same unresolvable line
+        forever, so an order could show "All links resolved — Items 0/0" while
+        silently stuck in the buffer for weeks on a line marked inactive long ago.
     """
     resolved: list[tuple[dict, str]] = []
     skipped: list[dict] = []
+    dropped_inactive: list[dict] = []
+    inactive_skus = inactive_skus or set()
     for i, line in enumerate(lines, start=1):
         sku_raw: str = (line.get("customerSKUCode") or "").strip()
         sku: str = sku_raw.upper()
         desc: str = (line.get("customerSKUDesc") or "").strip()
+
+        inactive_key = sku or (desc.upper() or _NO_SKU_KEY)
+        if inactive_key in inactive_skus:
+            logger.info(
+                f"PO {po_ref} line {i}: {sku_raw or desc!r} is marked inactive on /reconcile — "
+                f"dropping from this order, will never be retried"
+            )
+            dropped_inactive.append({"sku": sku_raw, "description": desc, "line": line})
+            continue
 
         # A reconcile-page SKU link always wins over ref_map lookup — resolvedItem is
         # the denormalized copy rgmc-bc-api's apply_resolution_to_buffer writes onto this
@@ -289,7 +314,7 @@ def _resolve_valid_lines(
             continue
 
         resolved.append((line, item_no))
-    return resolved, skipped
+    return resolved, skipped, dropped_inactive
 
 
 def _apply_sku_overrides(lines: list, sku_overrides: dict[str, dict]) -> None:
@@ -382,6 +407,7 @@ def _create_order(
     location_code: str,
     branch_overrides: dict[str, dict],
     customer_overrides: dict[str, dict],
+    inactive_skus: set[str] | None = None,
     existing_so_number: str | None = None,
 ) -> dict:
     """Create (or resume) one BC Sales Order and return a result summary dict.
@@ -557,7 +583,7 @@ def _create_order(
     # header created in BC (so the PO ref number is visible there), just with no
     # lines — the invalid lines are reported as skipped rather than blocking the
     # whole PO from ever reaching BC.
-    resolved_lines, skipped_lines = _resolve_valid_lines(po_ref, lines, ref_map)
+    resolved_lines, skipped_lines, dropped_inactive = _resolve_valid_lines(po_ref, lines, ref_map, inactive_skus)
     unmatched_items: list[dict] = [s for s in skipped_lines if s["reason"] == "no_bc_match"]
     if not resolved_lines:
         logger.warning(
@@ -650,6 +676,7 @@ def _create_order(
         "lines_skipped": lines_skipped,
         "unmatched_items": unmatched_items,
         "order_locked_reason": order_locked_reason,
+        "dropped_inactive_count": len(dropped_inactive),
     }
 
 
@@ -861,6 +888,7 @@ def _sync_order_from_cloudsql(
     src_company: str,
     ref_map: dict[str, str],
     sku_overrides: dict[str, dict] | None = None,
+    inactive_skus: set[str] | None = None,
 ) -> dict | None:
     """Backfill missing lines onto one BC sales order from Cloud SQL, using
     externalDocumentNo == poRefNumber to find it (not so_number/buffer state — this
@@ -891,7 +919,7 @@ def _sync_order_from_cloudsql(
 
     detail_rows = gcp_api_client.fetch_customerpouldetailbq(po_ref)
     _apply_sku_overrides(detail_rows, sku_overrides or {})
-    resolved_lines, skipped_lines = _resolve_valid_lines(po_ref, detail_rows, ref_map)
+    resolved_lines, skipped_lines, dropped_inactive = _resolve_valid_lines(po_ref, detail_rows, ref_map, inactive_skus)
 
     lines_created = 0
     already_present = 0
@@ -947,10 +975,14 @@ def _sync_order_from_cloudsql(
             order_no, order_locked_reason, so_buffer._doc_id(poul_header), None, None,
         )
     elif remaining_lines:
+        dropped_note = (
+            f" ({len(dropped_inactive)} line(s) excluded — marked inactive on /reconcile, never retried)"
+            if dropped_inactive else ""
+        )
         so_buffer.save_failed_order(
             poul_header, remaining_lines, company, src_company,
             f"Cloud SQL sync — order {order_no!r} still has {len(remaining_lines)} "
-            f"unresolved line(s) (no BC item match or rejected by BC)",
+            f"unresolved line(s) (no BC item match or rejected by BC){dropped_note}",
             so_number=order_no,
         )
 
@@ -966,6 +998,7 @@ def _sync_order_from_cloudsql(
         "already_present": already_present,
         "lines_skipped": lines_skipped,
         "remaining_lines": len(remaining_lines),
+        "dropped_inactive_count": len(dropped_inactive),
     }
 
 
@@ -1019,6 +1052,7 @@ def _run_sync_from_cloudsql(
     # Overrides aren't scoped per BC company (so_buffer_service.save_override keys
     # purely by raw SKU/branch/customer text), so one fetch covers every company below.
     sku_overrides = so_buffer_overrides.fetch_sku_item_overrides()
+    inactive_skus = so_buffer_overrides.fetch_inactive_skus()
 
     for company in companies:
         try:
@@ -1033,7 +1067,7 @@ def _run_sync_from_cloudsql(
         for h in company_headers:
             po_ref = h.get("poRefNumber", "unknown")
             try:
-                result = _sync_order_from_cloudsql(h, company, f"cloudsql-sync:{company}", ref_map, sku_overrides)
+                result = _sync_order_from_cloudsql(h, company, f"cloudsql-sync:{company}", ref_map, sku_overrides, inactive_skus)
                 if result is None:
                     not_found.append(po_ref)
                 else:
@@ -1048,7 +1082,7 @@ def _run_sync_from_cloudsql(
         for h in retry_headers:
             po_ref = h.get("poRefNumber", "unknown")
             try:
-                result = _sync_order_from_cloudsql(h, company, f"cloudsql-sync:{company}", ref_map, sku_overrides)
+                result = _sync_order_from_cloudsql(h, company, f"cloudsql-sync:{company}", ref_map, sku_overrides, inactive_skus)
                 if result is None:
                     not_found.append(po_ref)
                 else:
@@ -1135,6 +1169,7 @@ def _run_backfill_from_cloudsql(
     # Overrides aren't scoped per BC company (so_buffer_service.save_override keys
     # purely by raw SKU/branch/customer text), so one fetch covers every company below.
     sku_overrides = so_buffer_overrides.fetch_sku_item_overrides()
+    inactive_skus = so_buffer_overrides.fetch_inactive_skus()
     branch_overrides = so_buffer_overrides.fetch_branch_overrides()
     customer_overrides = so_buffer_overrides.fetch_customer_overrides()
 
@@ -1184,7 +1219,7 @@ def _run_backfill_from_cloudsql(
                     h, lines, company,
                     ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name,
                     ref_map, location_code, branch_overrides, customer_overrides,
-                    existing_so_number=None,
+                    inactive_skus=inactive_skus, existing_so_number=None,
                 )
                 result["from_buffer"] = False
                 successes.append(result)
@@ -1200,11 +1235,15 @@ def _run_backfill_from_cloudsql(
                         None, notify, None,
                     )
                 elif result["remaining_lines"]:
+                    dropped_note = (
+                        f" ({result['dropped_inactive_count']} line(s) excluded — marked inactive on /reconcile, never retried)"
+                        if result.get("dropped_inactive_count") else ""
+                    )
                     so_buffer.save_failed_order(
                         h, result["remaining_lines"], company, f"cloudsql-backfill:{company}",
                         f"Backfill — header {result['so_number']!r} created — "
                         f"{len(result['remaining_lines'])} line(s) still unresolved "
-                        f"(no BC item match or rejected by BC)",
+                        f"(no BC item match or rejected by BC){dropped_note}",
                         so_number=result["so_number"],
                     )
             except Exception as e:
@@ -1377,6 +1416,7 @@ def _run_batch(
     # customer takes effect whether the order is still being linked up or has already
     # reached BC once (branch/customer are read inside _create_order, below).
     sku_overrides = so_buffer_overrides.fetch_sku_item_overrides()
+    inactive_skus = so_buffer_overrides.fetch_inactive_skus()
     branch_overrides = so_buffer_overrides.fetch_branch_overrides()
     customer_overrides = so_buffer_overrides.fetch_customer_overrides()
     for order_item in all_orders:
@@ -1407,7 +1447,7 @@ def _run_batch(
                 header, lines, company,
                 ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name,
                 ref_map, location_code, branch_overrides, customer_overrides,
-                existing_so_number=so_number,
+                inactive_skus=inactive_skus, existing_so_number=so_number,
             )
             result["from_buffer"] = buf_id is not None
             successes.append(result)
@@ -1422,6 +1462,10 @@ def _run_batch(
                     buf_id, notify, run_id,
                 )
                 continue
+            dropped_note = (
+                f" ({result['dropped_inactive_count']} line(s) excluded — marked inactive on /reconcile, never retried)"
+                if result.get("dropped_inactive_count") else ""
+            )
             if result["remaining_lines"]:
                 # Header exists in BC but some lines still aren't — keep (or create)
                 # the buffer doc with just those lines and the so_number, so a future
@@ -1432,7 +1476,7 @@ def _run_batch(
                     header, result["remaining_lines"], company, src_company,
                     f"Header {result['so_number']!r} created — "
                     f"{len(result['remaining_lines'])} line(s) still unresolved "
-                    f"(no BC item match or rejected by BC)",
+                    f"(no BC item match or rejected by BC){dropped_note}",
                     so_number=result["so_number"],
                 )
                 outcome = "still_buffered"
@@ -1444,6 +1488,7 @@ def _run_batch(
                 so_buffer_history.record_reconciliation(
                     header, lines, company, outcome, notify,
                     run_id=run_id, so_number=result.get("so_number"),
+                    detail=f"Resolved{dropped_note}" if outcome == "resolved" and dropped_note else None,
                 )
         except Exception as e:
             err_str = str(e)
