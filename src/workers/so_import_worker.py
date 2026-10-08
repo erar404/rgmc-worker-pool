@@ -823,10 +823,18 @@ def _run_sync_from_cloudsql(
     companies: list[str],
     create_by: str,
     notify: dict | None = None,
+    po_ref_numbers: list[str] | None = None,
 ) -> tuple[bool, dict]:
     """Handle a poul-so-sync-from-cloudsql message: for every CustomerPOUL row with
     the given create_by, find its BC order (by externalDocumentNo) and backfill
     whatever lines are missing from Cloud SQL's CustomerPOULDetailBQ.
+
+    po_ref_numbers, when given, narrows the candidate set to exactly those PO refs —
+    e.g. the manual-trigger page's BigQuery Lookup "Quick Align" action, which only
+    wants this safe, already-existing-order-only backfill run for the one PO it's
+    looking at, not every create_by='trigger' row company-wide. Everything else about
+    this function (never creates a header, only backfills missing lines on an order
+    that already exists) is unchanged.
 
     A PO is reported as exactly one of:
       - synced     — checked successfully (lines added and/or already present).
@@ -851,6 +859,9 @@ def _run_sync_from_cloudsql(
     )
 
     headers = gcp_api_client.fetch_customerpoul_by_create_by(create_by)
+    if po_ref_numbers:
+        wanted_refs = set(po_ref_numbers)
+        headers = [h for h in headers if h.get("poRefNumber") in wanted_refs]
     synced: list[dict] = []
     not_found: list[str] = []
     errored: list[dict] = []
@@ -896,7 +907,7 @@ def _run_sync_from_cloudsql(
                 logger.error(f"Cloud SQL sync failed for PO {po_ref!r} (after retry): {e}")
                 errored.append({"po_ref": po_ref, "error": str(e)})
 
-    context = f"companies={companies} create_by={create_by!r}{requested_by}"
+    context = f"companies={companies} create_by={create_by!r} po_ref_numbers={po_ref_numbers or 'all'}{requested_by}"
     if synced or not_found or errored:
         detail_lines = [
             f"  PO Ref {r['po_ref']:<20} → BC {r['order_no']}: "
@@ -1356,15 +1367,16 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         # Firestore buffer doc is already gone, using Cloud SQL as the source of truth.
         companies = data.get("companies") or _ALL_BC_COMPANIES
         create_by = data.get("create_by") or "trigger"
+        po_ref_numbers = data.get("po_ref_numbers") or None
         notify = data.get("notify") or None
         run_id = data.get("run_id") or None
         logger.info(
             f"POUL SO: Cloud SQL sync triggered for companies={companies} "
-            f"create_by={create_by!r} notify={notify} run_id={run_id!r}"
+            f"create_by={create_by!r} po_ref_numbers={po_ref_numbers or 'all'} notify={notify} run_id={run_id!r}"
         )
         reprocess_status.start_run(run_id, companies=companies, notify=notify)
         try:
-            ok, summary = _run_sync_from_cloudsql(companies, create_by, notify=notify)
+            ok, summary = _run_sync_from_cloudsql(companies, create_by, notify=notify, po_ref_numbers=po_ref_numbers)
         except Exception as exc:
             logger.error(f"POUL SO: Cloud SQL sync run {run_id!r} crashed: {exc}")
             reprocess_status.finish_run(run_id, status="error", summary={}, error=str(exc))
