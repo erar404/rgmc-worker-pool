@@ -1029,6 +1029,7 @@ def _sync_order_from_cloudsql(
         if not created:
             remaining_lines.append(line)
 
+    buf_id = so_buffer._doc_id(poul_header)
     if order_locked_reason:
         # Same reasoning as _create_order's equivalent branch — this order's own BC
         # status blocks every further line, so there's no point re-buffering it (which
@@ -1037,7 +1038,7 @@ def _sync_order_from_cloudsql(
         # never succeed). Record the whole order to history instead.
         _handle_order_locked(
             poul_header, detail_rows, remaining_lines, company,
-            order_no, order_locked_reason, so_buffer._doc_id(poul_header), None, None,
+            order_no, order_locked_reason, buf_id, None, None,
         )
     elif remaining_lines:
         dropped_note = (
@@ -1050,6 +1051,22 @@ def _sync_order_from_cloudsql(
             f"Cloud SQL sync — order {order_no!r} still has {len(remaining_lines)} "
             f"unresolved line(s) (no BC item match or rejected by BC){dropped_note}{issues_note}",
             so_number=order_no,
+        )
+    elif so_buffer.get_buffered_order(buf_id):
+        # Every line is now confirmed present in BC, and this exact PO is STILL
+        # sitting in the buffer — this path never consults buffer state (it finds the
+        # order by externalDocumentNo, not by buf_id, per this function's docstring),
+        # so a PO that only got fully resolved via a Sync-from-Cloud-SQL run (as
+        # opposed to Reprocess Buffer, whose own success path already cleans up —
+        # see _run_batch) would otherwise sit in so_buffer forever with no code path
+        # ever revisiting it, even though /reconcile's Buffer tab would show it as
+        # fully linked. Clear it and move the record to history so it shows up there
+        # instead, same as every other resolved-buffer-entry path.
+        so_buffer.delete_buffered_order(buf_id)
+        so_buffer_history.record_reconciliation(
+            poul_header, detail_rows, company, "resolved", None,
+            so_number=order_no,
+            detail="Resolved via Sync from Cloud SQL — all lines confirmed present in BC.",
         )
 
     logger.info(

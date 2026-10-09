@@ -109,6 +109,16 @@ def save_failed_order(
         return 0
 
 
+def get_buffered_order(doc_id: str) -> dict | None:
+    """Return one buffered order's data by doc_id, or None if it isn't buffered."""
+    try:
+        snap = _client().collection(_COLLECTION).document(doc_id).get()
+        return snap.to_dict() if snap.exists else None
+    except Exception as exc:
+        logger.warning(f"so_buffer: get_buffered_order failed for {doc_id!r}: {exc}")
+        return None
+
+
 def get_buffered_orders(company: str) -> list[tuple[str, dict]]:
     """Return [(doc_id, data)] for all buffered orders for the given BC company."""
     try:
