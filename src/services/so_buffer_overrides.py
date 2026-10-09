@@ -102,6 +102,30 @@ def fetch_customer_overrides() -> dict[str, dict]:
         return {}
 
 
+def fetch_uom_overrides() -> dict[str, dict]:
+    """Return {"{ITEM_NO}::{RAW_UOM_UPPER}": {"uomCode": ..., "description": ...}} for
+    every saved "uom" override.
+
+    Unlike sku/branch/customer's flat raw-text keys, a uom override's key is composite
+    — the same raw unit-of-measure text (e.g. "Cases") can legitimately map to a
+    different BC UOM code depending on the item, so the key must include item_no (see
+    rgmc-bc-api's so_buffer_service._uom_key_parts, which this mirrors exactly).
+    """
+    try:
+        docs = _client().collection(_COLLECTION).where("type", "==", "uom").stream()
+        out: dict[str, dict] = {}
+        for doc in docs:
+            data = doc.to_dict() or {}
+            key = (data.get("key") or "").strip().upper()
+            resolved = data.get("resolved") or {}
+            if key and resolved.get("uomCode"):
+                out[key] = resolved
+        return out
+    except Exception as exc:
+        logger.warning(f"so_buffer_overrides: fetch_uom_overrides failed — continuing without overrides: {exc}")
+        return {}
+
+
 _INACTIVE_SKUS_COLLECTION = f"so_buffer_inactive_skus_{config.GCP_ENV.lower()}"
 
 

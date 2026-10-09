@@ -151,6 +151,14 @@ def _uom_code(uom_raw: str) -> str:
     return "PCS" if _is_pcs(uom_raw) else "CS"
 
 
+def _uom_override_key(item_no: str, uom_raw: str) -> str:
+    """Matches rgmc-bc-api's so_buffer_service._uom_key_parts exactly — a uom
+    override's key is "{itemNo}::{raw unit-of-measure text}" (not a flat raw-text key
+    like sku/branch/customer) since the same raw UOM text can map to a different BC
+    UOM code depending on the item."""
+    return f"{(item_no or '').strip().upper()}::{(uom_raw or '').strip().upper()}"
+
+
 def _safe_float(val) -> float:
     try:
         return float(val or 0)
@@ -209,13 +217,19 @@ def _build_header_payload(
     return {k: v for k, v in payload.items() if v}
 
 
-def _build_line_payload(line: dict, item_no: str, location_code: str, line_no: int) -> dict:
+def _build_line_payload(
+    line: dict, item_no: str, location_code: str, line_no: int, uom_override_code: str | None = None
+) -> dict:
     uom_raw: str = line.get("unitOfMeasurement") or ""
     pcs = _is_pcs(uom_raw)
 
     qty = _resolve_line_qty(line)
     unit_price = _safe_float(line.get("unitPricePcs") if pcs else line.get("unitPrice"))
-    uom_code = _uom_code(uom_raw)
+    # A saved /reconcile "Unit of Measure" override — a human confirming the actual BC
+    # UOM Code for this item (looked up against BC's own Item Unit of Measure table) —
+    # always wins over the blind CS/PCS keyword guess below, the same way a saved SKU
+    # override always wins over ref_map matching in _resolve_valid_lines.
+    uom_code = uom_override_code or _uom_code(uom_raw)
 
     # postingGroup used to be hardcoded here as "TRADE" — BC now rejects that as
     # "Control 'postingGroup' is read-only" on every line insert (confirmed live,
@@ -438,6 +452,26 @@ def _describe_line_rejection(bc_error_body, item_no: str, resolution_source: str
     return None
 
 
+def _uom_rejection_bad_code(bc_error_body) -> str | None:
+    """If a line rejection is specifically BC's Internal_InvalidTableRelation on the
+    Unit of Measure Code field, returns the bad UOM code value — used to tag the line
+    (line["uomIssue"]) so /reconcile's Unit of Measure tab can group and resolve it,
+    separately from _describe_line_rejection's human-readable message. Returns None
+    for every other rejection shape (including an InvalidTableRelation on some other
+    field, e.g. Ship-to Code)."""
+    try:
+        err = (bc_error_body or {}).get("error", {})
+    except AttributeError:
+        return None
+    if err.get("code") != "Internal_InvalidTableRelation":
+        return None
+    match = _INVALID_TABLE_RELATION_RE.search(err.get("message", ""))
+    if not match:
+        return None
+    field, bad_value, _related_table = match.groups()
+    return bad_value if field.strip().lower() == "unit of measure code" else None
+
+
 def _create_order(
     header: dict,
     lines: list,
@@ -450,6 +484,7 @@ def _create_order(
     branch_overrides: dict[str, dict],
     customer_overrides: dict[str, dict],
     inactive_skus: set[str] | None = None,
+    uom_overrides: dict[str, dict] | None = None,
     existing_so_number: str | None = None,
 ) -> dict:
     """Create (or resume) one BC Sales Order and return a result summary dict.
@@ -660,7 +695,11 @@ def _create_order(
             remaining_lines.append(line)
             continue
         next_line_no += 10000
-        line_payload = _build_line_payload(line, item_no, location_code, next_line_no)
+        uom_raw = line.get("unitOfMeasurement") or ""
+        resolved_uom = (line.get("resolvedUom") or {}).get("uomCode") or (
+            (uom_overrides or {}).get(_uom_override_key(item_no, uom_raw)) or {}
+        ).get("uomCode")
+        line_payload = _build_line_payload(line, item_no, location_code, next_line_no, uom_override_code=resolved_uom)
         created = False
         for attempt in range(4):
             lh, ld = bc_client.v2_create_record(
@@ -695,6 +734,9 @@ def _create_order(
                 if clearer:
                     logger.error(f"PO {po_ref} line rejected by BC — {clearer}")
                     line_issues.append(clearer)
+                bad_uom = _uom_rejection_bad_code(ld)
+                if bad_uom:
+                    line["uomIssue"] = {"itemNo": item_no, "rawUom": uom_raw, "badCode": bad_uom}
             break
         if not created:
             remaining_lines.append(line)
@@ -943,6 +985,7 @@ def _sync_order_from_cloudsql(
     ref_map: dict[str, str],
     sku_overrides: dict[str, dict] | None = None,
     inactive_skus: set[str] | None = None,
+    uom_overrides: dict[str, dict] | None = None,
 ) -> dict | None:
     """Backfill missing lines onto one BC sales order from Cloud SQL, using
     externalDocumentNo == poRefNumber to find it (not so_number/buffer state — this
@@ -990,7 +1033,13 @@ def _sync_order_from_cloudsql(
             remaining_lines.append(line)
             continue
         next_line_no += 10000
-        line_payload = _build_line_payload(line, item_no, config.POUL_SO_DEFAULT_LOCATION, next_line_no)
+        uom_raw = line.get("unitOfMeasurement") or ""
+        resolved_uom = (line.get("resolvedUom") or {}).get("uomCode") or (
+            (uom_overrides or {}).get(_uom_override_key(item_no, uom_raw)) or {}
+        ).get("uomCode")
+        line_payload = _build_line_payload(
+            line, item_no, config.POUL_SO_DEFAULT_LOCATION, next_line_no, uom_override_code=resolved_uom
+        )
         created = False
         for attempt in range(4):
             lh, ld = bc_client.v2_create_record(
@@ -1025,6 +1074,9 @@ def _sync_order_from_cloudsql(
                 if clearer:
                     logger.error(f"Cloud SQL sync — PO {po_ref!r} line rejected by BC — {clearer}")
                     line_issues.append(clearer)
+                bad_uom = _uom_rejection_bad_code(ld)
+                if bad_uom:
+                    line["uomIssue"] = {"itemNo": item_no, "rawUom": uom_raw, "badCode": bad_uom}
             break
         if not created:
             remaining_lines.append(line)
@@ -1136,6 +1188,7 @@ def _run_sync_from_cloudsql(
     # purely by raw SKU/branch/customer text), so one fetch covers every company below.
     sku_overrides = so_buffer_overrides.fetch_sku_item_overrides()
     inactive_skus = so_buffer_overrides.fetch_inactive_skus()
+    uom_overrides = so_buffer_overrides.fetch_uom_overrides()
 
     for company in companies:
         try:
@@ -1150,7 +1203,7 @@ def _run_sync_from_cloudsql(
         for h in company_headers:
             po_ref = h.get("poRefNumber", "unknown")
             try:
-                result = _sync_order_from_cloudsql(h, company, f"cloudsql-sync:{company}", ref_map, sku_overrides, inactive_skus)
+                result = _sync_order_from_cloudsql(h, company, f"cloudsql-sync:{company}", ref_map, sku_overrides, inactive_skus, uom_overrides)
                 if result is None:
                     not_found.append(po_ref)
                 else:
@@ -1165,7 +1218,7 @@ def _run_sync_from_cloudsql(
         for h in retry_headers:
             po_ref = h.get("poRefNumber", "unknown")
             try:
-                result = _sync_order_from_cloudsql(h, company, f"cloudsql-sync:{company}", ref_map, sku_overrides, inactive_skus)
+                result = _sync_order_from_cloudsql(h, company, f"cloudsql-sync:{company}", ref_map, sku_overrides, inactive_skus, uom_overrides)
                 if result is None:
                     not_found.append(po_ref)
                 else:
@@ -1255,6 +1308,7 @@ def _run_backfill_from_cloudsql(
     inactive_skus = so_buffer_overrides.fetch_inactive_skus()
     branch_overrides = so_buffer_overrides.fetch_branch_overrides()
     customer_overrides = so_buffer_overrides.fetch_customer_overrides()
+    uom_overrides = so_buffer_overrides.fetch_uom_overrides()
 
     successes: list[dict] = []
     errors: list[dict] = []
@@ -1302,7 +1356,7 @@ def _run_backfill_from_cloudsql(
                     h, lines, company,
                     ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name,
                     ref_map, location_code, branch_overrides, customer_overrides,
-                    inactive_skus=inactive_skus, existing_so_number=None,
+                    inactive_skus=inactive_skus, uom_overrides=uom_overrides, existing_so_number=None,
                 )
                 result["from_buffer"] = False
                 successes.append(result)
@@ -1505,6 +1559,7 @@ def _run_batch(
     inactive_skus = so_buffer_overrides.fetch_inactive_skus()
     branch_overrides = so_buffer_overrides.fetch_branch_overrides()
     customer_overrides = so_buffer_overrides.fetch_customer_overrides()
+    uom_overrides = so_buffer_overrides.fetch_uom_overrides()
     for order_item in all_orders:
         _apply_sku_overrides(order_item["lines"], sku_overrides)
 
@@ -1533,7 +1588,7 @@ def _run_batch(
                 header, lines, company,
                 ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name,
                 ref_map, location_code, branch_overrides, customer_overrides,
-                inactive_skus=inactive_skus, existing_so_number=so_number,
+                inactive_skus=inactive_skus, uom_overrides=uom_overrides, existing_so_number=so_number,
             )
             result["from_buffer"] = buf_id is not None
             successes.append(result)
