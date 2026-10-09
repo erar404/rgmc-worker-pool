@@ -396,6 +396,48 @@ def _describe_invalid_table_relation(bc_error_body, resolution_source: str) -> s
     )
 
 
+def _describe_line_rejection(bc_error_body, item_no: str, resolution_source: str) -> str | None:
+    """If a sales-LINE-create rejection is one BC reports deterministically for this
+    exact item/value every time (not a transient BC issue), returns a clear,
+    actionable message naming the item, where it was resolved from, and what's wrong.
+    Returns None if this isn't a known-permanent rejection, so the caller falls back to
+    BC's raw error body (same contract as _describe_invalid_table_relation).
+
+    Covers two cases seen in practice:
+      - Internal_InvalidTableRelation: some field on the line (most often Unit of
+        Measure Code) has a value not configured for this item in BC — either a bad
+        SKU override/source value, or a genuine gap in the item's BC setup.
+      - Application_DialogException on the item number field: the resolved item_no
+        (from a reconcile-page SKU override or a placeholder value) is not an actual
+        item in BC at all.
+    Neither self-heals on its own; retrying changes nothing until a human fixes the
+    override on /reconcile or the item's setup in BC.
+    """
+    try:
+        err = (bc_error_body or {}).get("error", {})
+    except AttributeError:
+        return None
+    code = err.get("code")
+    message = err.get("message", "")
+    if code == "Internal_InvalidTableRelation":
+        match = _INVALID_TABLE_RELATION_RE.search(message)
+        if not match:
+            return None
+        field, bad_value, related_table = match.groups()
+        return (
+            f"item {item_no!r} (from {resolution_source}): {field} {bad_value!r} does not exist in "
+            f"{related_table!r} in BC — not a transient failure; needs fixing on /reconcile's "
+            f"Overrides tab or in this item's BC setup before this line can ever go through."
+        )
+    if code == "Application_DialogException" and err.get("target") == "number":
+        return (
+            f"item {item_no!r} (from {resolution_source}) is not a valid/existing item in BC — "
+            f"not a transient failure; almost certainly a bad or placeholder SKU override on "
+            f"/reconcile's Overrides tab that will keep failing every retry until corrected."
+        )
+    return None
+
+
 def _create_order(
     header: dict,
     lines: list,
@@ -600,6 +642,7 @@ def _create_order(
     lines_already_present = 0
     remaining_lines: list[dict] = [s["line"] for s in skipped_lines]
     order_locked_reason: str | None = None
+    line_issues: list[str] = []
     next_line_no = base_line_no
     for line, item_no in resolved_lines:
         if item_no in existing_item_nos:
@@ -642,6 +685,16 @@ def _create_order(
                     f"PO {po_ref} → BC {order_no!r}: order status is {lock_reason!r} (not 'Open') — "
                     f"no further lines will be attempted; see order_locked_reason in the caller"
                 )
+            else:
+                resolution_source = (
+                    "reconcile-page SKU link"
+                    if (line.get("resolvedItem") or {}).get("itemNo") == item_no
+                    else "automatic item-reference matching"
+                )
+                clearer = _describe_line_rejection(ld, item_no, resolution_source)
+                if clearer:
+                    logger.error(f"PO {po_ref} line rejected by BC — {clearer}")
+                    line_issues.append(clearer)
             break
         if not created:
             remaining_lines.append(line)
@@ -677,6 +730,7 @@ def _create_order(
         "unmatched_items": unmatched_items,
         "order_locked_reason": order_locked_reason,
         "dropped_inactive_count": len(dropped_inactive),
+        "line_issues": line_issues,
     }
 
 
@@ -926,6 +980,7 @@ def _sync_order_from_cloudsql(
     lines_skipped = len(skipped_lines)
     remaining_lines: list[dict] = [s["line"] for s in skipped_lines]
     order_locked_reason: str | None = None
+    line_issues: list[str] = []
 
     for line, item_no in resolved_lines:
         if item_no in existing_item_nos:
@@ -960,6 +1015,16 @@ def _sync_order_from_cloudsql(
                     f"Cloud SQL sync — PO {po_ref!r} → BC {order_no!r}: order status is "
                     f"{lock_reason!r} (not 'Open') — no further lines will be attempted"
                 )
+            else:
+                resolution_source = (
+                    "reconcile-page SKU link"
+                    if (line.get("resolvedItem") or {}).get("itemNo") == item_no
+                    else "automatic item-reference matching"
+                )
+                clearer = _describe_line_rejection(ld, item_no, resolution_source)
+                if clearer:
+                    logger.error(f"Cloud SQL sync — PO {po_ref!r} line rejected by BC — {clearer}")
+                    line_issues.append(clearer)
             break
         if not created:
             remaining_lines.append(line)
@@ -979,10 +1044,11 @@ def _sync_order_from_cloudsql(
             f" ({len(dropped_inactive)} line(s) excluded — marked inactive on /reconcile, never retried)"
             if dropped_inactive else ""
         )
+        issues_note = f" — {'; '.join(line_issues)}" if line_issues else ""
         so_buffer.save_failed_order(
             poul_header, remaining_lines, company, src_company,
             f"Cloud SQL sync — order {order_no!r} still has {len(remaining_lines)} "
-            f"unresolved line(s) (no BC item match or rejected by BC){dropped_note}",
+            f"unresolved line(s) (no BC item match or rejected by BC){dropped_note}{issues_note}",
             so_number=order_no,
         )
 
@@ -1239,11 +1305,14 @@ def _run_backfill_from_cloudsql(
                         f" ({result['dropped_inactive_count']} line(s) excluded — marked inactive on /reconcile, never retried)"
                         if result.get("dropped_inactive_count") else ""
                     )
+                    issues_note = (
+                        f" — {'; '.join(result['line_issues'])}" if result.get("line_issues") else ""
+                    )
                     so_buffer.save_failed_order(
                         h, result["remaining_lines"], company, f"cloudsql-backfill:{company}",
                         f"Backfill — header {result['so_number']!r} created — "
                         f"{len(result['remaining_lines'])} line(s) still unresolved "
-                        f"(no BC item match or rejected by BC){dropped_note}",
+                        f"(no BC item match or rejected by BC){dropped_note}{issues_note}",
                         so_number=result["so_number"],
                     )
             except Exception as e:
@@ -1472,11 +1541,14 @@ def _run_batch(
                 # pass resumes this exact order instead of re-creating its header or
                 # losing the unresolved lines. Applies whether this order came from
                 # the buffer or was a fresh inbound PO that partially succeeded.
+                issues_note = (
+                    f" — {'; '.join(result['line_issues'])}" if result.get("line_issues") else ""
+                )
                 so_buffer.save_failed_order(
                     header, result["remaining_lines"], company, src_company,
                     f"Header {result['so_number']!r} created — "
                     f"{len(result['remaining_lines'])} line(s) still unresolved "
-                    f"(no BC item match or rejected by BC){dropped_note}",
+                    f"(no BC item match or rejected by BC){dropped_note}{issues_note}",
                     so_number=result["so_number"],
                 )
                 outcome = "still_buffered"
