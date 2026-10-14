@@ -495,9 +495,11 @@ def _create_order(
 
     branch_overrides / customer_overrides: so_buffer_overrides.fetch_branch_overrides()
     / fetch_customer_overrides() — every saved reconcile-page branch/customer link,
-    keyed by raw upper-cased customerBranchName/customerName text, fetched fresh by
-    the caller for the whole batch (see this function's own "Customer lookup via
-    Ship-to Address" section for why this is needed alongside header.resolvedShipTo).
+    keyed by raw upper-cased customerBranchName/customerName text (customer_overrides'
+    keys may also be composite, "{customerName}::{customerBranchName}" — see this
+    function's own "Customer lookup via Ship-to Address" section), fetched fresh by
+    the caller for the whole batch (see that same section for why this is needed
+    alongside header.resolvedShipTo).
 
     existing_so_number: when set, this PO's header was already created on a previous
     pass (recorded as so_buffer's `so_number`) — skip ship-to resolution and header
@@ -601,10 +603,36 @@ def _create_order(
         # resolvedShipTo (customerNo + shipToCode) takes priority since it pins the
         # exact ship-to; resolvedCustomer alone (no branch link saved) still lets the
         # order in with just a customer, no ship-to code.
+        #
+        # A "customer" override's key can also be composite — "{name}::{branch}" (see
+        # rgmc-bc-api's so_buffer_service._customer_key_parts) — for a customer name BC
+        # has split across more than one Customer record, one per branch/ship-to (a
+        # retail chain set up as a separate customer per store, say). The scoped key is
+        # checked first and wins over the flat name-only key when both exist, since it's
+        # the more specific statement of truth for this exact branch; the flat key
+        # remains the fallback for a branch-less/blank-branch order or one whose branch
+        # was never individually resolved. See /reconcile's Overrides tab, which labels
+        # a scoped override distinctly from a blanket one for the same reason this
+        # matters here: applying a blanket link derived from just one branch's
+        # resolution to every OTHER branch sharing that customer name would silently
+        # misroute them whenever they actually belong to a different BC customer.
         branch_key = (header.get("customerBranchName") or "").strip().upper()
         customer_key = (header.get("customerName") or "").strip().upper()
+        scoped_customer_key = f"{customer_key}::{branch_key}" if branch_key else None
         resolved_ship_to: dict = branch_overrides.get(branch_key) or header.get("resolvedShipTo") or {}
-        resolved_customer: dict = customer_overrides.get(customer_key) or header.get("resolvedCustomer") or {}
+        # Track whether resolved_customer came from the scoped key specifically — its
+        # shipToCode (see below) is only safe to reuse when it is, since a FLAT
+        # customer override's shipToCode was captured for whichever ONE branch happened
+        # to save it and is not necessarily correct for this header's own branch too
+        # (the customer can be right for every branch sharing the name while still
+        # having a different ship-to address per branch).
+        used_scoped_customer = bool(scoped_customer_key and customer_overrides.get(scoped_customer_key))
+        resolved_customer: dict = (
+            (used_scoped_customer and customer_overrides.get(scoped_customer_key))
+            or customer_overrides.get(customer_key)
+            or header.get("resolvedCustomer")
+            or {}
+        )
 
         if resolved_ship_to.get("customerNo"):
             customer_no = resolved_ship_to["customerNo"]
@@ -616,12 +644,19 @@ def _create_order(
             logger.info(f"PO {po_ref}: using reconcile-page branch link → customer={customer_no!r} shipTo={ship_to_code!r}")
         elif resolved_customer.get("customerNo"):
             customer_no = resolved_customer["customerNo"]
-            ship_to_code = ""
+            # shipToCode here is reference metadata captured when this customer link was
+            # saved alongside a specific branch's ship-to resolution (see the /reconcile
+            # Overrides tab) — safe to reuse ONLY when resolved_customer is the scoped
+            # (this-branch-specific) override; a flat override's shipToCode belongs to
+            # whichever other branch originally saved it, so it's left out (blank, as
+            # before) when the match came from the flat key instead.
+            ship_to_code = resolved_customer.get("shipToCode", "") if used_scoped_customer else ""
+            scope_note = f", scoped to branch {header.get('customerBranchName')!r}" if used_scoped_customer else ""
             resolution_source = (
                 f"the saved customer override for {header.get('customerName')!r} on /reconcile's "
-                f"Overrides tab (customerNo={customer_no!r})"
+                f"Overrides tab (customerNo={customer_no!r}, shipToCode={ship_to_code!r}{scope_note})"
             )
-            logger.info(f"PO {po_ref}: using reconcile-page customer link → customer={customer_no!r} (no ship-to)")
+            logger.info(f"PO {po_ref}: using reconcile-page customer link{scope_note} → customer={customer_no!r} shipTo={ship_to_code!r}")
         else:
             branch_code: str = (header.get("customerBranchLookUpCode") or "").strip().upper()
             branch_name: str = (header.get("customerBranchName") or "").strip()
