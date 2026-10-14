@@ -88,14 +88,16 @@ def fetch_customer_overrides() -> dict[str, dict]:
     "shipToName": ...}} for every saved "customer" override. Same rationale as
     fetch_branch_overrides.
 
-    KEY_UPPER is usually just CUSTOMER_NAME_UPPER, but can also be a composite
-    "{CUSTOMER_NAME_UPPER}::{CUSTOMER_BRANCH_NAME_UPPER}" for a customer name BC has
-    split across more than one Customer record (see rgmc-bc-api's
+    KEY_UPPER is usually just CUSTOMER_NAME_UPPER, but can also be scoped —
+    "{CUSTOMER_NAME_UPPER}::{CUSTOMER_BRANCH_NAME_UPPER}" or
+    "{CUSTOMER_NAME_UPPER}::PO:{PO_REF_UPPER}" — for a customer name BC has split
+    across more than one Customer record (see rgmc-bc-api's
     so_buffer_service._customer_key_parts, and so_import_worker.py's _create_order,
-    which checks the composite key first before falling back to the flat one) — this
-    function itself doesn't need to know which form a given key is; it's returned
-    exactly as stored. shipToCode/shipToName are reference metadata (not always
-    present — only on an override saved via a branch link's ship-to resolution).
+    which checks the PO-scoped key, then the branch-scoped key, before falling back to
+    the flat one) — this function itself doesn't need to know which form a given key
+    is; it's returned exactly as stored. shipToCode/shipToName are reference metadata
+    (not always present — only on an override saved via a branch link's ship-to
+    resolution).
     """
     try:
         docs = _client().collection(_COLLECTION).where("type", "==", "customer").stream()

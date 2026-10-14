@@ -604,35 +604,42 @@ def _create_order(
         # exact ship-to; resolvedCustomer alone (no branch link saved) still lets the
         # order in with just a customer, no ship-to code.
         #
-        # A "customer" override's key can also be composite — "{name}::{branch}" (see
-        # rgmc-bc-api's so_buffer_service._customer_key_parts) — for a customer name BC
-        # has split across more than one Customer record, one per branch/ship-to (a
-        # retail chain set up as a separate customer per store, say). The scoped key is
-        # checked first and wins over the flat name-only key when both exist, since it's
-        # the more specific statement of truth for this exact branch; the flat key
-        # remains the fallback for a branch-less/blank-branch order or one whose branch
-        # was never individually resolved. See /reconcile's Overrides tab, which labels
-        # a scoped override distinctly from a blanket one for the same reason this
-        # matters here: applying a blanket link derived from just one branch's
-        # resolution to every OTHER branch sharing that customer name would silently
-        # misroute them whenever they actually belong to a different BC customer.
+        # A "customer" override's key can also be scoped — "{name}::{branch}" or
+        # "{name}::PO:{ref}" (see rgmc-bc-api's so_buffer_service._customer_key_parts)
+        # — for a customer name BC has split across more than one Customer record, one
+        # per branch/ship-to (a retail chain set up as a separate customer per store,
+        # say) or, more rarely, one per individual PO when even two orders sharing the
+        # same raw branch text turn out to need different customers (/reconcile's
+        # Customers tab "Split…" action creates these). Checked most-specific first —
+        # PO-scoped, then branch-scoped, then the flat name-only key — since each is a
+        # more specific statement of truth than the last; the flat key remains the
+        # fallback for a branch-less/blank-branch order or one never individually
+        # resolved. See /reconcile's Overrides tab, which labels a scoped override
+        # distinctly from a blanket one for the same reason this matters here: applying
+        # a blanket link derived from just one branch's (or PO's) resolution to every
+        # OTHER branch/PO sharing that customer name would silently misroute them
+        # whenever they actually belong to a different BC customer.
         branch_key = (header.get("customerBranchName") or "").strip().upper()
         customer_key = (header.get("customerName") or "").strip().upper()
-        scoped_customer_key = f"{customer_key}::{branch_key}" if branch_key else None
+        po_scoped_key = f"{customer_key}::PO:{po_ref.strip().upper()}" if po_ref else None
+        branch_scoped_key = f"{customer_key}::{branch_key}" if branch_key else None
         resolved_ship_to: dict = branch_overrides.get(branch_key) or header.get("resolvedShipTo") or {}
-        # Track whether resolved_customer came from the scoped key specifically — its
-        # shipToCode (see below) is only safe to reuse when it is, since a FLAT
-        # customer override's shipToCode was captured for whichever ONE branch happened
-        # to save it and is not necessarily correct for this header's own branch too
-        # (the customer can be right for every branch sharing the name while still
+
+        # Track which tier resolved_customer actually came from — shipToCode (see
+        # below) is only safe to reuse from a scoped match (po or branch), never the
+        # flat one, since a FLAT override's shipToCode was captured for whichever ONE
+        # branch/PO happened to save it and isn't necessarily correct for this header
+        # too (the customer can be right for every branch sharing the name while still
         # having a different ship-to address per branch).
-        used_scoped_customer = bool(scoped_customer_key and customer_overrides.get(scoped_customer_key))
-        resolved_customer: dict = (
-            (used_scoped_customer and customer_overrides.get(scoped_customer_key))
-            or customer_overrides.get(customer_key)
-            or header.get("resolvedCustomer")
-            or {}
-        )
+        customer_scope_used: str | None = None
+        resolved_customer: dict = {}
+        for scope_label, scoped_key in (("po", po_scoped_key), ("branch", branch_scoped_key)):
+            if scoped_key and customer_overrides.get(scoped_key, {}).get("customerNo"):
+                customer_scope_used = scope_label
+                resolved_customer = customer_overrides[scoped_key]
+                break
+        if not resolved_customer:
+            resolved_customer = customer_overrides.get(customer_key) or header.get("resolvedCustomer") or {}
 
         if resolved_ship_to.get("customerNo"):
             customer_no = resolved_ship_to["customerNo"]
@@ -646,12 +653,17 @@ def _create_order(
             customer_no = resolved_customer["customerNo"]
             # shipToCode here is reference metadata captured when this customer link was
             # saved alongside a specific branch's ship-to resolution (see the /reconcile
-            # Overrides tab) — safe to reuse ONLY when resolved_customer is the scoped
-            # (this-branch-specific) override; a flat override's shipToCode belongs to
-            # whichever other branch originally saved it, so it's left out (blank, as
+            # Overrides tab) — safe to reuse ONLY when resolved_customer came from a
+            # scoped (po or branch) match; a flat override's shipToCode belongs to
+            # whichever other branch/PO originally saved it, so it's left out (blank, as
             # before) when the match came from the flat key instead.
-            ship_to_code = resolved_customer.get("shipToCode", "") if used_scoped_customer else ""
-            scope_note = f", scoped to branch {header.get('customerBranchName')!r}" if used_scoped_customer else ""
+            ship_to_code = resolved_customer.get("shipToCode", "") if customer_scope_used else ""
+            if customer_scope_used == "po":
+                scope_note = ", scoped to this PO"
+            elif customer_scope_used == "branch":
+                scope_note = f", scoped to branch {header.get('customerBranchName')!r}"
+            else:
+                scope_note = ""
             resolution_source = (
                 f"the saved customer override for {header.get('customerName')!r} on /reconcile's "
                 f"Overrides tab (customerNo={customer_no!r}, shipToCode={ship_to_code!r}{scope_note})"
