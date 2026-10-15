@@ -44,6 +44,17 @@ at all, skipping any row whose externalDocumentNo already matches an existing BC
   ship-to/customer/item match, or BC rejects it) is buffered via so_buffer, exactly
   like a normal inbound batch.
 
+A sixth message type applies queued Ship-to Code fixes for Sales Orders that ALREADY
+exist in BC (not buffered orders) — published by gcp-api's POST
+/customerpoul/apply-shipto-fixes, after a human picks a ship-to candidate for one or
+more orders on the /reconcile page's Missing Ship-To tab (queued instantly via
+rgmc-bc-api's POST .../so-buffer/shipto-fixes, with no BC write at that point):
+  { "type": "poul-so-shipto-patch-batch", "companies": ["SBIC"] }
+  "companies" is optional; omitted means every company's pending fixes. Pulls every
+  not-yet-applied doc from Firestore so_shipto_fixes_{env}, re-validates each against
+  BC fresh (still Open, still submittedBy "SBIC AI Uploading", shipToCode still blank)
+  immediately before PATCHing, and writes the outcome back onto the same doc.
+
 Processing per batch message:
   1. Resolve BC company from the first order's companyName.
   2. Pre-fetch all BC ship-to addresses and item references ONCE for the batch.
@@ -63,7 +74,7 @@ from difflib import SequenceMatcher
 from google.cloud import pubsub_v1
 
 from src import config
-from src.services import bc_client, gcp_api_client, so_buffer, so_buffer_history, so_buffer_overrides, reprocess_status
+from src.services import bc_client, gcp_api_client, shipto_fixes, so_buffer, so_buffer_history, so_buffer_overrides, reprocess_status
 from src.services.send_mail import notify_error, notify_success, notify_warning
 
 logger = logging.getLogger("worker.so_import")
@@ -1314,6 +1325,99 @@ def _run_sync_from_cloudsql(
     return True, summary
 
 
+def _run_shipto_fixes_batch(companies: list[str] | None, notify: dict | None = None) -> tuple[bool, dict]:
+    """Handle a poul-so-shipto-patch-batch message: apply every pending Ship-to Code fix
+    queued from the /reconcile page's Missing Ship-To tab (rgmc-bc-api's POST
+    .../so-buffer/shipto-fixes) — PATCHes each named Sales Order's Ship-to Code in BC.
+
+    Re-checks each fix against BC immediately before patching (status still Open,
+    submittedBy still _SUBMITTED_BY, shipToCode still blank) rather than trusting the
+    queued snapshot — a fix can go stale between being queued on /reconcile and this
+    batch actually running (the order could since have been fixed another way, or
+    changed status). A stale fix is left in the queue, marked with why, rather than
+    silently dropped or force-applied.
+
+    Always returns (True, summary) — a per-fix failure is recorded on that fix's own
+    Firestore doc (so it stays visible/queued for the next Apply run) rather than
+    failing the whole batch.
+    """
+    extra_recipients = [notify["email"]] if notify and notify.get("email") else None
+    requested_by = (
+        f" requested_by={notify.get('name', '')} <{notify.get('email', '')}> "
+        f"({notify.get('department', '')}, {notify.get('company', '')})"
+        if notify else ""
+    )
+
+    pending = shipto_fixes.fetch_pending(companies)
+    applied: list[dict] = []
+    skipped: list[dict] = []
+    failed: list[dict] = []
+
+    for fix in pending:
+        fix_id = fix.get("id")
+        company = fix.get("company")
+        po_ref = fix.get("po_ref")
+        order_no = fix.get("order_no") or fix_id
+        ship_to_code = fix.get("ship_to_code")
+        try:
+            order = bc_client.v2_find_sales_order_by_external_doc_no(po_ref, company) if po_ref else None
+            if not order:
+                reason = "Order no longer found in BC"
+                skipped.append({"order_no": order_no, "reason": reason})
+                shipto_fixes.mark_failed(fix_id, reason)
+                continue
+            if order.get("shipToCode"):
+                reason = f"Already has Ship-to Code {order['shipToCode']!r} — skipped"
+                skipped.append({"order_no": order_no, "reason": reason})
+                shipto_fixes.mark_failed(fix_id, reason)
+                continue
+            if order.get("status") != "Open" or order.get("submittedBy") != _SUBMITTED_BY:
+                reason = f"No longer eligible (status={order.get('status')!r}, submittedBy={order.get('submittedBy')!r}) — skipped"
+                skipped.append({"order_no": order_no, "reason": reason})
+                shipto_fixes.mark_failed(fix_id, reason)
+                continue
+            status_code, body = bc_client.v2_patch_record("salesOrders", order["id"], {"shipToCode": ship_to_code}, company)
+            if status_code not in (200, 201):
+                raise RuntimeError(f"BC returned {status_code}: {body}")
+            shipto_fixes.mark_applied(fix_id)
+            applied.append({"order_no": order.get("number") or order_no, "ship_to_code": ship_to_code})
+        except Exception as exc:
+            logger.error(f"POUL SO shipto-fix: {order_no!r} failed: {exc}")
+            failed.append({"order_no": order_no, "error": str(exc)})
+            shipto_fixes.mark_failed(fix_id, str(exc))
+
+    context = f"companies={companies or 'all'}{requested_by}"
+    if applied or skipped or failed:
+        detail_lines = [f"  {a['order_no']} -> ship-to {a['ship_to_code']}" for a in applied]
+        if skipped:
+            detail_lines.append("")
+            detail_lines.append(f"Skipped (no longer eligible) — {len(skipped)}:")
+            detail_lines.extend(f"  - {s['order_no']}: {s['reason']}" for s in skipped)
+        if failed:
+            detail_lines.append("")
+            detail_lines.append(f"Failed — {len(failed)}:")
+            detail_lines.extend(f"  - {f['order_no']}: {f['error']}" for f in failed)
+        title = f"POUL SO Ship-to Fixes — {len(applied)} order(s) updated"
+        if skipped:
+            title += f", {len(skipped)} skipped"
+        if failed:
+            title += f", {len(failed)} failed"
+        notify_success(title=title, detail="\n".join(detail_lines), context=context, extra_recipients=extra_recipients)
+    else:
+        notify_success(
+            title="POUL SO Ship-to Fixes — nothing queued",
+            detail="No pending Ship-to Code fixes found.",
+            context=context, extra_recipients=extra_recipients,
+        )
+
+    summary = {
+        "fixes_applied": len(applied),
+        "fixes_skipped": len(skipped),
+        "fixes_failed": len(failed),
+    }
+    return True, summary
+
+
 def _run_backfill_from_cloudsql(
     companies: list[str],
     create_by: str,
@@ -1816,6 +1920,31 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             ok, summary = _run_backfill_from_cloudsql(companies, create_by, date_from, date_to, notify=notify)
         except Exception as exc:
             logger.error(f"POUL SO: Cloud SQL backfill run {run_id!r} crashed: {exc}")
+            reprocess_status.finish_run(run_id, status="error", summary={}, error=str(exc))
+            message.nack()
+            return
+        if ok:
+            reprocess_status.finish_run(run_id, status="done", summary=summary)
+            message.ack()
+        else:
+            message.nack()
+        return
+
+    if msg_type == "poul-so-shipto-patch-batch":
+        # Manual trigger (published by gcp-api) — applies every pending Ship-to Code fix
+        # queued from the /reconcile page's Missing Ship-To tab.
+        companies = data.get("companies") or None  # None = every company's pending fixes
+        notify = data.get("notify") or None
+        run_id = data.get("run_id") or None
+        logger.info(
+            f"POUL SO: ship-to fixes batch triggered for companies={companies or 'all'} "
+            f"notify={notify} run_id={run_id!r}"
+        )
+        reprocess_status.start_run(run_id, companies=companies or ["all"], notify=notify)
+        try:
+            ok, summary = _run_shipto_fixes_batch(companies, notify=notify)
+        except Exception as exc:
+            logger.error(f"POUL SO: ship-to fixes batch run {run_id!r} crashed: {exc}")
             reprocess_status.finish_run(run_id, status="error", summary={}, error=str(exc))
             message.nack()
             return

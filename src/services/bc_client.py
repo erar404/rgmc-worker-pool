@@ -695,6 +695,18 @@ def v2_find_sales_order_by_external_doc_no(po_ref: str, company_name: str) -> di
     return records[0] if records else None
 
 
+def v2_patch_record(table_endpoint: str, record_id: str, payload: dict, company_name: str):
+    """PATCH an existing record in any v2.0 RGMC custom API entity set — mirrors the
+    main API's bc_functions.rgmc_v2_update_record exactly (same If-Match: * header;
+    RGMC's AL extension pages require it even though no record here is ever actually
+    read with an ETag first)."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}({record_id})"
+    headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
+    resp = _bc_request("patch", url, json=payload, headers=headers)
+    return resp.status_code, _safe_json(resp)
+
+
 def v2_list_sales_order_lines(order_id: str, company_name: str) -> list:
     """GET every existing salesOrderLines for one order — used by the Cloud SQL sync
     path to avoid re-adding a line whose item is already on the order."""
