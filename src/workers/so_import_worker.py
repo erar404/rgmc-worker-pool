@@ -74,7 +74,7 @@ from difflib import SequenceMatcher
 from google.cloud import pubsub_v1
 
 from src import config
-from src.services import bc_client, gcp_api_client, shipto_fixes, so_buffer, so_buffer_history, so_buffer_overrides, reprocess_status
+from src.services import bc_client, gcp_api_client, shipto_fix_history, shipto_fixes, so_buffer, so_buffer_history, so_buffer_overrides, reprocess_status
 from src.services.send_mail import notify_error, notify_success, notify_warning
 
 logger = logging.getLogger("worker.so_import")
@@ -1325,7 +1325,7 @@ def _run_sync_from_cloudsql(
     return True, summary
 
 
-def _run_shipto_fixes_batch(companies: list[str] | None, notify: dict | None = None) -> tuple[bool, dict]:
+def _run_shipto_fixes_batch(companies: list[str] | None, notify: dict | None = None, run_id: str | None = None) -> tuple[bool, dict]:
     """Handle a poul-so-shipto-patch-batch message: apply every pending Ship-to Code fix
     queued from the /reconcile page's Missing Ship-To tab (rgmc-bc-api's POST
     .../so-buffer/shipto-fixes) — PATCHes each named Sales Order's Ship-to Code in BC.
@@ -1336,6 +1336,12 @@ def _run_shipto_fixes_batch(companies: list[str] | None, notify: dict | None = N
     batch actually running (the order could since have been fixed another way, or
     changed status). A stale fix is left in the queue, marked with why, rather than
     silently dropped or force-applied.
+
+    Every attempt (applied, skipped, or failed) is also appended to
+    shipto_fix_history — so_shipto_fixes_{env} only ever holds ONE doc per order_id
+    (reused across retries), so that append-only log is the only place a human can
+    search by PO ref/order number afterward to see what ship-to was actually applied,
+    when, and by whom — e.g. to find and correct a wrong link.
 
     Always returns (True, summary) — a per-fix failure is recorded on that fix's own
     Firestore doc (so it stays visible/queued for the next Apply run) rather than
@@ -1365,26 +1371,31 @@ def _run_shipto_fixes_batch(companies: list[str] | None, notify: dict | None = N
                 reason = "Order no longer found in BC"
                 skipped.append({"order_no": order_no, "reason": reason})
                 shipto_fixes.mark_failed(fix_id, reason)
+                shipto_fix_history.record_attempt(fix, "skipped", run_id=run_id, detail=reason)
                 continue
             if order.get("shipToCode"):
                 reason = f"Already has Ship-to Code {order['shipToCode']!r} — skipped"
                 skipped.append({"order_no": order_no, "reason": reason})
                 shipto_fixes.mark_failed(fix_id, reason)
+                shipto_fix_history.record_attempt(fix, "skipped", run_id=run_id, detail=reason)
                 continue
             if order.get("status") != "Open" or order.get("submittedBy") != _SUBMITTED_BY:
                 reason = f"No longer eligible (status={order.get('status')!r}, submittedBy={order.get('submittedBy')!r}) — skipped"
                 skipped.append({"order_no": order_no, "reason": reason})
                 shipto_fixes.mark_failed(fix_id, reason)
+                shipto_fix_history.record_attempt(fix, "skipped", run_id=run_id, detail=reason)
                 continue
             status_code, body = bc_client.v2_patch_record("salesOrders", order["id"], {"shipToCode": ship_to_code}, company)
             if status_code not in (200, 201):
                 raise RuntimeError(f"BC returned {status_code}: {body}")
             shipto_fixes.mark_applied(fix_id)
             applied.append({"order_no": order.get("number") or order_no, "ship_to_code": ship_to_code})
+            shipto_fix_history.record_attempt(fix, "applied", run_id=run_id)
         except Exception as exc:
             logger.error(f"POUL SO shipto-fix: {order_no!r} failed: {exc}")
             failed.append({"order_no": order_no, "error": str(exc)})
             shipto_fixes.mark_failed(fix_id, str(exc))
+            shipto_fix_history.record_attempt(fix, "failed", run_id=run_id, detail=str(exc))
 
     context = f"companies={companies or 'all'}{requested_by}"
     if applied or skipped or failed:
@@ -1942,7 +1953,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         )
         reprocess_status.start_run(run_id, companies=companies or ["all"], notify=notify)
         try:
-            ok, summary = _run_shipto_fixes_batch(companies, notify=notify)
+            ok, summary = _run_shipto_fixes_batch(companies, notify=notify, run_id=run_id)
         except Exception as exc:
             logger.error(f"POUL SO: ship-to fixes batch run {run_id!r} crashed: {exc}")
             reprocess_status.finish_run(run_id, status="error", summary={}, error=str(exc))
