@@ -1385,6 +1385,20 @@ def _run_shipto_fixes_batch(companies: list[str] | None, notify: dict | None = N
                 shipto_fixes.mark_failed(fix_id, reason)
                 shipto_fix_history.record_attempt(fix, "skipped", run_id=run_id, detail=reason)
                 continue
+            # BC's Ship-to Address table is scoped per customer — patching in a ship-to
+            # that belongs to a different customer than the order's own sellToCustomerNo
+            # is guaranteed to 404 (Internal_InvalidTableRelation). The queue-time caller
+            # already rejects an obvious mismatch; this is the defense-in-depth check for
+            # a fix queued before that validation existed, queued via a caller that
+            # skipped it, or one the order's customer changed under since.
+            ship_to_customer_no = (fix.get("ship_to_customer_no") or "").strip().upper()
+            order_customer_no = (order.get("sellToCustomerNo") or "").strip().upper()
+            if ship_to_customer_no and ship_to_customer_no != order_customer_no:
+                reason = f"Ship-to {ship_to_code!r} belongs to customer {fix.get('ship_to_customer_no')!r}, not this order's {order.get('sellToCustomerNo')!r} — skipped"
+                skipped.append({"order_no": order_no, "reason": reason})
+                shipto_fixes.mark_failed(fix_id, reason)
+                shipto_fix_history.record_attempt(fix, "skipped", run_id=run_id, detail=reason)
+                continue
             status_code, body = bc_client.v2_patch_record("salesOrders", order["id"], {"shipToCode": ship_to_code}, company)
             if status_code not in (200, 201):
                 raise RuntimeError(f"BC returned {status_code}: {body}")
