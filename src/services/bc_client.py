@@ -695,6 +695,26 @@ def v2_find_sales_order_by_external_doc_no(po_ref: str, company_name: str) -> di
     return records[0] if records else None
 
 
+def v2_get_sales_order_by_id(order_id: str, company_name: str) -> dict | None:
+    """Look up an existing v2.0 salesOrders record by its own BC SystemId (direct OData
+    key access) — unlike v2_find_sales_order_by_external_doc_no, this can never return
+    the WRONG order: externalDocumentNo (the PO ref) is not guaranteed unique per Sales
+    Order — multiple SOs can legitimately share one PO ref (e.g. a split/resubmitted
+    order) — so filtering by it and taking records[0] risks silently fetching (and, for
+    a caller that then PATCHes it, silently mutating) a completely different order than
+    the one actually intended. Returns None on a 404 (deleted) or any other non-2xx.
+    """
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/salesOrders({order_id})"
+    )
+    resp = _bc_request("get", url, headers=_auth_headers())
+    if not resp.ok:
+        return None
+    return _safe_json(resp)
+
+
 def v2_patch_record(table_endpoint: str, record_id: str, payload: dict, company_name: str):
     """PATCH an existing record in any v2.0 RGMC custom API entity set — mirrors the
     main API's bc_functions.rgmc_v2_update_record exactly (same If-Match: * header;

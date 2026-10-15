@@ -1330,18 +1330,26 @@ def _run_shipto_fixes_batch(companies: list[str] | None, notify: dict | None = N
     queued from the /reconcile page's Missing Ship-To tab (rgmc-bc-api's POST
     .../so-buffer/shipto-fixes) — PATCHes each named Sales Order's Ship-to Code in BC.
 
-    Re-checks each fix against BC immediately before patching (status still Open,
-    submittedBy still _SUBMITTED_BY, shipToCode still blank) rather than trusting the
-    queued snapshot — a fix can go stale between being queued on /reconcile and this
-    batch actually running (the order could since have been fixed another way, or
-    changed status). A stale fix is left in the queue, marked with why, rather than
-    silently dropped or force-applied.
+    Re-fetches each order fresh by its own order_id (BC SystemId, direct OData key
+    access via bc_client.v2_get_sales_order_by_id) — never by po_ref/externalDocumentNo,
+    which is NOT guaranteed unique per Sales Order (multiple SOs can share one PO ref,
+    e.g. a split/resubmitted order); looking it up that way and patching whichever
+    record came back first risked silently mutating a completely different order than
+    the one actually queued. Re-checks status still Open, submittedBy still
+    _SUBMITTED_BY, shipToCode still blank, and the ship-to's owning customer still
+    matches, rather than trusting the queued snapshot — a fix can go stale between being
+    queued on /reconcile and this batch actually running. A stale fix is left in the
+    queue, marked with why, rather than silently dropped or force-applied.
 
-    Every attempt (applied, skipped, or failed) is also appended to
+    Every attempt (applied, already_resolved, skipped, or failed) is also appended to
     shipto_fix_history — so_shipto_fixes_{env} only ever holds ONE doc per order_id
     (reused across retries), so that append-only log is the only place a human can
     search by PO ref/order number afterward to see what ship-to was actually applied,
-    when, and by whom — e.g. to find and correct a wrong link.
+    when, and by whom — e.g. to find and correct a wrong link. already_resolved is
+    distinct from applied: the order already had a Ship-to Code set by the time this
+    ran (some other way, not this fix) — the goal was still met, so it's cleared from
+    the pending queue the same as a real success, just recorded under its own outcome
+    so an audit later can tell the two apart.
 
     Always returns (True, summary) — a per-fix failure is recorded on that fix's own
     Firestore doc (so it stays visible/queued for the next Apply run) rather than
@@ -1356,17 +1364,23 @@ def _run_shipto_fixes_batch(companies: list[str] | None, notify: dict | None = N
 
     pending = shipto_fixes.fetch_pending(companies)
     applied: list[dict] = []
+    already_resolved: list[dict] = []
     skipped: list[dict] = []
     failed: list[dict] = []
 
     for fix in pending:
         fix_id = fix.get("id")
         company = fix.get("company")
-        po_ref = fix.get("po_ref")
+        order_id = fix.get("order_id")
         order_no = fix.get("order_no") or fix_id
         ship_to_code = fix.get("ship_to_code")
         try:
-            order = bc_client.v2_find_sales_order_by_external_doc_no(po_ref, company) if po_ref else None
+            # By order_id (BC SystemId), NOT by po_ref/externalDocumentNo — a PO ref is
+            # not guaranteed unique per Sales Order (multiple SOs can share one, e.g. a
+            # split/resubmitted order), so looking it up by po_ref and taking the first
+            # match could silently fetch — and then PATCH — a completely different
+            # order than the one this fix was actually queued for.
+            order = bc_client.v2_get_sales_order_by_id(order_id, company) if order_id else None
             if not order:
                 reason = "Order no longer found in BC"
                 skipped.append({"order_no": order_no, "reason": reason})
@@ -1374,10 +1388,20 @@ def _run_shipto_fixes_batch(companies: list[str] | None, notify: dict | None = N
                 shipto_fix_history.record_attempt(fix, "skipped", run_id=run_id, detail=reason)
                 continue
             if order.get("shipToCode"):
-                reason = f"Already has Ship-to Code {order['shipToCode']!r} — skipped"
-                skipped.append({"order_no": order_no, "reason": reason})
-                shipto_fixes.mark_failed(fix_id, reason)
-                shipto_fix_history.record_attempt(fix, "skipped", run_id=run_id, detail=reason)
+                # The order's own goal — having a Ship-to Code — is already met, just not
+                # by this fix (set another way: a different queued fix for the same
+                # order, a direct BC edit, etc.). This is NOT a failure to keep retrying:
+                # mark_applied (not mark_failed) clears it from the pending queue — it
+                # would never leave the Missing Ship-To search results again anyway,
+                # since that search itself filters on shipToCode being blank — and
+                # "already_resolved" is a distinct history outcome from "applied" so an
+                # audit later can tell "we patched this" from "this turned out to already
+                # be fine", instead of both looking identical, or this looking like an
+                # unresolved "skipped" problem that still needs attention.
+                reason = f"Already has Ship-to Code {order['shipToCode']!r} — goal already met, not by this fix"
+                already_resolved.append({"order_no": order_no, "ship_to_code": order["shipToCode"]})
+                shipto_fixes.mark_applied(fix_id)
+                shipto_fix_history.record_attempt(fix, "already_resolved", run_id=run_id, detail=reason)
                 continue
             if order.get("status") != "Open" or order.get("submittedBy") != _SUBMITTED_BY:
                 reason = f"No longer eligible (status={order.get('status')!r}, submittedBy={order.get('submittedBy')!r}) — skipped"
@@ -1412,8 +1436,12 @@ def _run_shipto_fixes_batch(companies: list[str] | None, notify: dict | None = N
             shipto_fix_history.record_attempt(fix, "failed", run_id=run_id, detail=str(exc))
 
     context = f"companies={companies or 'all'}{requested_by}"
-    if applied or skipped or failed:
+    if applied or already_resolved or skipped or failed:
         detail_lines = [f"  {a['order_no']} -> ship-to {a['ship_to_code']}" for a in applied]
+        if already_resolved:
+            detail_lines.append("")
+            detail_lines.append(f"Already resolved another way (goal met, just not by this fix) — {len(already_resolved)}:")
+            detail_lines.extend(f"  - {a['order_no']}: now has ship-to {a['ship_to_code']}" for a in already_resolved)
         if skipped:
             detail_lines.append("")
             detail_lines.append(f"Skipped (no longer eligible) — {len(skipped)}:")
@@ -1423,6 +1451,8 @@ def _run_shipto_fixes_batch(companies: list[str] | None, notify: dict | None = N
             detail_lines.append(f"Failed — {len(failed)}:")
             detail_lines.extend(f"  - {f['order_no']}: {f['error']}" for f in failed)
         title = f"POUL SO Ship-to Fixes — {len(applied)} order(s) updated"
+        if already_resolved:
+            title += f", {len(already_resolved)} already resolved another way"
         if skipped:
             title += f", {len(skipped)} skipped"
         if failed:
@@ -1437,6 +1467,7 @@ def _run_shipto_fixes_batch(companies: list[str] | None, notify: dict | None = N
 
     summary = {
         "fixes_applied": len(applied),
+        "fixes_already_resolved": len(already_resolved),
         "fixes_skipped": len(skipped),
         "fixes_failed": len(failed),
     }
