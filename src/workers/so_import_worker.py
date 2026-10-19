@@ -623,13 +623,26 @@ def _create_order(
         # same raw branch text turn out to need different customers (/reconcile's
         # Customers tab "Split…" action creates these). Checked most-specific first —
         # PO-scoped, then branch-scoped, then the flat name-only key — since each is a
-        # more specific statement of truth than the last; the flat key remains the
-        # fallback for a branch-less/blank-branch order or one never individually
-        # resolved. See /reconcile's Overrides tab, which labels a scoped override
-        # distinctly from a blanket one for the same reason this matters here: applying
-        # a blanket link derived from just one branch's (or PO's) resolution to every
-        # OTHER branch/PO sharing that customer name would silently misroute them
-        # whenever they actually belong to a different BC customer.
+        # more specific statement of truth than the last. See /reconcile's Overrides
+        # tab, which labels a scoped override distinctly from a blanket one for the
+        # same reason this matters here: applying a blanket link derived from just one
+        # branch's (or PO's) resolution to every OTHER branch/PO sharing that customer
+        # name would silently misroute them whenever they actually belong to a
+        # different BC customer.
+        #
+        # A FLAT (name-only) customer override gets no such free pass, though — unlike
+        # a branch override or a PO/branch-SCOPED customer override (both precise,
+        # human-verified for this exact context), a flat override was saved against
+        # whichever ONE branch happened to resolve it first, under a raw customer name
+        # BC itself may have split across more than one real Customer record (confirmed
+        # in production: "WALTERMART SUPERMARKET, INC." has multiple BC customers, each
+        # with its own ship-to addresses — a flat override saved for one branch doesn't
+        # verify it's also correct for a DIFFERENT branch sharing the identical name,
+        # and blindly trusting it produced real ship-to/customer mismatches on orders
+        # for branches it was never actually resolved against). So a flat override is
+        # only ever a FALLBACK HINT below, cross-checked against this branch's own
+        # automatic ship-to resolution — not trusted outright the way #1 and a scoped
+        # #2 both still are.
         branch_key = (header.get("customerBranchName") or "").strip().upper()
         customer_key = (header.get("customerName") or "").strip().upper()
         po_scoped_key = f"{customer_key}::PO:{po_ref.strip().upper()}" if po_ref else None
@@ -660,27 +673,27 @@ def _create_order(
                 f"Overrides tab (customerNo={customer_no!r}, shipToCode={ship_to_code!r})"
             )
             logger.info(f"PO {po_ref}: using reconcile-page branch link → customer={customer_no!r} shipTo={ship_to_code!r}")
-        elif resolved_customer.get("customerNo"):
+        elif resolved_customer.get("customerNo") and customer_scope_used:
+            # PO- or branch-SCOPED customer override — already precise for this exact
+            # context (same trust level as a branch override), so no ship-to cross-
+            # check needed; its shipToCode (reference metadata captured when this exact
+            # link was saved) is safe to reuse directly, unlike a flat override's.
             customer_no = resolved_customer["customerNo"]
-            # shipToCode here is reference metadata captured when this customer link was
-            # saved alongside a specific branch's ship-to resolution (see the /reconcile
-            # Overrides tab) — safe to reuse ONLY when resolved_customer came from a
-            # scoped (po or branch) match; a flat override's shipToCode belongs to
-            # whichever other branch/PO originally saved it, so it's left out (blank, as
-            # before) when the match came from the flat key instead.
-            ship_to_code = resolved_customer.get("shipToCode", "") if customer_scope_used else ""
-            if customer_scope_used == "po":
-                scope_note = ", scoped to this PO"
-            elif customer_scope_used == "branch":
-                scope_note = f", scoped to branch {header.get('customerBranchName')!r}"
-            else:
-                scope_note = ""
+            ship_to_code = resolved_customer.get("shipToCode", "")
+            scope_note = ", scoped to this PO" if customer_scope_used == "po" else f", scoped to branch {header.get('customerBranchName')!r}"
             resolution_source = (
                 f"the saved customer override for {header.get('customerName')!r} on /reconcile's "
                 f"Overrides tab (customerNo={customer_no!r}, shipToCode={ship_to_code!r}{scope_note})"
             )
             logger.info(f"PO {po_ref}: using reconcile-page customer link{scope_note} → customer={customer_no!r} shipTo={ship_to_code!r}")
         else:
+            # No branch override, and no SCOPED customer override either — resolve
+            # THIS branch's own ship-to first, before ever trusting a flat (name-only)
+            # customer override (resolved_customer here, if it has a customerNo, is
+            # necessarily flat — see the elif above). See the big comment block above
+            # for why a flat override can't be trusted outright: BC sometimes splits
+            # one raw customer name across more than one real Customer record, each
+            # with its own ship-to addresses.
             branch_code: str = (header.get("customerBranchLookUpCode") or "").strip().upper()
             branch_name: str = (header.get("customerBranchName") or "").strip()
 
@@ -696,13 +709,50 @@ def _create_order(
                 or ship_to_by_lookup_code.get(branch_code)
                 or _fuzzy_ship_to_lookup(branch_name, ship_to_by_name)
             )
-            if not ship_to_match:
+            flat_customer_no = (resolved_customer.get("customerNo") or "").strip() or None
+
+            if ship_to_match:
+                customer_no, ship_to_code = ship_to_match
+                if flat_customer_no and flat_customer_no.upper() != customer_no.strip().upper():
+                    # The exact ambiguity this whole branch exists to catch: a flat
+                    # customer-name override disagrees with what THIS branch's own
+                    # ship-to resolves to. The ship-to match wins — it's structurally
+                    # scoped to one real BC customer, not a name-based guess that may
+                    # have been saved against a different branch sharing this name.
+                    logger.warning(
+                        f"PO {po_ref}: flat customer override for {header.get('customerName')!r} points to "
+                        f"{flat_customer_no!r}, but branch {branch_name!r}'s own ship-to resolves to "
+                        f"{customer_no!r} instead — using the ship-to match, not the flat override (BC "
+                        f"likely has more than one Customer record sharing this name)"
+                    )
+                    resolution_source = (
+                        f"automatic ship-to matching for branch {branch_name!r} — overrides a flat "
+                        f"customer override on /reconcile's Overrides tab that pointed to a different "
+                        f"customer ({flat_customer_no!r})"
+                    )
+                else:
+                    resolution_source = f"automatic ship-to matching for branch {branch_name!r}" + (
+                        " (confirms the saved flat customer override)" if flat_customer_no else " (no saved override)"
+                    )
+                logger.info(f"PO {po_ref}: using ship-to match → customer={customer_no!r} shipTo={ship_to_code!r}")
+            elif flat_customer_no:
+                # Ship-to couldn't be resolved at all, and the only customer link on
+                # file is an unscoped (flat) override — buffer instead of guessing.
+                # Trusting the flat override here is exactly how a wrong-ship-to order
+                # slipped through before this check existed: an unscoped name-based
+                # link offers nothing to confirm it's correct for THIS branch.
+                raise ValueError(
+                    f"No ship-to address in BC for branch code={branch_code!r} / name={branch_name!r} "
+                    f"(company={company!r}) — not using the only customer link on file for "
+                    f"{header.get('customerName')!r} because it's an unscoped (flat) override, and BC may "
+                    f"have more than one Customer record sharing this name. Buffering instead of guessing; "
+                    f"resolve a branch- or PO-scoped link on /reconcile's Overrides tab instead."
+                )
+            else:
                 raise ValueError(
                     f"No ship-to address in BC for branch code={branch_code!r} / "
                     f"name={branch_name!r} (company={company!r})"
                 )
-            customer_no, ship_to_code = ship_to_match
-            resolution_source = f"automatic ship-to matching for branch {branch_name!r} (no saved override)"
 
         header_payload = _build_header_payload(header, customer_no, ship_to_code, location_code)
         h_status, h_data = bc_client.v2_create_record("salesOrders", header_payload, company)
