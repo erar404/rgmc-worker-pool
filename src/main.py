@@ -1,8 +1,12 @@
 """RGMC BC Worker Pool — Cloud Run Worker Pool entry point.
 
-Pulls messages from two Pub/Sub subscriptions:
-  • PUBSUB_ORDER_SUBSCRIPTION  →  order submission to Business Central
-  • PUBSUB_SYNC_SUBSCRIPTION   →  Firestore catalog/price sync
+Pulls messages from four Pub/Sub subscriptions:
+  • PUBSUB_ORDER_SUBSCRIPTION   →  order submission to Business Central
+  • PUBSUB_SYNC_SUBSCRIPTION    →  Firestore catalog/price sync
+  • PUBSUB_POUL_SO_SUBSCRIPTION →  POUL Sales Order import (fed by bigquery_bridge_worker below)
+  • PUBSUB_BRIDGE_SUBSCRIPTION  →  BigQuery-to-MSSQL bridge runs (ported from rgmc-gcp-api;
+                                    see that repo's handoff.md, "Move bigquery_bridge heavy
+                                    work to worker pool")
 
 A lightweight HTTP server on PORT handles Cloud Run liveness/readiness probes.
 No FastAPI. No public endpoints. No inbound HTTP beyond health checks.
@@ -14,7 +18,7 @@ import threading
 from src import config
 from src.logger import logger
 from src.health import start as start_health_server
-from src.workers import order_worker, sync_worker, so_import_worker
+from src.workers import order_worker, sync_worker, so_import_worker, bigquery_bridge_worker
 
 
 def main() -> None:
@@ -29,6 +33,7 @@ def main() -> None:
     order_future = order_worker.start()
     sync_future = sync_worker.start()
     so_import_future = so_import_worker.start()
+    bridge_future = bigquery_bridge_worker.start()
 
     stop = threading.Event()
 
@@ -37,6 +42,7 @@ def main() -> None:
         order_future.cancel()
         sync_future.cancel()
         so_import_future.cancel()
+        bridge_future.cancel()
         stop.set()
 
     signal.signal(signal.SIGTERM, _shutdown)

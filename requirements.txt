@@ -2,4 +2,14 @@ requests==2.32.3
 google-cloud-firestore==2.20.1
 google-cloud-storage==2.19.0
 google-cloud-pubsub==2.21.1
-google-cloud-bigquery==3.27.0
+google-cloud-bigquery==3.38.0
+protobuf==6.33.1
+
+# BigQuery bridge worker (src/services/bigquery_bridge.py, ported from rgmc-gcp-api) --
+# pins mirror rgmc-gcp-api's own requirements.txt, a known-working combination there.
+pandas==2.3.3
+pandas-gbq==0.31.0
+db-dtypes==1.4.4
+SQLAlchemy==2.0.46
+sqlalchemy-pytds==0.3.5
+cloud-sql-python-connector==1.18.5
