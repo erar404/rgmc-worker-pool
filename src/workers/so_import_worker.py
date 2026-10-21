@@ -235,7 +235,11 @@ def _build_line_payload(
     pcs = _is_pcs(uom_raw)
 
     qty = _resolve_line_qty(line)
-    unit_price = _safe_float(line.get("unitPricePcs") if pcs else line.get("unitPrice"))
+    # Net price (post-discount) is the real basis for what BC should charge — unit
+    # price alone ignores whatever discount Document AI also extracted. Falls back to
+    # unit price when net price is 0 (not every PO has a net price extracted).
+    net_price = _safe_float(line.get("netPricePcs") if pcs else line.get("netPrice"))
+    unit_price = net_price or _safe_float(line.get("unitPricePcs") if pcs else line.get("unitPrice"))
     # A saved /reconcile "Unit of Measure" override — a human confirming the actual BC
     # UOM Code for this item (looked up against BC's own Item Unit of Measure table) —
     # always wins over the blind CS/PCS keyword guess below, the same way a saved SKU
