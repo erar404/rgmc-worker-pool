@@ -88,7 +88,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         # Permanent failure — don't retry, store the error
         update_task(task_id, status="failed", error=str(e))
         logger.error(f"Task {task_id} permanent failure: {e}")
-        notify_error(
+        notify_error(module="order_task", 
             title=f"Order Task Failed — {task_id}",
             detail=str(e),
             context=f"company={company} order_type={order_type}",
@@ -102,7 +102,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             message.nack()  # Pub/Sub will redeliver
         else:
             update_task(task_id, status="failed", error=err_str)
-            notify_error(
+            notify_error(module="order_task", 
                 title=f"Order Task Error — {task_id}",
                 detail=err_str,
                 context=f"company={company} order_type={order_type}",

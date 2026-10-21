@@ -77,9 +77,9 @@ class BigqueryBridge(object):
         title = f"BigQuery Bridge {'Error' if category == 'ERROR' else 'Complete'} — {self.__group_code}"
         context = f"method={self.__method}"
         if category == "ERROR":
-            notify_error(title=title, detail=self.__log_body, context=context)
+            notify_error(module="bigquery_bridge", title=title, detail=self.__log_body, context=context)
         else:
-            notify_success(title=title, detail=self.__log_body, context=context)
+            notify_success(module="bigquery_bridge", title=title, detail=self.__log_body, context=context)
 
     def __get_last_run_timestamp(self):
         """Get the last run timestamp from MSSQL table."""

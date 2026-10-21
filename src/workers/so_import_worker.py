@@ -74,7 +74,7 @@ from difflib import SequenceMatcher
 from google.cloud import pubsub_v1
 
 from src import config
-from src.services import bc_client, gcp_api_client, shipto_fix_history, shipto_fixes, so_buffer, so_buffer_history, so_buffer_overrides, reprocess_status
+from src.services import bc_client, gcp_api_client, sbic_db, shipto_fix_history, shipto_fixes, so_buffer, so_buffer_history, so_buffer_overrides, reprocess_status
 from src.services.send_mail import notify_error, notify_success, notify_warning
 
 logger = logging.getLogger("worker.so_import")
@@ -1008,6 +1008,15 @@ def _buffer_status_note(attempt_count: int | None) -> str:
     return "  [buffered for retry]"
 
 
+_RESOLUTION_TIER_LABELS: dict[str | None, str] = {
+    "customer_branch_match": "CustomerBranch match (structured, new)",
+    "branch_override": "saved branch override",
+    "customer_override": "saved customer override",
+    "automatic_ship_to_match": "automatic ship-to match",
+    None: "resumed order — no new resolution",
+}
+
+
 def _send_batch_notification(
     successes: list[dict],
     errors: list[dict],
@@ -1035,16 +1044,29 @@ def _send_batch_notification(
         count = len(successes)
         total_created = sum(r["lines_created"] for r in successes)
         total_skipped = sum(r["lines_skipped"] for r in successes)
+        # Breakdown by which tier resolved each order's customer/ship-to — lets a
+        # recipient see at a glance how much of this batch the new structured
+        # CustomerBranch match (see so_import_worker.py's _create_order) is actually
+        # handling vs. falling through to a saved override or the older automatic/fuzzy
+        # ship-to match.
+        tier_counts: dict[str | None, int] = {}
+        for r in successes:
+            tier_counts[r.get("resolution_tier")] = tier_counts.get(r.get("resolution_tier"), 0) + 1
+        tier_summary = ", ".join(
+            f"{_RESOLUTION_TIER_LABELS.get(tier, tier)}: {n}" for tier, n in tier_counts.items()
+        )
         order_lines = []
         for r in successes:
             customer_str = r["customer_name"]
             if r["branch_name"]:
                 customer_str += f" — {r['branch_name']}"
             tag = "  [retried from buffer]" if r.get("from_buffer") else ""
+            tier_label = _RESOLUTION_TIER_LABELS.get(r.get("resolution_tier"), r.get("resolution_tier"))
             order_lines.append(
                 f"  PO Ref        : {r['po_ref']}{tag}\n"
                 f"  BC Order No.  : {r['order_no']}\n"
                 f"  Customer      : {customer_str}\n"
+                f"  Resolved Via  : {tier_label}\n"
                 f"  PO Date       : {r['po_date']}\n"
                 f"  Delivery Date : {r['delivery_date']}\n"
                 f"  Lines Created : {r['lines_created']}  |  Lines Skipped : {r['lines_skipped']}"
@@ -1053,6 +1075,7 @@ def _send_batch_notification(
             f"Orders Created  : {count}\n"
             f"Total Lines In  : {total_created}\n"
             f"Total Skipped   : {total_skipped}\n"
+            f"Resolved Via    : {tier_summary}\n"
             "\n\n"
             + "\n\n".join(order_lines)
         )
@@ -1064,14 +1087,14 @@ def _send_batch_notification(
         title = f"{label} — {count} order{'s' if count != 1 else ''} created"
         if errors:
             title += f", {len(errors)} failed"
-        notify_success(title=title, detail=detail, context=context, extra_recipients=extra_recipients)
+        notify_success(module="poul_so_import", title=title, detail=detail, context=context, extra_recipients=extra_recipients)
 
     elif errors:
         detail = "\n".join(
             f"  - {e['po_ref']}: {e['error']}{_buffer_status_note(e.get('attempt_count'))}"
             for e in errors
         )
-        notify_error(
+        notify_error(module="poul_so_import", 
             title=f"{label} Failed — {len(errors)} order{'s' if len(errors) != 1 else ''}",
             detail=detail,
             context=context,
@@ -1128,7 +1151,7 @@ def _send_unmatched_items_notification(
         + "\n\n".join(order_lines)
     )
     count = len(flagged)
-    notify_warning(
+    notify_warning(module="poul_so_import", 
         title=f"{label} — {count} order{'s' if count != 1 else ''} inserted with unmatched items",
         detail=detail,
         context=context,
@@ -1415,9 +1438,9 @@ def _run_sync_from_cloudsql(
             title += f", {len(not_found)} not found in BC"
         if errored:
             title += f", {len(errored)} errored"
-        notify_success(title=title, detail="\n".join(detail_lines), context=context, extra_recipients=extra_recipients)
+        notify_success(module="poul_so_import", title=title, detail="\n".join(detail_lines), context=context, extra_recipients=extra_recipients)
     else:
-        notify_success(
+        notify_success(module="poul_so_import", 
             title="POUL SO Cloud SQL Sync — nothing to sync",
             detail=f"No CustomerPOUL rows found with create_by={create_by!r}.",
             context=context,
@@ -1566,9 +1589,9 @@ def _run_shipto_fixes_batch(companies: list[str] | None, notify: dict | None = N
             title += f", {len(skipped)} skipped"
         if failed:
             title += f", {len(failed)} failed"
-        notify_success(title=title, detail="\n".join(detail_lines), context=context, extra_recipients=extra_recipients)
+        notify_success(module="poul_so_import", title=title, detail="\n".join(detail_lines), context=context, extra_recipients=extra_recipients)
     else:
-        notify_success(
+        notify_success(module="poul_so_import", 
             title="POUL SO Ship-to Fixes — nothing queued",
             detail="No pending Ship-to Code fixes found.",
             context=context, extra_recipients=extra_recipients,
@@ -1730,14 +1753,14 @@ def _run_backfill_from_cloudsql(
         label="POUL SO Cloud SQL Backfill", notify=notify,
     )
     if skipped_existing:
-        notify_success(
+        notify_success(module="poul_so_import", 
             title=f"POUL SO Cloud SQL Backfill — {len(skipped_existing)} PO(s) skipped (already in BC)",
             detail="\n".join(f"  - {ref}" for ref in skipped_existing),
             context=f"companies={companies} create_by={create_by!r} date_from={date_from!r} date_to={date_to!r}{requested_by}",
             extra_recipients=extra_recipients,
         )
     if not total_headers_considered:
-        notify_success(
+        notify_success(module="poul_so_import", 
             title="POUL SO Cloud SQL Backfill — nothing to backfill",
             detail=f"No CustomerPOUL rows found with create_by={create_by!r} "
                    f"date_from={date_from!r} date_to={date_to!r}.",
@@ -1858,7 +1881,7 @@ def _run_batch(
         logger.error(f"POUL SO pre-fetch failed (company={company!r}): {e}")
         if any(sig in err_str for sig in _TRANSIENT_SIGNALS):
             return False, dict(_EMPTY_SUMMARY)
-        notify_error(
+        notify_error(module="poul_so_import", 
             title=f"{label} Error — BC pre-fetch failed",
             detail=err_str,
             context=f"company={company} src_company={src_company}{requested_by}",
@@ -1888,24 +1911,37 @@ def _run_batch(
 
     # customerBranchId never travels through the BigQuery bridge's Pub/Sub message
     # (mappings_bridge.py only ever maps customerBranchName/customerBranchLookUpCode,
-    # never the numeric FK) — a fresh CustomerPOUL-by-poRefNumber lookup, batched for
-    # the whole pass, is the only way to get it for _create_order's structured
-    # CustomerBranch-based match tier. Stamped onto each header fresh every pass, same
-    # as every override fetch above — never cached stale from a previous run.
-    po_refs = [o["header"].get("poRefNumber") for o in all_orders if o["header"].get("poRefNumber")]
-    poul_by_ref = gcp_api_client.fetch_customerpoul_by_refs(po_refs)
-    for order_item in all_orders:
-        po_ref_lookup = order_item["header"].get("poRefNumber")
-        poul_row = poul_by_ref.get(po_ref_lookup) if po_ref_lookup else None
-        if poul_row and poul_row.get("customerBranchId") is not None:
-            order_item["header"]["customerBranchId"] = poul_row["customerBranchId"]
-    branch_ids = {
-        o["header"].get("customerBranchId") for o in all_orders if o["header"].get("customerBranchId") is not None
-    }
-    branch_rows = gcp_api_client.fetch_customer_branches(list(branch_ids))
-    branch_code_by_id = {
-        bid: (row.get("customerBranchCode") or "").strip() for bid, row in branch_rows.items()
-    }
+    # never the numeric FK) — resolved here directly from that raw customerName/
+    # customerBranchName text via sbic_db.resolve_customer_id/resolve_branch, which
+    # replicate sbic_prod's own tr_CustomerPOBQ trigger (Customer -> CustomerBranch
+    # matching, including its hardcoded per-customer branch overrides) over a direct
+    # MSSQL connection — no CustomerPOUL round trip through rgmc-gcp-api needed just to
+    # recover a customerBranchId that _create_order's structured-match tier immediately
+    # throws away anyway (it only ever reads customerBranchCode/lookUpCode). Customer/
+    # CustomerBranch rows are fetched fresh once per pass, same as every override fetch
+    # above — never cached stale from a previous run.
+    active_customers = sbic_db.fetch_active_customers()
+    customer_id_by_order: dict[int, int] = {}
+    seen_customer_ids: set[int] = set()
+    for i, order_item in enumerate(all_orders):
+        header = order_item["header"]
+        customer_id = sbic_db.resolve_customer_id(header.get("customerName", ""), active_customers)
+        if customer_id is not None:
+            customer_id_by_order[i] = customer_id
+            seen_customer_ids.add(customer_id)
+    all_branches = sbic_db.fetch_customer_branches(list(seen_customer_ids)) if seen_customer_ids else []
+    branch_code_by_id: dict[int, str] = {}
+    for i, order_item in enumerate(all_orders):
+        customer_id = customer_id_by_order.get(i)
+        if customer_id is None:
+            continue
+        header = order_item["header"]
+        resolved = sbic_db.resolve_branch(customer_id, header.get("customerBranchName", ""), all_branches)
+        if resolved["customerBranchId"] is not None:
+            header["customerBranchId"] = resolved["customerBranchId"]
+            branch_code_by_id[resolved["customerBranchId"]] = resolved["customerBranchCode"]
+            if resolved["lookUpCode"]:
+                header.setdefault("customerBranchLookUpCode", resolved["lookUpCode"])
 
     # A buffered order's lines normally already carry resolvedItem (apply_resolution_to_buffer
     # patches it on save), but a fresh inbound order never does, and a buffer doc saved before
@@ -1924,7 +1960,7 @@ def _run_batch(
 
     if not all_orders:
         logger.info(f"POUL SO: nothing to do for company={company!r} (no fresh orders, empty buffer)")
-        notify_success(
+        notify_success(module="poul_so_import", 
             title=f"{label} — {company}: nothing to retry",
             detail=f"Firestore buffer for company={company!r} is empty; no orders were reprocessed.",
             context=f"company={company} src_company={src_company}{requested_by}",

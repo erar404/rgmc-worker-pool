@@ -38,6 +38,13 @@ Message formats (JSON):
   see the bq-sync-ile note above — Airbyte now owns BigQuery for itemLedgerEntries):
     { "type": "backfill-ile-columns", "company": "RGMC", "since_date": "YYYY-MM-DD" }
 
+  Validate consignment-app session_history_{env} records against BC, patching an
+  inBc/inBcStatus flag on each doc (see session_history_verify_service.py). Moved here
+  from rgmc-bc-api because the full collection is too large to validate inside one
+  synchronous HTTP request. force=true re-verifies everything, not just unchecked/
+  pending records; limit caps how many records this run processes:
+    { "type": "verify-session-history", "force": false, "limit": 5000 }
+
   Connectivity test (bc-api → worker pool):
     { "type": "ping", "sent_at": "ISO8601", "sent_by": "bc-api", "note": "optional" }
 
@@ -113,6 +120,7 @@ from src.services.price_overlay import (
     compact_index_lines,
     is_ic_code,
 )
+from src.services.session_history_verify_service import backfill_validate as verify_session_history
 # bigquery_ile_service is disabled 2026-09-22 — Airbyte's itemLedgerEntries stream now
 # writes directly to bc_*_raw.itemLedgerEntries from BC, superseding this worker-pool
 # path. Kept importable for reference/rollback; not called anywhere below.
@@ -545,7 +553,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                 companies = get_all_company_names()
             for company in companies:
                 _sync_company(company, on_date, page_size)
-            notify_success(
+            notify_success(module="sync_worker", 
                 title="Routine Sync Complete",
                 detail="\n".join(companies),
                 context=f"on_date={on_date}",
@@ -554,7 +562,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         elif msg_type == "sync-item-prices":
             company = data.get("company") or config.BC_COMPANY
             _sync_company(company, on_date, page_size)
-            notify_success(
+            notify_success(module="sync_worker", 
                 title=f"Item Prices Sync Complete — {company}",
                 detail=f"Company: {company}",
                 context=f"on_date={on_date}",
@@ -569,7 +577,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             if headers:
                 set_sync_state(company, "price_list_headers", sync_start)
             logger.info(f"[{company}] {written} price list headers written")
-            notify_success(
+            notify_success(module="sync_worker", 
                 title=f"Price List Headers Sync Complete — {company}",
                 detail=f"Company: {company}\n{written} headers written to Firestore",
                 context="full",
@@ -602,7 +610,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                     set_sync_state(c, "price_list_headers", sync_start)
                 logger.info(f"[{c}] {company_total} price list items written total")
                 total += company_total
-            notify_success(
+            notify_success(module="sync_worker", 
                 title=f"Price List Items Sync Complete — {company}",
                 detail=f"Companies: {', '.join(companies)}\n{total} items written to Firestore",
                 context=f"price_list_code={price_list_code or 'all'}",
@@ -615,7 +623,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             total = 0
             for c in companies:
                 total += _sync_item_ledger_entries(c, since_date=since_date)
-            notify_success(
+            notify_success(module="sync_worker", 
                 title=f"Item Ledger Entries Sync Complete — {company}",
                 detail=f"Companies: {', '.join(companies)}\n{total} records written to Firestore",
                 context=f"since_date={since_date or 'full'}",
@@ -630,7 +638,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                 logger.info(f"[{c}] backfill-family-codes: {len(records)} records from BC — patching Firestore familyCode")
                 if not records:
                     logger.warning(f"[{c}] backfill-family-codes: BC returned 0 records — nothing to patch")
-                    notify_success(
+                    notify_success(module="sync_worker", 
                         title=f"Family Code Backfill Skipped — {c}",
                         detail=f"Company: {c}\nBC returned 0 records for on_date={on_date} — Firestore unchanged.",
                         context=f"on_date={on_date}",
@@ -642,7 +650,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                         f"{result['skipped_missing_product_no']} skipped (no productNo), "
                         f"{result.get('skipped_no_family_code', 0)} skipped (no familyCode from BC)"
                     )
-                    notify_success(
+                    notify_success(module="sync_worker", 
                         title=f"Family Code Backfill Complete — {c}",
                         detail=(
                             f"Company: {c}\n"
@@ -675,7 +683,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                     f"[{c}] backfill-item-prices complete: {result['patched']} patched "
                     f"(price_list_code={price_list_code or 'all'})"
                 )
-                notify_success(
+                notify_success(module="sync_worker", 
                     title=f"Item Prices Backfill Complete — {c}",
                     detail=(
                         f"Company: {c}\n"
@@ -694,7 +702,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                 "bq-sync-ile received but is disabled — Airbyte's itemLedgerEntries "
                 "stream now owns this sync. Message acked without action."
             )
-            notify_success(
+            notify_success(module="sync_worker", 
                 title="BQ ILE Sync Skipped (disabled)",
                 detail=(
                     "bq-sync-ile is disabled as of 2026-09-22 — Airbyte's itemLedgerEntries "
@@ -741,7 +749,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         #             (["=== FAILED ==="] + error_lines)
         #             + (["\n=== SUCCEEDED ==="] + success_lines if success_lines else [])
         #         )
-        #         notify_error(
+        #         notify_error(module="sync_worker", 
         #             title=f"BQ ILE Sync {'Partial Failure' if inserted_by_company else 'Failed'} — {company}",
         #             detail=detail,
         #             context=context,
@@ -749,7 +757,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         #     else:
         #         total = sum(inserted_by_company.values())
         #         lines = [_company_line(c) for c in inserted_by_company]
-        #         notify_success(
+        #         notify_success(module="sync_worker", 
         #             title=f"BQ ILE Sync Complete — {company}",
         #             detail=f"Total rows inserted: {total}\n\n" + "\n".join(lines),
         #             context=context,
@@ -775,7 +783,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             ]
             if errors:
                 error_lines = [f"{c}: {err}" for c, err in errors.items()]
-                notify_error(
+                notify_error(module="sync_worker", 
                     title=f"ILE Column Backfill {'Partial Failure' if results else 'Failed'} — {company}",
                     detail="\n".join(
                         ["=== FAILED ==="] + error_lines
@@ -784,11 +792,31 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                     context=f"since_date={since_date or 'full'}",
                 )
             else:
-                notify_success(
+                notify_success(module="sync_worker", 
                     title=f"ILE Column Backfill Complete — {company}",
                     detail=f"Total: {total_fs} Firestore docs patched, {total_bq} BQ rows upserted\n\n" + "\n".join(detail_lines),
                     context=f"since_date={since_date or 'full'} columns={sorted(_ILE_BACKFILL_COLUMNS)}",
                 )
+
+        elif msg_type == "verify-session-history":
+            force = bool(data.get("force", False))
+            limit = data.get("limit")
+            result = verify_session_history(force=force, limit=limit)
+            counts = result["counts"]
+            detail = (
+                f"Total records: {result['total']}\n"
+                f"Already verified (skipped): {result['skipped_already_verified']}\n"
+                f"Processed this run: {result['processed']}\n\n"
+                + "\n".join(f"{k}: {v}" for k, v in counts.items())
+            )
+            notify_success(module="sync_worker",
+                title="Session History Verification Complete",
+                detail=detail,
+                context=(
+                    f"force={force} limit={limit} "
+                    f"not_found={counts.get('not_found', 0)} needs_review={counts.get('needs_review', 0)}"
+                ),
+            )
 
         elif msg_type == "ping":
             sent_at = data.get("sent_at", "unknown")
@@ -797,7 +825,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             detail = f"Ping received from {sent_by}.\nSent at: {sent_at}"
             if note:
                 detail += f"\nNote: {note}"
-            notify_success(
+            notify_success(module="sync_worker", 
                 title="Worker Pool Ping ACK",
                 detail=detail,
                 context=f"subscription={config.PUBSUB_SYNC_SUBSCRIPTION}",
@@ -811,7 +839,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
 
     except Exception as e:
         logger.error(f"Sync message failed (type={msg_type!r}): {e}")
-        notify_error(
+        notify_error(module="sync_worker", 
             title=f"Sync Worker Error — {msg_type}",
             detail=str(e),
             context=f"on_date={on_date} page_size={page_size}",

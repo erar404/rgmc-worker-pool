@@ -695,6 +695,27 @@ def v2_find_sales_order_by_external_doc_no(po_ref: str, company_name: str) -> di
     return records[0] if records else None
 
 
+def v2_list_records_by_filter(table_endpoint: str, odata_filter: str, company_name: str) -> list:
+    """Generic OData $filter query against any v2.0 RGMC custom API entity set.
+
+    Unlike v2_find_sales_order_by_number/v2_find_sales_order_by_external_doc_no (which
+    are sales-orders-specific and return a single record), this returns the full match
+    list and works against any table (e.g. salesReturnOrders too) — used by
+    session_history_verify_service, which needs both "does exactly one match exist"
+    (number lookup) and "how many candidates match" (customer+date fallback, where more
+    than one match must be treated as ambiguous, not guessed at).
+    """
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/{table_endpoint}?$filter={odata_filter}"
+    )
+    resp = _bc_request("get", url, headers=_auth_headers())
+    if not resp.ok:
+        return []
+    return _safe_json(resp).get("value", [])
+
+
 def v2_get_sales_order_by_id(order_id: str, company_name: str) -> dict | None:
     """Look up an existing v2.0 salesOrders record by its own BC SystemId (direct OData
     key access) — unlike v2_find_sales_order_by_external_doc_no, this can never return
