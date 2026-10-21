@@ -315,21 +315,25 @@ def _resolve_valid_lines(
             dropped_inactive.append({"sku": sku_raw, "description": desc, "line": line})
             continue
 
-        # A reconcile-page SKU link always wins over ref_map lookup — resolvedItem is
-        # the denormalized copy rgmc-bc-api's apply_resolution_to_buffer writes onto this
-        # exact line when a human resolves its SKU group on /reconcile. Previously written
-        # but never read back here, so a resolved SKU link never actually changed the retry.
-        resolved_item: dict = line.get("resolvedItem") or {}
-        item_no: str | None = resolved_item.get("itemNo")
+        # A BC Item Reference match (referenceType="Customer", customerSKUCode ==
+        # referenceNo) now wins first — it's a structured, auditable match straight off
+        # BC's own master data. A reconcile-page SKU link (resolvedItem — the
+        # denormalized copy rgmc-bc-api's apply_resolution_to_buffer writes onto this
+        # exact line when a human resolves its SKU group on /reconcile) is only
+        # consulted as a fallback when ref_map has nothing for this SKU.
+        item_no: str | None = ref_map.get(sku) if sku else None
         if item_no:
-            logger.info(f"PO {po_ref} line {i}: using reconcile-page SKU link → item={item_no!r}")
-        elif not sku:
-            logger.warning(f"PO {po_ref} line {i}: empty SKU — invalid")
-            skipped.append({"sku": "", "description": desc, "reason": "no_bc_match", "line": line})
-            continue
+            logger.info(f"PO {po_ref} line {i}: matched BC item reference → item={item_no!r}")
         else:
-            item_no = ref_map.get(sku)
-            if not item_no:
+            resolved_item: dict = line.get("resolvedItem") or {}
+            item_no = resolved_item.get("itemNo")
+            if item_no:
+                logger.info(f"PO {po_ref} line {i}: using reconcile-page SKU link → item={item_no!r}")
+            elif not sku:
+                logger.warning(f"PO {po_ref} line {i}: empty SKU — invalid")
+                skipped.append({"sku": "", "description": desc, "reason": "no_bc_match", "line": line})
+                continue
+            else:
                 logger.warning(
                     f"PO {po_ref} line {i}: SKU {sku!r} not found in item references — invalid"
                 )
@@ -501,12 +505,20 @@ def _create_order(
     inactive_skus: set[str] | None = None,
     uom_overrides: dict[str, dict] | None = None,
     existing_so_number: str | None = None,
+    ship_to_by_legacy_code: dict[str, tuple[str, str]] | None = None,
+    branch_code_by_id: dict[int, str] | None = None,
 ) -> dict:
     """Create (or resume) one BC Sales Order and return a result summary dict.
 
     ship_to_by_code / ship_to_by_lookup_code / ship_to_by_name map upper-cased branch
     code / lookup code / name → (customer_no, ship_to_code). ref_map is pre-fetched by
     the caller for the whole batch.
+
+    ship_to_by_legacy_code: upper-cased ship-to legacyCode → (customer_no, ship_to_code)
+    — see _build_ship_to_maps. branch_code_by_id: customerBranchId → CustomerBranch's
+    own customerBranchCode (the sbic_prod "Legacy Code"), pre-fetched by the caller for
+    every branch ID in the batch. Both feed the structured CustomerBranch-based match
+    tried before everything else below — see that tier's own comment.
 
     branch_overrides / customer_overrides: so_buffer_overrides.fetch_branch_overrides()
     / fetch_customer_overrides() — every saved reconcile-page branch/customer link,
@@ -539,6 +551,12 @@ def _create_order(
     """
     po_ref: str = header.get("poRefNumber", "unknown")
     base_line_no = 0
+    # Both set alongside customer_no/ship_to_code below, fresh-order path only — a
+    # resumed order's customer/ship-to was already resolved on a previous pass, so
+    # there's nothing new to report; stays None so the batch-notification email can
+    # tell "resumed, no new resolution" apart from every fresh-resolution tier.
+    resolution_source: str | None = None
+    resolution_tier: str | None = None
 
     if not existing_so_number:
         # Defensive fresh check — the caller may not already know about an order
@@ -592,171 +610,202 @@ def _create_order(
         # (CustomerPOULDetail, int_document_ai_detail, or anywhere else).
         existing_item_nos = {l.get("number") for l in existing_lines if l.get("number")}
     else:
-        # ── Customer lookup via Ship-to Address ───────────────────────────────
-        # A reconcile-page link always wins over automatic matching. Two independent
-        # sources feed resolved_ship_to/resolved_customer:
-        #   1. branch_overrides / customer_overrides — the saved override, fetched
-        #      fresh from so_buffer_overrides_{env} by the caller for this whole pass
-        #      (so_buffer_overrides.fetch_branch_overrides/fetch_customer_overrides).
-        #   2. header.resolvedShipTo / header.resolvedCustomer — denormalized copies
-        #      rgmc-bc-api's apply_resolution_to_buffer writes directly onto a buffer
-        #      doc at the moment a human resolves it on /reconcile.
-        # #1 takes priority over #2 — a buffer doc's denormalized field is a one-time
-        # patch applied only to the buffer_ids known at save time, so if a user later
-        # re-links the same branch/customer text to a different value (the UI's
-        # "Change…" action) while some buffer doc with the OLD patched value was missed
-        # by that save (e.g. page wasn't refreshed, or the doc didn't exist/was
-        # recreated after the first link), the doc keeps the stale value forever and
-        # #2-first would silently keep routing to the wrong customer/ship-to on every
-        # retry, with no error. #1 is always the current truth for that branch/customer
-        # text (fetch_branch_overrides/fetch_customer_overrides re-read it fresh on
-        # every pass — same self-healing pattern _apply_sku_overrides already uses for
-        # SKU links), so it must win whenever it has a value. #2 only still matters as
-        # a fallback for a buffer doc whose branch/customer text no longer has ANY
-        # saved override (e.g. the override was deleted outright via /reconcile's
-        # "unlink", but the doc was already patched beforehand).
-        # resolvedShipTo (customerNo + shipToCode) takes priority since it pins the
-        # exact ship-to; resolvedCustomer alone (no branch link saved) still lets the
-        # order in with just a customer, no ship-to code.
-        #
-        # A "customer" override's key can also be scoped — "{name}::{branch}" or
-        # "{name}::PO:{ref}" (see rgmc-bc-api's so_buffer_service._customer_key_parts)
-        # — for a customer name BC has split across more than one Customer record, one
-        # per branch/ship-to (a retail chain set up as a separate customer per store,
-        # say) or, more rarely, one per individual PO when even two orders sharing the
-        # same raw branch text turn out to need different customers (/reconcile's
-        # Customers tab "Split…" action creates these). Checked most-specific first —
-        # PO-scoped, then branch-scoped, then the flat name-only key — since each is a
-        # more specific statement of truth than the last. See /reconcile's Overrides
-        # tab, which labels a scoped override distinctly from a blanket one for the
-        # same reason this matters here: applying a blanket link derived from just one
-        # branch's (or PO's) resolution to every OTHER branch/PO sharing that customer
-        # name would silently misroute them whenever they actually belong to a
-        # different BC customer.
-        #
-        # A FLAT (name-only) customer override gets no such free pass, though — unlike
-        # a branch override or a PO/branch-SCOPED customer override (both precise,
-        # human-verified for this exact context), a flat override was saved against
-        # whichever ONE branch happened to resolve it first, under a raw customer name
-        # BC itself may have split across more than one real Customer record (confirmed
-        # in production: "WALTERMART SUPERMARKET, INC." has multiple BC customers, each
-        # with its own ship-to addresses — a flat override saved for one branch doesn't
-        # verify it's also correct for a DIFFERENT branch sharing the identical name,
-        # and blindly trusting it produced real ship-to/customer mismatches on orders
-        # for branches it was never actually resolved against). So a flat override is
-        # only ever a FALLBACK HINT below, cross-checked against this branch's own
-        # automatic ship-to resolution — not trusted outright the way #1 and a scoped
-        # #2 both still are.
-        branch_key = (header.get("customerBranchName") or "").strip().upper()
-        customer_key = (header.get("customerName") or "").strip().upper()
-        po_scoped_key = f"{customer_key}::PO:{po_ref.strip().upper()}" if po_ref else None
-        branch_scoped_key = f"{customer_key}::{branch_key}" if branch_key else None
-        resolved_ship_to: dict = branch_overrides.get(branch_key) or header.get("resolvedShipTo") or {}
+        # ── NEW: structured CustomerBranch-based match, tried first ────────────
+        # Independent of any saved override: resolves this branch's CustomerBranch row
+        # (sbic_prod, via customerBranchId — pre-fetched by the caller as
+        # branch_code_by_id) to get its customerBranchCode ("Legacy Code"), and matches
+        # that plus the branch's own customerBranchLookUpCode ("Lookup Code") against
+        # BC ship-to's legacyCode/lookupCode fields (tableextension 50458). Only when
+        # NEITHER resolves anything does this fall through to the entire existing
+        # override/automatic-matching cascade below, unchanged.
+        branch_id = header.get("customerBranchId")
+        customer_branch_code = ((branch_code_by_id or {}).get(branch_id) or "").strip().upper()
+        lookup_code_for_branch = (header.get("customerBranchLookUpCode") or "").strip().upper()
+        structured_match = (
+            (ship_to_by_legacy_code or {}).get(customer_branch_code) if customer_branch_code else None
+        ) or (
+            (ship_to_by_lookup_code or {}).get(lookup_code_for_branch) if lookup_code_for_branch else None
+        )
 
-        # Track which tier resolved_customer actually came from — shipToCode (see
-        # below) is only safe to reuse from a scoped match (po or branch), never the
-        # flat one, since a FLAT override's shipToCode was captured for whichever ONE
-        # branch/PO happened to save it and isn't necessarily correct for this header
-        # too (the customer can be right for every branch sharing the name while still
-        # having a different ship-to address per branch).
-        customer_scope_used: str | None = None
-        resolved_customer: dict = {}
-        for scope_label, scoped_key in (("po", po_scoped_key), ("branch", branch_scoped_key)):
-            if scoped_key and customer_overrides.get(scoped_key, {}).get("customerNo"):
-                customer_scope_used = scope_label
-                resolved_customer = customer_overrides[scoped_key]
-                break
-        if not resolved_customer:
-            resolved_customer = customer_overrides.get(customer_key) or header.get("resolvedCustomer") or {}
-
-        if resolved_ship_to.get("customerNo"):
-            customer_no = resolved_ship_to["customerNo"]
-            ship_to_code = resolved_ship_to.get("shipToCode", "")
+        if structured_match:
+            customer_no, ship_to_code = structured_match
+            resolution_tier = "customer_branch_match"
             resolution_source = (
-                f"the saved branch override for {header.get('customerBranchName')!r} on /reconcile's "
-                f"Overrides tab (customerNo={customer_no!r}, shipToCode={ship_to_code!r})"
+                f"CustomerBranch-based matching for branch {header.get('customerBranchName')!r} "
+                f"(legacyCode={customer_branch_code!r}, lookupCode={lookup_code_for_branch!r})"
             )
-            logger.info(f"PO {po_ref}: using reconcile-page branch link → customer={customer_no!r} shipTo={ship_to_code!r}")
-        elif resolved_customer.get("customerNo") and customer_scope_used:
-            # PO- or branch-SCOPED customer override — already precise for this exact
-            # context (same trust level as a branch override), so no ship-to cross-
-            # check needed; its shipToCode (reference metadata captured when this exact
-            # link was saved) is safe to reuse directly, unlike a flat override's.
-            customer_no = resolved_customer["customerNo"]
-            ship_to_code = resolved_customer.get("shipToCode", "")
-            scope_note = ", scoped to this PO" if customer_scope_used == "po" else f", scoped to branch {header.get('customerBranchName')!r}"
-            resolution_source = (
-                f"the saved customer override for {header.get('customerName')!r} on /reconcile's "
-                f"Overrides tab (customerNo={customer_no!r}, shipToCode={ship_to_code!r}{scope_note})"
+            logger.info(
+                f"PO {po_ref}: using CustomerBranch match → customer={customer_no!r} shipTo={ship_to_code!r}"
             )
-            logger.info(f"PO {po_ref}: using reconcile-page customer link{scope_note} → customer={customer_no!r} shipTo={ship_to_code!r}")
         else:
-            # No branch override, and no SCOPED customer override either — resolve
-            # THIS branch's own ship-to first, before ever trusting a flat (name-only)
-            # customer override (resolved_customer here, if it has a customerNo, is
-            # necessarily flat — see the elif above). See the big comment block above
-            # for why a flat override can't be trusted outright: BC sometimes splits
-            # one raw customer name across more than one real Customer record, each
-            # with its own ship-to addresses.
-            branch_code: str = (header.get("customerBranchLookUpCode") or "").strip().upper()
-            branch_name: str = (header.get("customerBranchName") or "").strip()
+            # ── Customer lookup via Ship-to Address ───────────────────────────────
+            # A reconcile-page link always wins over automatic matching. Two independent
+            # sources feed resolved_ship_to/resolved_customer:
+            #   1. branch_overrides / customer_overrides — the saved override, fetched
+            #      fresh from so_buffer_overrides_{env} by the caller for this whole pass
+            #      (so_buffer_overrides.fetch_branch_overrides/fetch_customer_overrides).
+            #   2. header.resolvedShipTo / header.resolvedCustomer — denormalized copies
+            #      rgmc-bc-api's apply_resolution_to_buffer writes directly onto a buffer
+            #      doc at the moment a human resolves it on /reconcile.
+            # #1 takes priority over #2 — a buffer doc's denormalized field is a one-time
+            # patch applied only to the buffer_ids known at save time, so if a user later
+            # re-links the same branch/customer text to a different value (the UI's
+            # "Change…" action) while some buffer doc with the OLD patched value was missed
+            # by that save (e.g. page wasn't refreshed, or the doc didn't exist/was
+            # recreated after the first link), the doc keeps the stale value forever and
+            # #2-first would silently keep routing to the wrong customer/ship-to on every
+            # retry, with no error. #1 is always the current truth for that branch/customer
+            # text (fetch_branch_overrides/fetch_customer_overrides re-read it fresh on
+            # every pass — same self-healing pattern _apply_sku_overrides already uses for
+            # SKU links), so it must win whenever it has a value. #2 only still matters as
+            # a fallback for a buffer doc whose branch/customer text no longer has ANY
+            # saved override (e.g. the override was deleted outright via /reconcile's
+            # "unlink", but the doc was already patched beforehand).
+            # resolvedShipTo (customerNo + shipToCode) takes priority since it pins the
+            # exact ship-to; resolvedCustomer alone (no branch link saved) still lets the
+            # order in with just a customer, no ship-to code.
+            #
+            # A "customer" override's key can also be scoped — "{name}::{branch}" or
+            # "{name}::PO:{ref}" (see rgmc-bc-api's so_buffer_service._customer_key_parts)
+            # — for a customer name BC has split across more than one Customer record, one
+            # per branch/ship-to (a retail chain set up as a separate customer per store,
+            # say) or, more rarely, one per individual PO when even two orders sharing the
+            # same raw branch text turn out to need different customers (/reconcile's
+            # Customers tab "Split…" action creates these). Checked most-specific first —
+            # PO-scoped, then branch-scoped, then the flat name-only key — since each is a
+            # more specific statement of truth than the last. See /reconcile's Overrides
+            # tab, which labels a scoped override distinctly from a blanket one for the
+            # same reason this matters here: applying a blanket link derived from just one
+            # branch's (or PO's) resolution to every OTHER branch/PO sharing that customer
+            # name would silently misroute them whenever they actually belong to a
+            # different BC customer.
+            #
+            # A FLAT (name-only) customer override gets no such free pass, though — unlike
+            # a branch override or a PO/branch-SCOPED customer override (both precise,
+            # human-verified for this exact context), a flat override was saved against
+            # whichever ONE branch happened to resolve it first, under a raw customer name
+            # BC itself may have split across more than one real Customer record (confirmed
+            # in production: "WALTERMART SUPERMARKET, INC." has multiple BC customers, each
+            # with its own ship-to addresses — a flat override saved for one branch doesn't
+            # verify it's also correct for a DIFFERENT branch sharing the identical name,
+            # and blindly trusting it produced real ship-to/customer mismatches on orders
+            # for branches it was never actually resolved against). So a flat override is
+            # only ever a FALLBACK HINT below, cross-checked against this branch's own
+            # automatic ship-to resolution — not trusted outright the way #1 and a scoped
+            # #2 both still are.
+            branch_key = (header.get("customerBranchName") or "").strip().upper()
+            customer_key = (header.get("customerName") or "").strip().upper()
+            po_scoped_key = f"{customer_key}::PO:{po_ref.strip().upper()}" if po_ref else None
+            branch_scoped_key = f"{customer_key}::{branch_key}" if branch_key else None
+            resolved_ship_to: dict = branch_overrides.get(branch_key) or header.get("resolvedShipTo") or {}
 
-            # 1. Exact match on BC's own native ship-to code (fastest, most reliable where it
-            #    happens to align — BC's code and SBIC's branch_code are usually different
-            #    coding schemes entirely, e.g. "DS001-C001" vs "2001").
-            # 2. Exact match on the ship-to's lookupCode field (tableextension 50458) — this
-            #    is purpose-built to hold SBIC's own CustomerBranch.lookUpCode value, so once
-            #    populated this is the reliable match for branch_code, not #1.
-            # 3. Fuzzy name match (SequenceMatcher on normalized strings) — last resort.
-            ship_to_match = (
-                ship_to_by_code.get(branch_code)
-                or ship_to_by_lookup_code.get(branch_code)
-                or _fuzzy_ship_to_lookup(branch_name, ship_to_by_name)
-            )
-            flat_customer_no = (resolved_customer.get("customerNo") or "").strip() or None
+            # Track which tier resolved_customer actually came from — shipToCode (see
+            # below) is only safe to reuse from a scoped match (po or branch), never the
+            # flat one, since a FLAT override's shipToCode was captured for whichever ONE
+            # branch/PO happened to save it and isn't necessarily correct for this header
+            # too (the customer can be right for every branch sharing the name while still
+            # having a different ship-to address per branch).
+            customer_scope_used: str | None = None
+            resolved_customer: dict = {}
+            for scope_label, scoped_key in (("po", po_scoped_key), ("branch", branch_scoped_key)):
+                if scoped_key and customer_overrides.get(scoped_key, {}).get("customerNo"):
+                    customer_scope_used = scope_label
+                    resolved_customer = customer_overrides[scoped_key]
+                    break
+            if not resolved_customer:
+                resolved_customer = customer_overrides.get(customer_key) or header.get("resolvedCustomer") or {}
 
-            if ship_to_match:
-                customer_no, ship_to_code = ship_to_match
-                if flat_customer_no and flat_customer_no.upper() != customer_no.strip().upper():
-                    # The exact ambiguity this whole branch exists to catch: a flat
-                    # customer-name override disagrees with what THIS branch's own
-                    # ship-to resolves to. The ship-to match wins — it's structurally
-                    # scoped to one real BC customer, not a name-based guess that may
-                    # have been saved against a different branch sharing this name.
-                    logger.warning(
-                        f"PO {po_ref}: flat customer override for {header.get('customerName')!r} points to "
-                        f"{flat_customer_no!r}, but branch {branch_name!r}'s own ship-to resolves to "
-                        f"{customer_no!r} instead — using the ship-to match, not the flat override (BC "
-                        f"likely has more than one Customer record sharing this name)"
-                    )
-                    resolution_source = (
-                        f"automatic ship-to matching for branch {branch_name!r} — overrides a flat "
-                        f"customer override on /reconcile's Overrides tab that pointed to a different "
-                        f"customer ({flat_customer_no!r})"
+            if resolved_ship_to.get("customerNo"):
+                customer_no = resolved_ship_to["customerNo"]
+                ship_to_code = resolved_ship_to.get("shipToCode", "")
+                resolution_tier = "branch_override"
+                resolution_source = (
+                    f"the saved branch override for {header.get('customerBranchName')!r} on /reconcile's "
+                    f"Overrides tab (customerNo={customer_no!r}, shipToCode={ship_to_code!r})"
+                )
+                logger.info(f"PO {po_ref}: using reconcile-page branch link → customer={customer_no!r} shipTo={ship_to_code!r}")
+            elif resolved_customer.get("customerNo") and customer_scope_used:
+                # PO- or branch-SCOPED customer override — already precise for this exact
+                # context (same trust level as a branch override), so no ship-to cross-
+                # check needed; its shipToCode (reference metadata captured when this exact
+                # link was saved) is safe to reuse directly, unlike a flat override's.
+                customer_no = resolved_customer["customerNo"]
+                ship_to_code = resolved_customer.get("shipToCode", "")
+                scope_note = ", scoped to this PO" if customer_scope_used == "po" else f", scoped to branch {header.get('customerBranchName')!r}"
+                resolution_tier = "customer_override"
+                resolution_source = (
+                    f"the saved customer override for {header.get('customerName')!r} on /reconcile's "
+                    f"Overrides tab (customerNo={customer_no!r}, shipToCode={ship_to_code!r}{scope_note})"
+                )
+                logger.info(f"PO {po_ref}: using reconcile-page customer link{scope_note} → customer={customer_no!r} shipTo={ship_to_code!r}")
+            else:
+                # No branch override, and no SCOPED customer override either — resolve
+                # THIS branch's own ship-to first, before ever trusting a flat (name-only)
+                # customer override (resolved_customer here, if it has a customerNo, is
+                # necessarily flat — see the elif above). See the big comment block above
+                # for why a flat override can't be trusted outright: BC sometimes splits
+                # one raw customer name across more than one real Customer record, each
+                # with its own ship-to addresses.
+                branch_code: str = (header.get("customerBranchLookUpCode") or "").strip().upper()
+                branch_name: str = (header.get("customerBranchName") or "").strip()
+
+                # 1. Exact match on BC's own native ship-to code (fastest, most reliable where it
+                #    happens to align — BC's code and SBIC's branch_code are usually different
+                #    coding schemes entirely, e.g. "DS001-C001" vs "2001").
+                # 2. Exact match on the ship-to's lookupCode field (tableextension 50458) — this
+                #    is purpose-built to hold SBIC's own CustomerBranch.lookUpCode value, so once
+                #    populated this is the reliable match for branch_code, not #1.
+                # 3. Fuzzy name match (SequenceMatcher on normalized strings) — last resort.
+                ship_to_match = (
+                    ship_to_by_code.get(branch_code)
+                    or ship_to_by_lookup_code.get(branch_code)
+                    or _fuzzy_ship_to_lookup(branch_name, ship_to_by_name)
+                )
+                flat_customer_no = (resolved_customer.get("customerNo") or "").strip() or None
+
+                if ship_to_match:
+                    customer_no, ship_to_code = ship_to_match
+                    resolution_tier = "automatic_ship_to_match"
+                    if flat_customer_no and flat_customer_no.upper() != customer_no.strip().upper():
+                        # The exact ambiguity this whole branch exists to catch: a flat
+                        # customer-name override disagrees with what THIS branch's own
+                        # ship-to resolves to. The ship-to match wins — it's structurally
+                        # scoped to one real BC customer, not a name-based guess that may
+                        # have been saved against a different branch sharing this name.
+                        logger.warning(
+                            f"PO {po_ref}: flat customer override for {header.get('customerName')!r} points to "
+                            f"{flat_customer_no!r}, but branch {branch_name!r}'s own ship-to resolves to "
+                            f"{customer_no!r} instead — using the ship-to match, not the flat override (BC "
+                            f"likely has more than one Customer record sharing this name)"
+                        )
+                        resolution_source = (
+                            f"automatic ship-to matching for branch {branch_name!r} — overrides a flat "
+                            f"customer override on /reconcile's Overrides tab that pointed to a different "
+                            f"customer ({flat_customer_no!r})"
+                        )
+                    else:
+                        resolution_source = f"automatic ship-to matching for branch {branch_name!r}" + (
+                            " (confirms the saved flat customer override)" if flat_customer_no else " (no saved override)"
+                        )
+                    logger.info(f"PO {po_ref}: using ship-to match → customer={customer_no!r} shipTo={ship_to_code!r}")
+                elif flat_customer_no:
+                    # Ship-to couldn't be resolved at all, and the only customer link on
+                    # file is an unscoped (flat) override — buffer instead of guessing.
+                    # Trusting the flat override here is exactly how a wrong-ship-to order
+                    # slipped through before this check existed: an unscoped name-based
+                    # link offers nothing to confirm it's correct for THIS branch.
+                    raise ValueError(
+                        f"No ship-to address in BC for branch code={branch_code!r} / name={branch_name!r} "
+                        f"(company={company!r}) — not using the only customer link on file for "
+                        f"{header.get('customerName')!r} because it's an unscoped (flat) override, and BC may "
+                        f"have more than one Customer record sharing this name. Buffering instead of guessing; "
+                        f"resolve a branch- or PO-scoped link on /reconcile's Overrides tab instead."
                     )
                 else:
-                    resolution_source = f"automatic ship-to matching for branch {branch_name!r}" + (
-                        " (confirms the saved flat customer override)" if flat_customer_no else " (no saved override)"
+                    raise ValueError(
+                        f"No ship-to address in BC for branch code={branch_code!r} / "
+                        f"name={branch_name!r} (company={company!r})"
                     )
-                logger.info(f"PO {po_ref}: using ship-to match → customer={customer_no!r} shipTo={ship_to_code!r}")
-            elif flat_customer_no:
-                # Ship-to couldn't be resolved at all, and the only customer link on
-                # file is an unscoped (flat) override — buffer instead of guessing.
-                # Trusting the flat override here is exactly how a wrong-ship-to order
-                # slipped through before this check existed: an unscoped name-based
-                # link offers nothing to confirm it's correct for THIS branch.
-                raise ValueError(
-                    f"No ship-to address in BC for branch code={branch_code!r} / name={branch_name!r} "
-                    f"(company={company!r}) — not using the only customer link on file for "
-                    f"{header.get('customerName')!r} because it's an unscoped (flat) override, and BC may "
-                    f"have more than one Customer record sharing this name. Buffering instead of guessing; "
-                    f"resolve a branch- or PO-scoped link on /reconcile's Overrides tab instead."
-                )
-            else:
-                raise ValueError(
-                    f"No ship-to address in BC for branch code={branch_code!r} / "
-                    f"name={branch_name!r} (company={company!r})"
-                )
 
         header_payload = _build_header_payload(header, customer_no, ship_to_code, location_code)
         h_status, h_data = bc_client.v2_create_record("salesOrders", header_payload, company)
@@ -837,12 +886,16 @@ def _create_order(
                     f"no further lines will be attempted; see order_locked_reason in the caller"
                 )
             else:
-                resolution_source = (
+                # Deliberately named distinctly from the order-level resolution_source
+                # above (customer/ship-to) — this is a per-LINE item-resolution note for
+                # the BC-rejection message only, and must never clobber the order-level
+                # value still needed for the result dict this function returns.
+                line_resolution_source = (
                     "reconcile-page SKU link"
                     if (line.get("resolvedItem") or {}).get("itemNo") == item_no
                     else "automatic item-reference matching"
                 )
-                clearer = _describe_line_rejection(ld, item_no, resolution_source)
+                clearer = _describe_line_rejection(ld, item_no, line_resolution_source)
                 if clearer:
                     logger.error(f"PO {po_ref} line rejected by BC — {clearer}")
                     line_issues.append(clearer)
@@ -877,6 +930,8 @@ def _create_order(
         "lines_already_present": lines_already_present,
         "customer_name": header.get("customerName", ""),
         "branch_name": header.get("customerBranchName", ""),
+        "resolution_tier": resolution_tier,
+        "resolution_source": resolution_source,
         "po_date": header.get("poDate", ""),
         "delivery_date": header.get("deliveryDate", ""),
         "lines_created": lines_created,
@@ -1583,7 +1638,7 @@ def _run_backfill_from_cloudsql(
         except Exception as e:
             logger.error(f"POUL SO backfill: pre-fetch failed (company={company!r}): {e}")
             continue
-        ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name = _build_ship_to_maps(ship_tos)
+        ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code, ship_to_by_name = _build_ship_to_maps(ship_tos)
         ref_map: dict[str, str] = _build_ref_map(item_refs)
 
         # Scope the CustomerPOUL query itself to this company's companyId (SBIC=6,
@@ -1599,6 +1654,15 @@ def _run_backfill_from_cloudsql(
             create_by, date_from=date_from, date_to=date_to, company_id=company_id,
         )
         total_headers_considered += len(company_headers)
+        # customerBranchId is already on each CustomerPOUL row fetched above — batch-
+        # fetch every unique branch's CustomerBranch row (customerBranchCode) once for
+        # the whole company instead of per order (see _create_order's new structured
+        # CustomerBranch-based match tier).
+        branch_ids = {h.get("customerBranchId") for h in company_headers if h.get("customerBranchId") is not None}
+        branch_rows = gcp_api_client.fetch_customer_branches(list(branch_ids))
+        branch_code_by_id = {
+            bid: (row.get("customerBranchCode") or "").strip() for bid, row in branch_rows.items()
+        }
         for h in company_headers:
             po_ref = h.get("poRefNumber", "unknown")
             try:
@@ -1618,6 +1682,7 @@ def _run_backfill_from_cloudsql(
                     ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name,
                     ref_map, location_code, branch_overrides, customer_overrides,
                     inactive_skus=inactive_skus, uom_overrides=uom_overrides, existing_so_number=None,
+                    ship_to_by_legacy_code=ship_to_by_legacy_code, branch_code_by_id=branch_code_by_id,
                 )
                 result["from_buffer"] = False
                 successes.append(result)
@@ -1691,43 +1756,55 @@ def _run_backfill_from_cloudsql(
     return True, summary
 
 
-def _build_ship_to_maps(ship_tos: list) -> tuple[dict, dict, dict]:
-    """ship_to_by_code / ship_to_by_lookup_code / ship_to_by_name, each mapping an
-    upper-cased key to (customer_no, ship_to_code) — shared by every handler that
-    resolves a PO's customer branch against BC's ship-to addresses.
+def _build_ship_to_maps(ship_tos: list) -> tuple[dict, dict, dict, dict]:
+    """ship_to_by_code / ship_to_by_lookup_code / ship_to_by_legacy_code / ship_to_by_name,
+    each mapping an upper-cased key to (customer_no, ship_to_code) — shared by every
+    handler that resolves a PO's customer branch against BC's ship-to addresses.
 
     ship_to_by_code: exact upper-cased BC ship-to code.
     ship_to_by_lookup_code: exact upper-cased lookupCode (tableextension 50458 — SBIC's
       own CustomerBranch.lookUpCode, manually populated in BC).
+    ship_to_by_legacy_code: exact upper-cased legacyCode (same tableextension 50458 —
+      SBIC's own CustomerBranch.customerBranchCode, also manually populated in BC).
     ship_to_by_name: normalized BC name, used for fuzzy match.
     """
     ship_to_by_code: dict[str, tuple[str, str]] = {}
     ship_to_by_lookup_code: dict[str, tuple[str, str]] = {}
+    ship_to_by_legacy_code: dict[str, tuple[str, str]] = {}
     ship_to_by_name: dict[str, tuple[str, str]] = {}
     for st in ship_tos:
         cust_no = st.get("customerNumber") or ""
         st_code = (st.get("code") or "").strip()
         st_lookup_code = (st.get("lookupCode") or "").strip()
+        st_legacy_code = (st.get("legacyCode") or "").strip()
         st_name = (st.get("name") or "").strip()
         if not cust_no or not st_code:
             continue
         ship_to_by_code[st_code.upper()] = (cust_no, st_code)
         if st_lookup_code:
             ship_to_by_lookup_code[st_lookup_code.upper()] = (cust_no, st_code)
+        if st_legacy_code:
+            ship_to_by_legacy_code[st_legacy_code.upper()] = (cust_no, st_code)
         if st_name:
             norm_name = _normalize_name(st_name)
             if norm_name:
                 ship_to_by_name[norm_name] = (cust_no, st_code)
-    return ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name
+    return ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code, ship_to_by_name
 
 
 def _build_ref_map(item_refs: list) -> dict[str, str]:
     """Upper-cased referenceNo → itemNo, shared by every handler that resolves a
-    line's customerSKUCode against BC's item references."""
+    line's customerSKUCode against BC's item references.
+
+    Filtered to referenceType="Customer" only — BC's Item Reference table (page 50349)
+    also carries Item/Variant/Bar Code/Vendor reference rows, any of which could share a
+    referenceNo value with an unrelated item's customer SKU code and silently resolve a
+    line to the wrong item if left unfiltered."""
     return {
         r.get("referenceNo", "").upper(): r["itemNo"]
         for r in item_refs
         if r.get("itemNo") and r.get("referenceNo")
+        and (r.get("referenceType") or "").strip().lower() == "customer"
     }
 
 
@@ -1789,7 +1866,7 @@ def _run_batch(
         )
         return True, dict(_EMPTY_SUMMARY)
 
-    ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name = _build_ship_to_maps(ship_tos)
+    ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code, ship_to_by_name = _build_ship_to_maps(ship_tos)
     ref_map: dict[str, str] = _build_ref_map(item_refs)
     location_code: str = config.POUL_SO_DEFAULT_LOCATION
 
@@ -1808,6 +1885,27 @@ def _run_batch(
             "_buf_id": buf_doc_id,
             "so_number": buf_data.get("so_number"),
         })
+
+    # customerBranchId never travels through the BigQuery bridge's Pub/Sub message
+    # (mappings_bridge.py only ever maps customerBranchName/customerBranchLookUpCode,
+    # never the numeric FK) — a fresh CustomerPOUL-by-poRefNumber lookup, batched for
+    # the whole pass, is the only way to get it for _create_order's structured
+    # CustomerBranch-based match tier. Stamped onto each header fresh every pass, same
+    # as every override fetch above — never cached stale from a previous run.
+    po_refs = [o["header"].get("poRefNumber") for o in all_orders if o["header"].get("poRefNumber")]
+    poul_by_ref = gcp_api_client.fetch_customerpoul_by_refs(po_refs)
+    for order_item in all_orders:
+        po_ref_lookup = order_item["header"].get("poRefNumber")
+        poul_row = poul_by_ref.get(po_ref_lookup) if po_ref_lookup else None
+        if poul_row and poul_row.get("customerBranchId") is not None:
+            order_item["header"]["customerBranchId"] = poul_row["customerBranchId"]
+    branch_ids = {
+        o["header"].get("customerBranchId") for o in all_orders if o["header"].get("customerBranchId") is not None
+    }
+    branch_rows = gcp_api_client.fetch_customer_branches(list(branch_ids))
+    branch_code_by_id = {
+        bid: (row.get("customerBranchCode") or "").strip() for bid, row in branch_rows.items()
+    }
 
     # A buffered order's lines normally already carry resolvedItem (apply_resolution_to_buffer
     # patches it on save), but a fresh inbound order never does, and a buffer doc saved before
@@ -1850,6 +1948,7 @@ def _run_batch(
                 ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name,
                 ref_map, location_code, branch_overrides, customer_overrides,
                 inactive_skus=inactive_skus, uom_overrides=uom_overrides, existing_so_number=so_number,
+                ship_to_by_legacy_code=ship_to_by_legacy_code, branch_code_by_id=branch_code_by_id,
             )
             result["from_buffer"] = buf_id is not None
             successes.append(result)

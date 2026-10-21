@@ -66,3 +66,70 @@ def fetch_customerpouldetailbq(po_ref: str) -> list[dict]:
     except Exception as e:
         logger.warning(f"gcp_api_client: fetch_customerpouldetailbq({po_ref!r}) failed: {e}")
         return []
+
+
+# Batch size for the chunked lookups below — comfortably under /customerpoul and
+# /sbic/customerbranches' own limit=1000 cap, chunked so one slow/failed chunk doesn't
+# lose the whole batch's results.
+_BATCH_CHUNK_SIZE = 500
+
+
+def fetch_customerpoul_by_refs(po_refs: list[str]) -> dict[str, dict]:
+    """poRefNumber -> latest CustomerPOUL header row, for many refs in a handful of
+    GET /customerpoul calls instead of one per PO — used to recover customerBranchId
+    for orders sourced from the BigQuery/Pub/Sub pipeline, whose header never carries
+    that FK (only customerBranchName/customerBranchLookUpCode — see mappings_bridge.py,
+    which never maps customer_branch_id at all). The list endpoint orders by createDate
+    DESC, so for a ref with more than one row (a re-PO), the first one seen per ref is
+    the latest — same "first wins" convention used elsewhere in this ecosystem.
+
+    limit is requested at the route's own max (1000) regardless of chunk size, not
+    len(chunk) — a ref with multiple historical rows (re-POs) would otherwise let a
+    `TOP {limit}` cutoff silently drop some refs from a full chunk entirely.
+    """
+    unique_refs = sorted({r for r in po_refs if r})
+    if not unique_refs:
+        return {}
+    chunks = [unique_refs[i:i + _BATCH_CHUNK_SIZE] for i in range(0, len(unique_refs), _BATCH_CHUNK_SIZE)]
+    by_ref: dict[str, dict] = {}
+    for chunk in chunks:
+        try:
+            resp = _session.get(
+                f"{config.GCP_API_BASE}/customerpoul",
+                params={"po_ref_number": ",".join(chunk), "limit": 1000},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            for row in resp.json().get("data", []):
+                ref = row.get("poRefNumber")
+                if ref and ref not in by_ref:
+                    by_ref[ref] = row
+        except Exception as e:
+            logger.warning(f"gcp_api_client: fetch_customerpoul_by_refs chunk failed: {e}")
+    return by_ref
+
+
+def fetch_customer_branches(branch_ids: list[int]) -> dict[int, dict]:
+    """customerBranchId -> CustomerBranch row (customerBranchCode, lookUpCode, ...), for
+    many IDs in a handful of GET /sbic/customerbranches calls instead of one per order.
+    """
+    unique_ids = sorted({b for b in branch_ids if b is not None})
+    if not unique_ids:
+        return {}
+    chunks = [unique_ids[i:i + _BATCH_CHUNK_SIZE] for i in range(0, len(unique_ids), _BATCH_CHUNK_SIZE)]
+    by_id: dict[int, dict] = {}
+    for chunk in chunks:
+        try:
+            resp = _session.get(
+                f"{config.GCP_API_BASE}/sbic/customerbranches",
+                params={"customer_branch_id": ",".join(str(b) for b in chunk), "limit": len(chunk)},
+                timeout=60,
+            )
+            resp.raise_for_status()
+            for row in resp.json().get("data", []):
+                branch_id = row.get("customerBranchId")
+                if branch_id is not None:
+                    by_id[branch_id] = row
+        except Exception as e:
+            logger.warning(f"gcp_api_client: fetch_customer_branches chunk failed: {e}")
+    return by_id
