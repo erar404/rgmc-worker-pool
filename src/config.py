@@ -76,3 +76,9 @@ smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
 smtp_port = int(os.getenv("SMTP_PORT", "587"))
 smtp_user = os.getenv("SMTP_USER", "")
 smtp_password = os.getenv("SMTP_PASSWORD", "")
+
+# rgmc-it-bot (MS Teams bot) — compact chat notifications alongside the email alerts
+# above. Leave RGMC_IT_BOT_URL blank to disable (every call becomes a silent no-op,
+# same as the email path's missing-config behavior).
+RGMC_IT_BOT_URL = os.getenv("RGMC_IT_BOT_URL", "")
+RGMC_IT_BOT_API_KEY = os.getenv("RGMC_IT_BOT_API_KEY", "")

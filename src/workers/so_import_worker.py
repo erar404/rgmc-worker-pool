@@ -69,13 +69,13 @@ import json
 import logging
 import re
 import time
-from difflib import SequenceMatcher
 
 from google.cloud import pubsub_v1
 
 from src import config
 from src.services import bc_client, gcp_api_client, sbic_db, shipto_fix_history, shipto_fixes, so_buffer, so_buffer_history, so_buffer_overrides, reprocess_status
 from src.services.send_mail import notify_error, notify_success, notify_warning
+from src.services import bot_notify
 
 logger = logging.getLogger("worker.so_import")
 
@@ -98,51 +98,6 @@ _BC_COMPANY_ID_MAP: dict[str, int] = {"SBIC": 6, "MTC": 12}
 # UOM rules: if the source unit_of_measurement contains any of these substrings
 # (case-insensitive), treat the line as Piece/Pcs and use poQtyPcs / unitPricePcs.
 _PCS_KEYWORDS = ("pcs", "piece", "pc/s")
-
-# Minimum SequenceMatcher ratio (0–1) for a fuzzy ship-to name match to be accepted.
-_SHIP_TO_FUZZY_THRESHOLD = 0.5
-
-
-def _normalize_name(s: str) -> str:
-    """Uppercase, strip punctuation, collapse whitespace — for fuzzy comparison."""
-    return " ".join(re.sub(r"[^A-Z0-9\s]", "", (s or "").upper()).split())
-
-
-def _fuzzy_ship_to_lookup(
-    branch_name: str,
-    ship_to_by_name: dict[str, tuple[str, str]],
-) -> tuple[str, str] | None:
-    """Return (customer_no, ship_to_code) for the BC ship-to address whose normalized
-    name has the highest SequenceMatcher similarity to branch_name, provided the ratio
-    is at or above _SHIP_TO_FUZZY_THRESHOLD.  Returns None when no match qualifies.
-    """
-    norm_query = _normalize_name(branch_name)
-    if not norm_query or not ship_to_by_name:
-        return None
-
-    best_ratio = 0.0
-    best_key: str | None = None
-    best_match: tuple[str, str] | None = None
-
-    for norm_bc_name, match_data in ship_to_by_name.items():
-        ratio = SequenceMatcher(None, norm_query, norm_bc_name).ratio()
-        if ratio > best_ratio:
-            best_ratio = ratio
-            best_key = norm_bc_name
-            best_match = match_data
-
-    if best_ratio >= _SHIP_TO_FUZZY_THRESHOLD and best_match is not None:
-        logger.info(
-            f"Fuzzy ship-to match: {branch_name!r} → {best_key!r} "
-            f"(ratio={best_ratio:.2f})"
-        )
-        return best_match
-
-    logger.warning(
-        f"Fuzzy ship-to: no match above threshold {_SHIP_TO_FUZZY_THRESHOLD} "
-        f"for {branch_name!r} (best={best_key!r} ratio={best_ratio:.2f})"
-    )
-    return None
 
 
 def _resolve_bc_company(src_company_name: str) -> str:
@@ -497,7 +452,6 @@ def _create_order(
     company: str,
     ship_to_by_code: dict[str, tuple[str, str]],
     ship_to_by_lookup_code: dict[str, tuple[str, str]],
-    ship_to_by_name: dict[str, tuple[str, str]],
     ref_map: dict[str, str],
     location_code: str,
     branch_overrides: dict[str, dict],
@@ -510,9 +464,11 @@ def _create_order(
 ) -> dict:
     """Create (or resume) one BC Sales Order and return a result summary dict.
 
-    ship_to_by_code / ship_to_by_lookup_code / ship_to_by_name map upper-cased branch
-    code / lookup code / name → (customer_no, ship_to_code). ref_map is pre-fetched by
-    the caller for the whole batch.
+    ship_to_by_code / ship_to_by_lookup_code map upper-cased branch code / lookup code
+    → (customer_no, ship_to_code) — both exact matches. ref_map is pre-fetched by the
+    caller for the whole batch. There is deliberately no name-similarity/fuzzy fallback
+    here — see the ship-to resolution cascade below for why (a 2026-10-22 production
+    incident where fuzzy matching crossed two unrelated customers).
 
     ship_to_by_legacy_code: upper-cased ship-to legacyCode → (customer_no, ship_to_code)
     — see _build_ship_to_maps. branch_code_by_id: customerBranchId → CustomerBranch's
@@ -755,11 +711,22 @@ def _create_order(
                 # 2. Exact match on the ship-to's lookupCode field (tableextension 50458) — this
                 #    is purpose-built to hold SBIC's own CustomerBranch.lookUpCode value, so once
                 #    populated this is the reliable match for branch_code, not #1.
-                # 3. Fuzzy name match (SequenceMatcher on normalized strings) — last resort.
+                #
+                # NO fuzzy/name-similarity fallback here (removed 2026-10-22, see
+                # _normalize_name's former caller _fuzzy_ship_to_lookup, deleted) — confirmed
+                # in production that a SequenceMatcher ratio just above threshold can match two
+                # totally unrelated customers whose branches happen to share a location name:
+                # PO '14475399' ("6721 WALTERMART-SAN RAFAEL") fuzzy-matched a Puregold ship-to
+                # ("312 PUREGOLD JR SAN RAFAEL", ratio=0.55) because both chains have a branch in
+                # San Rafael — BC order SBSO265184 was created against Puregold's customer/ship-to
+                # (PU003/PU003-S018) instead of Waltermart. Exact/structured matches (above, and
+                # the CustomerBranch-based tier earlier in this function) are scoped to a single
+                # real BC record and can't cross customers this way; buffering when neither
+                # resolves (below) is the correct outcome once a branch's legacyCode/lookupCode
+                # aren't populated in BC yet — not guessing via name similarity.
                 ship_to_match = (
                     ship_to_by_code.get(branch_code)
                     or ship_to_by_lookup_code.get(branch_code)
-                    or _fuzzy_ship_to_lookup(branch_name, ship_to_by_name)
                 )
                 flat_customer_no = (resolved_customer.get("customerNo") or "").strip() or None
 
@@ -1661,7 +1628,7 @@ def _run_backfill_from_cloudsql(
         except Exception as e:
             logger.error(f"POUL SO backfill: pre-fetch failed (company={company!r}): {e}")
             continue
-        ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code, ship_to_by_name = _build_ship_to_maps(ship_tos)
+        ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code = _build_ship_to_maps(ship_tos)
         ref_map: dict[str, str] = _build_ref_map(item_refs)
 
         # Scope the CustomerPOUL query itself to this company's companyId (SBIC=6,
@@ -1702,7 +1669,7 @@ def _run_backfill_from_cloudsql(
             try:
                 result = _create_order(
                     h, lines, company,
-                    ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name,
+                    ship_to_by_code, ship_to_by_lookup_code,
                     ref_map, location_code, branch_overrides, customer_overrides,
                     inactive_skus=inactive_skus, uom_overrides=uom_overrides, existing_so_number=None,
                     ship_to_by_legacy_code=ship_to_by_legacy_code, branch_code_by_id=branch_code_by_id,
@@ -1752,6 +1719,14 @@ def _run_backfill_from_cloudsql(
         successes, "/".join(companies), f"cloudsql-backfill:{create_by}",
         label="POUL SO Cloud SQL Backfill", notify=notify,
     )
+    bot_notify.notify_po_batch(
+        successes, errors, "/".join(companies), f"cloudsql-backfill:{create_by}",
+        label="POUL SO Cloud SQL Backfill",
+    )
+    bot_notify.notify_po_unmatched(
+        successes, "/".join(companies), f"cloudsql-backfill:{create_by}",
+        label="POUL SO Cloud SQL Backfill",
+    )
     if skipped_existing:
         notify_success(module="poul_so_import", 
             title=f"POUL SO Cloud SQL Backfill — {len(skipped_existing)} PO(s) skipped (already in BC)",
@@ -1779,28 +1754,27 @@ def _run_backfill_from_cloudsql(
     return True, summary
 
 
-def _build_ship_to_maps(ship_tos: list) -> tuple[dict, dict, dict, dict]:
-    """ship_to_by_code / ship_to_by_lookup_code / ship_to_by_legacy_code / ship_to_by_name,
-    each mapping an upper-cased key to (customer_no, ship_to_code) — shared by every
-    handler that resolves a PO's customer branch against BC's ship-to addresses.
+def _build_ship_to_maps(ship_tos: list) -> tuple[dict, dict, dict]:
+    """ship_to_by_code / ship_to_by_lookup_code / ship_to_by_legacy_code, each mapping
+    an upper-cased key to (customer_no, ship_to_code) — shared by every handler that
+    resolves a PO's customer branch against BC's ship-to addresses. All three are exact
+    matches; there is deliberately no name-similarity map here (see _create_order's
+    ship-to resolution cascade for why a fuzzy fallback was removed 2026-10-22).
 
     ship_to_by_code: exact upper-cased BC ship-to code.
     ship_to_by_lookup_code: exact upper-cased lookupCode (tableextension 50458 — SBIC's
       own CustomerBranch.lookUpCode, manually populated in BC).
     ship_to_by_legacy_code: exact upper-cased legacyCode (same tableextension 50458 —
       SBIC's own CustomerBranch.customerBranchCode, also manually populated in BC).
-    ship_to_by_name: normalized BC name, used for fuzzy match.
     """
     ship_to_by_code: dict[str, tuple[str, str]] = {}
     ship_to_by_lookup_code: dict[str, tuple[str, str]] = {}
     ship_to_by_legacy_code: dict[str, tuple[str, str]] = {}
-    ship_to_by_name: dict[str, tuple[str, str]] = {}
     for st in ship_tos:
         cust_no = st.get("customerNumber") or ""
         st_code = (st.get("code") or "").strip()
         st_lookup_code = (st.get("lookupCode") or "").strip()
         st_legacy_code = (st.get("legacyCode") or "").strip()
-        st_name = (st.get("name") or "").strip()
         if not cust_no or not st_code:
             continue
         ship_to_by_code[st_code.upper()] = (cust_no, st_code)
@@ -1808,11 +1782,7 @@ def _build_ship_to_maps(ship_tos: list) -> tuple[dict, dict, dict, dict]:
             ship_to_by_lookup_code[st_lookup_code.upper()] = (cust_no, st_code)
         if st_legacy_code:
             ship_to_by_legacy_code[st_legacy_code.upper()] = (cust_no, st_code)
-        if st_name:
-            norm_name = _normalize_name(st_name)
-            if norm_name:
-                ship_to_by_name[norm_name] = (cust_no, st_code)
-    return ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code, ship_to_by_name
+    return ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code
 
 
 def _build_ref_map(item_refs: list) -> dict[str, str]:
@@ -1889,7 +1859,7 @@ def _run_batch(
         )
         return True, dict(_EMPTY_SUMMARY)
 
-    ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code, ship_to_by_name = _build_ship_to_maps(ship_tos)
+    ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code = _build_ship_to_maps(ship_tos)
     ref_map: dict[str, str] = _build_ref_map(item_refs)
     location_code: str = config.POUL_SO_DEFAULT_LOCATION
 
@@ -1981,7 +1951,7 @@ def _run_batch(
         try:
             result = _create_order(
                 header, lines, company,
-                ship_to_by_code, ship_to_by_lookup_code, ship_to_by_name,
+                ship_to_by_code, ship_to_by_lookup_code,
                 ref_map, location_code, branch_overrides, customer_overrides,
                 inactive_skus=inactive_skus, uom_overrides=uom_overrides, existing_so_number=so_number,
                 ship_to_by_legacy_code=ship_to_by_legacy_code, branch_code_by_id=branch_code_by_id,
@@ -2049,6 +2019,8 @@ def _run_batch(
     # ── Send one consolidated email, plus a separate flag for unmatched items ──
     _send_batch_notification(successes, errors, company, src_company, label=label, notify=notify)
     _send_unmatched_items_notification(successes, company, src_company, label=label, notify=notify)
+    bot_notify.notify_po_batch(successes, errors, company, src_company, label=label)
+    bot_notify.notify_po_unmatched(successes, company, src_company, label=label)
     summary = {
         "orders_created": len(successes),
         "orders_failed": len(errors),
