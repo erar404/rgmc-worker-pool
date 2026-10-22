@@ -2079,6 +2079,11 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         except Exception as exc:
             logger.error(f"POUL SO: reprocess-buffer run {run_id!r} crashed: {exc}")
             reprocess_status.finish_run(run_id, status="error", summary=run_summary, error=str(exc))
+            notify_error(module="poul_so_import",
+                title=f"POUL SO Reprocess-Buffer — hard error (run {run_id or 'unknown'})",
+                detail=str(exc),
+                context=f"companies={companies} notify={notify}",
+            )
             message.nack()
             return
 
@@ -2109,6 +2114,11 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         except Exception as exc:
             logger.error(f"POUL SO: Cloud SQL sync run {run_id!r} crashed: {exc}")
             reprocess_status.finish_run(run_id, status="error", summary={}, error=str(exc))
+            notify_error(module="poul_so_import",
+                title=f"POUL SO Cloud SQL Sync — hard error (run {run_id or 'unknown'})",
+                detail=str(exc),
+                context=f"companies={companies} create_by={create_by!r} notify={notify}",
+            )
             message.nack()
             return
         if ok:
@@ -2138,6 +2148,11 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         except Exception as exc:
             logger.error(f"POUL SO: Cloud SQL backfill run {run_id!r} crashed: {exc}")
             reprocess_status.finish_run(run_id, status="error", summary={}, error=str(exc))
+            notify_error(module="poul_so_import",
+                title=f"POUL SO Cloud SQL Backfill — hard error (run {run_id or 'unknown'})",
+                detail=str(exc),
+                context=f"companies={companies} create_by={create_by!r} date_from={date_from!r} date_to={date_to!r} notify={notify}",
+            )
             message.nack()
             return
         if ok:
@@ -2163,6 +2178,11 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         except Exception as exc:
             logger.error(f"POUL SO: ship-to fixes batch run {run_id!r} crashed: {exc}")
             reprocess_status.finish_run(run_id, status="error", summary={}, error=str(exc))
+            notify_error(module="poul_so_import",
+                title=f"POUL SO Ship-To Fixes Batch — hard error (run {run_id or 'unknown'})",
+                detail=str(exc),
+                context=f"companies={companies or 'all'} notify={notify}",
+            )
             message.nack()
             return
         if ok:
@@ -2192,7 +2212,24 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
     src_company: str = first_header.get("companyName", "")
     company: str = _resolve_bc_company(src_company)
 
-    ok, _ = _run_batch(company, src_company, orders)
+    try:
+        ok, _ = _run_batch(company, src_company, orders)
+    except Exception as exc:
+        # _run_batch only guards its own BC pre-fetch and each per-PO create
+        # individually — anything else (e.g. sbic_db's direct-MSSQL resolution, map
+        # building, override fetches) previously propagated out of this function
+        # entirely uncaught: no ack/nack, no alert, the message just vanished from
+        # view. Catch it here so a hard error always reaches someone and the
+        # message gets redelivered instead of silently disappearing.
+        logger.error(f"POUL SO: batch for company={company!r} crashed: {exc}")
+        notify_error(module="poul_so_import",
+            title=f"POUL SO Import — hard error ({company})",
+            detail=str(exc),
+            context=f"company={company} src_company={src_company!r} orders={len(orders)}",
+        )
+        message.nack()
+        return
+
     if ok:
         message.ack()
     else:

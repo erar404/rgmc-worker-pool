@@ -26,6 +26,7 @@ from google.cloud import pubsub_v1
 from src import config
 from src.logger import logger as app_logger
 from src.services.bigquery_bridge import BigqueryBridge
+from src.services.send_mail import notify_error
 
 logger = logging.getLogger("worker.bigquery_bridge")
 
@@ -35,6 +36,11 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         data = json.loads(message.data.decode("utf-8"))
     except Exception as e:
         logger.error(f"Bridge-run message decode failed: {e} — acking to drop poison pill")
+        notify_error(module="bigquery_bridge",
+            title="BigQuery Bridge — message decode failed (dropped)",
+            detail=str(e),
+            context=f"raw_data={message.data!r}"[:2000],
+        )
         message.ack()
         return
 
@@ -48,6 +54,18 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         message.ack()
     except Exception as e:
         logger.error(f"Bridge run failed (group_code={group_code!r}, method={method!r}): {e}")
+        # BigqueryBridge.main() already self-alerts (notify_error/success(module=
+        # "bigquery_bridge")) for errors it anticipates (see bigquery_bridge.py's
+        # __notify) — but anything raised before that internal handling kicks in
+        # (e.g. the constructor's DB connection, or an unanticipated step in main())
+        # previously reached only this log line, never an email. This is a safety
+        # net, not a replacement — it may duplicate an alert main() already sent for
+        # errors it does handle internally; a missed alert is worse than a double one.
+        notify_error(module="bigquery_bridge",
+            title=f"BigQuery Bridge — hard error (group_code={group_code!r}, method={method!r})",
+            detail=str(e),
+            context=f"group_code={group_code} method={method}",
+        )
         message.nack()  # let Pub/Sub redeliver for a transient BigQuery/MSSQL error
 
 

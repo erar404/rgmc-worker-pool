@@ -262,6 +262,16 @@ class BigqueryBridge(object):
         the "Held back (0 line items extracted yet)" incident this guards against,
         including the automated retry (customerpoul-backfill-held-back Cloud Scheduler
         job) that now picks these up once their lines actually land in BigQuery.
+
+        Caller contract: header_table/detail_table must be the FULL set BigQuery handed
+        back this run (see __insert_dataframes's full_header_table/full_detail_table),
+        not whatever remains after duplicate-key rows were pruned for the MSSQL insert —
+        a po_ref whose detail rows already exist in MSSQL (re-served by BigQuery past its
+        own watermark, a known upstream issue) still has its lines here, so it's correctly
+        NOT held back just because nothing new needed inserting for it this run. The
+        genuine "header landed, detail hasn't arrived yet" race is unaffected by this —
+        that po_ref still legitimately has zero rows in ANY run's fetch and is still held
+        back exactly as before.
         """
         sep = "-" * 55
 
@@ -541,7 +551,27 @@ class BigqueryBridge(object):
         against must already exist by the time the header insert fires it). Retries
         once per duplicate-key IntegrityError, dropping just the offending row and
         trying again, same as main()'s original inline loop.
+
+        header_table/detail_table get progressively pruned below as the retry loop
+        drops whichever po_ref hit a duplicate-key conflict — that pruned, end-state
+        table is correct for the MSSQL insert (only genuinely-new rows should be
+        written), but it is NOT what __trigger_so_import should see: a po_ref whose
+        detail rows turned out to already exist in MSSQL (re-served by a BigQuery
+        source whose watermark doesn't exclude already-ingested rows — a known,
+        separate upstream issue) would otherwise look identical to a po_ref that
+        genuinely has zero lines, and get misreported as "held back" even though it's
+        already fully synced to BC. full_header_table/full_detail_table are the
+        unpruned snapshot of everything BigQuery actually handed us this run — the
+        "accepted" data — so __trigger_so_import's company filter and line-matching
+        always run against the same data this run accepted from BigQuery, independent
+        of which rows the MSSQL-insert retry below had to skip as duplicates. Safe
+        even when a po_ref is re-triggered after already reaching BC: _create_order
+        looks up the existing order by externalDocumentNo first and only backfills
+        missing lines, never a duplicate header.
         """
+        full_header_table = header_table
+        full_detail_table = detail_table
+
         continue_execution = True
         while continue_execution:
             try:
@@ -572,7 +602,7 @@ class BigqueryBridge(object):
                 continue_execution = False
                 self.__log("Data inserted successfully into MSSQL.", level="info")
                 if trigger_so_import:
-                    self.__trigger_so_import(header_table, detail_table)
+                    self.__trigger_so_import(full_header_table, full_detail_table)
                 self.__log("Inserted Records - {}: {}, {}: {}".format(mssql_header_table_name,
                                                                       ul_bq,
                                                                       mssql_detail_table_name,

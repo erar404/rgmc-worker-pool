@@ -29,7 +29,7 @@ from src.services.bc_client import (
     v2_create_record,
     v2_delete_record,
 )
-from src.services.send_mail import notify_error
+from src.services.send_mail import notify_error, notify_success
 from src.services.task_service import update_task
 
 logger = logging.getLogger("worker.order")
@@ -37,11 +37,28 @@ logger = logging.getLogger("worker.order")
 _TRANSIENT_SIGNALS = ("429", "502", "503", "timeout", "ConnectionError", "ReadTimeout")
 
 
+def _line_summary(line: dict, idx: int) -> str:
+    """One-line summary of a BC order line for the completion email — field names
+    come straight from the caller's raw BC API payload (v1/v2 may differ slightly),
+    so every lookup is best-effort with a fallback rather than assuming one schema.
+    """
+    item = line.get("number") or line.get("lineObjectNumber") or line.get("itemNo") or "—"
+    qty = line.get("quantity", "—")
+    price = line.get("unitPrice", "—")
+    desc = line.get("description") or ""
+    return f"  Line {idx}: {item}  qty={qty}  unitPrice={price}" + (f"  — {desc}" if desc else "")
+
+
 def _process(message: pubsub_v1.subscriber.message.Message) -> None:
     try:
         data = json.loads(message.data.decode("utf-8"))
     except Exception as e:
         logger.error(f"Order message decode failed: {e} — acking to drop poison pill")
+        notify_error(module="order_task",
+            title="Order Task — message decode failed (dropped)",
+            detail=str(e),
+            context=f"raw_data={message.data!r}"[:2000],
+        )
         message.ack()
         return
 
@@ -81,7 +98,24 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                 raise ValueError(f"Line {i} failed (BC {lh}): {ld}. Order rolled back.")
 
         update_task(task_id, status="done", result=resp_data)
-        logger.info(f"Task {task_id} done — order {resp_data.get('number') or order_id}")
+        order_no = resp_data.get("number") or order_id
+        logger.info(f"Task {task_id} done — order {order_no}")
+
+        customer_no = (
+            header.get("customerNumber") or header.get("sellToCustomerNumber") or header.get("customerNo") or ""
+        )
+        line_detail = "\n".join(_line_summary(l, i) for i, l in enumerate(lines, start=1)) or "  (no lines)"
+        notify_success(module="order_task",
+            title=f"Order Task Completed — {order_type} {order_no}",
+            detail=(
+                f"BC Order No.   : {order_no}\n"
+                f"Order Type     : {order_type}\n"
+                f"Customer       : {customer_no or '—'}\n"
+                f"Lines Inserted : {len(lines)}\n\n"
+                f"{line_detail}"
+            ),
+            context=f"task_id={task_id} company={company} api_version={api_version}",
+        )
         message.ack()
 
     except ValueError as e:

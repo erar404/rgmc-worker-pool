@@ -538,6 +538,11 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         data = json.loads(message.data.decode("utf-8"))
     except Exception as e:
         logger.error(f"Sync message decode failed: {e} — acking to drop poison pill")
+        notify_error(module="sync_worker",
+            title="Sync Worker — message decode failed (dropped)",
+            detail=str(e),
+            context=f"raw_data={message.data!r}"[:2000],
+        )
         message.ack()
         return
 
