@@ -40,7 +40,8 @@ import src.mappings_bridge as mappings
 from src import config
 from src.db.dbconn import DbConn
 from src.services.bq_read import read_gbq_with_timeout
-from src.services.send_mail import notify_error, notify_success
+from src.services.send_mail import notify_error, notify_success, notify_warning
+from src.services.bridge_handoff_history import record_handoff
 
 
 class BigqueryBridge(object):
@@ -356,6 +357,30 @@ class BigqueryBridge(object):
             )
             for po_ref, co in held_back_refs:
                 trigger_lines.append(f"    - {po_ref}  [{co}]")
+            # Dedicated alert, separate from the run's own success/error email — a
+            # genuine "header landed, detail hasn't arrived yet" hold-back should
+            # self-heal on the next customerpoul-backfill-held-back Cloud Scheduler
+            # pass (every 2h, business hours, Mon-Fri), but that's still up to ~2
+            # hours (or until Monday, overnight/weekend) of a real PO sitting
+            # unactioned with nothing surfacing it outside this run's own log —
+            # see the 2026-10-22 incident where this went unnoticed for a new
+            # Waltermart upload. Fires every time, not just once, so held-back POs
+            # stay visible until they clear — cheap and harmless if the same refs
+            # repeat across runs.
+            notify_warning(
+                module="bigquery_bridge",
+                title=f"BigQuery Bridge — {len(held_back_refs)} order(s) held back (0 lines yet)",
+                detail=(
+                    f"group_code={self.__group_code} method={self.__method}\n\n"
+                    + "\n".join(f"  - {po_ref}  [{co}]" for po_ref, co in held_back_refs)
+                    + "\n\nThese will auto-retry via the customerpoul-backfill-held-back "
+                    "Cloud Scheduler job (every 2h, Mon-Fri 7am-7pm PHT) once "
+                    "CustomerPOULDetail has lines for them — or trigger "
+                    "POST /customerpoul/backfill-from-cloudsql?companies=SBIC manually "
+                    "to retry immediately."
+                ),
+                context=f"group_code={self.__group_code} method={self.__method}",
+            )
 
         if not orders:
             trigger_lines.append(f"  Status : SKIPPED — every SBIC/Suncoast order in this batch was held back")
@@ -543,6 +568,92 @@ class BigqueryBridge(object):
             main_key, trigger_so_import=(self.__group_code == 'customerpoul'),
         )
 
+    def __existing_key_rows(
+        self, mssql_table_name: str, key_cols: list[str], main_key: str, main_values: list[str],
+    ) -> set[tuple[str, ...]]:
+        """One query returning every (key_cols) tuple already in mssql_table_name among
+        these main_key values — scoped to this batch, never a full-table scan.
+        """
+        if not main_values:
+            return set()
+        cols_sql = ", ".join(f"[{c}]" for c in key_cols)
+        params = {f"v{i}": v for i, v in enumerate(main_values)}
+        placeholders = ", ".join(f":{k}" for k in params)
+        query = text(f"SELECT {cols_sql} FROM [{mssql_table_name}] WHERE [{main_key}] IN ({placeholders})")
+        with self.__mssql_engine.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return {tuple("" if v is None else str(v) for v in row) for row in rows}
+
+    def __drop_already_inserted(
+        self, df: pandas.DataFrame, mssql_table_name: str, main_key: str, is_detail: bool,
+    ) -> pandas.DataFrame:
+        """Filter out rows whose composite key already exists in mssql_table_name —
+        one bulk pre-check instead of discovering each one via a separate
+        IntegrityError + retry.
+
+        A batch re-served by BigQuery past its own watermark (a known upstream issue)
+        can be almost entirely duplicates; retrying the WHOLE remaining table once per
+        individual duplicate turned one bridge run into hundreds of serial round trips
+        on 2026-10-22, delaying that same batch's genuinely new rows (a PO upload)
+        behind a mountain of already-known dupes for so long __trigger_so_import never
+        even got reached — the actual new POs sat fully resolved in MSSQL but never
+        attempted against BC until a human manually ran the Cloud SQL backfill.
+
+        Uses the real composite unique key (not just main_key) so a PO with some
+        genuinely-new sibling lines and some already-inserted ones only drops the
+        already-inserted lines, not the whole PO's rows — main_key alone (the old
+        per-conflict retry's filter) would have dropped every line for that PO.
+        """
+        key_cols_raw = mappings.required_columns[self.__table_version].get(mssql_table_name.lower(), [])
+        table_mapping = mappings.table_mappings[self.__table_version].get(mssql_table_name.lower(), {})
+        key_cols = [table_mapping.get(c, c) for c in key_cols_raw]
+        key_cols = [c for c in key_cols if c in df.columns]
+        if df.empty or not key_cols or main_key not in df.columns:
+            return df
+
+        main_values = sorted(set(df[main_key].astype(str)))
+        existing = self.__existing_key_rows(mssql_table_name, key_cols, main_key, main_values)
+        if not existing:
+            return df
+
+        key_tuples = df[key_cols].astype(str).apply(tuple, axis=1)
+        is_dup = key_tuples.isin(existing)
+        if not is_dup.any():
+            return df
+
+        dup_refs = sorted(set(df.loc[is_dup, main_key].astype(str)))
+        (self.__dup_detail_keys if is_detail else self.__dup_header_keys).extend(dup_refs)
+        self.__log(
+            f"Pre-check: {int(is_dup.sum())} row(s) already exist in {mssql_table_name} "
+            f"(by {key_cols}) — excluding from insert ({len(dup_refs)} PO ref(s)).",
+            level="warning",
+        )
+        return df[~is_dup]
+
+    def __group_by_file(
+        self, df: pandas.DataFrame, main_key: str, po_to_file: dict[str, str] | None = None,
+    ) -> dict[str, list[str]]:
+        """Group df's main_key values by source filename, for the handoff-history
+        record — df's own 'fileName' column when present (header tables carry it),
+        else po_to_file (a po_ref -> fileName lookup built from the header table, for
+        a detail table that doesn't carry fileName itself — see ignore_columns in
+        mappings_bridge.py). Falls back to one "(unknown file)" bucket when neither
+        is available, rather than failing.
+        """
+        if df.empty or main_key not in df.columns:
+            return {}
+        grouped: dict[str, list[str]] = {}
+        if "fileName" in df.columns:
+            file_col = df["fileName"].fillna("(unknown file)").astype(str)
+            file_col = file_col.where(file_col.str.strip() != "", "(unknown file)")
+            for file_name, refs in df.groupby(file_col)[main_key].unique().items():
+                grouped.setdefault(str(file_name), []).extend(sorted(set(str(r) for r in refs)))
+            return {k: sorted(set(v)) for k, v in grouped.items()}
+        for ref in sorted(set(df[main_key].astype(str))):
+            file_name = (po_to_file or {}).get(ref) or "(unknown file)"
+            grouped.setdefault(file_name, []).append(ref)
+        return grouped
+
     def __insert_dataframes(self, header_table, detail_table, mssql_header_table_name,
                              mssql_detail_table_name, main_key, trigger_so_import=True):
         """Insert header_table/detail_table into their MSSQL staging tables — detail
@@ -571,6 +682,27 @@ class BigqueryBridge(object):
         """
         full_header_table = header_table
         full_detail_table = detail_table
+
+        # po_ref -> fileName, built once from the full header snapshot — the detail
+        # table never carries fileName itself (see ignore_columns in
+        # mappings_bridge.py), so this is how its handoff-history grouping below
+        # still knows which upload each line came from.
+        po_to_file: dict[str, str] = {}
+        if "fileName" in full_header_table.columns and main_key in full_header_table.columns:
+            for ref, fname in zip(
+                full_header_table[main_key].astype(str),
+                full_header_table["fileName"].fillna("(unknown file)").astype(str),
+            ):
+                po_to_file[ref] = fname.strip() or "(unknown file)"
+
+        # Bulk pre-check BEFORE the first insert attempt — detail first, same ordering
+        # as the insert itself (see docstring). Replaces discovering duplicates one
+        # IntegrityError at a time; the retry loop below still exists as a fallback
+        # for anything a race condition slips past this check with (rare), but it is
+        # no longer the primary mechanism, which is what made a heavily-duplicated
+        # batch so slow before.
+        detail_table = self.__drop_already_inserted(detail_table, mssql_detail_table_name, main_key, is_detail=True)
+        header_table = self.__drop_already_inserted(header_table, mssql_header_table_name, main_key, is_detail=False)
 
         continue_execution = True
         while continue_execution:
@@ -624,16 +756,44 @@ class BigqueryBridge(object):
                 else:
                     self.__log(f"IntegrityError encountered: {ie}", level="error")
                     self.__notify("ERROR")
+                    record_handoff(
+                        self.__group_code, self.__method, "error",
+                        tables={
+                            mssql_header_table_name: self.__group_by_file(header_table, main_key),
+                            mssql_detail_table_name: self.__group_by_file(detail_table, main_key, po_to_file),
+                        },
+                        error=str(ie),
+                    )
                     return {"status": "error", "message": str(ie)}
             except Exception as e:
                 self.__log(f"Error inserting data into MSSQL: {e}", level="error")
                 self.__notify("ERROR")
+                record_handoff(
+                    self.__group_code, self.__method, "error",
+                    tables={
+                        mssql_header_table_name: self.__group_by_file(header_table, main_key),
+                        mssql_detail_table_name: self.__group_by_file(detail_table, main_key, po_to_file),
+                    },
+                    error=str(e),
+                )
                 return {"status": "error", "message": str(e)}
 
         self.__log_section(self.__build_summary(
             header_table, detail_table, main_key,
             mssql_header_table_name, mssql_detail_table_name,
         ))
+
+        record_handoff(
+            self.__group_code, self.__method, "success",
+            tables={
+                mssql_header_table_name: self.__group_by_file(header_table, main_key),
+                mssql_detail_table_name: self.__group_by_file(detail_table, main_key, po_to_file),
+            },
+            duplicate_po_refs={
+                mssql_header_table_name: sorted(set(self.__dup_header_keys)),
+                mssql_detail_table_name: sorted(set(self.__dup_detail_keys)),
+            },
+        )
 
         total_inserted = len(header_table) + len(detail_table)
         if total_inserted > 0:
