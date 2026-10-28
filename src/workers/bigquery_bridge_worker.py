@@ -17,6 +17,11 @@ limiter rgmc-gcp-api's /handoff/runbridge/ still keeps as defense-in-depth again
 misbehaving trigger spamming publishes), so two bursty events for the same or
 different group_code can never race on MSSQL concurrently the way this project's
 "8 concurrent /handoff/runbridge/ calls" incident did.
+
+bridge_run_lock additionally gates method="triggered" messages specifically: even
+serialized one-at-a-time, a string of back-to-back automated runs for the same
+group_code (upstream BigQuery events trickling in over several minutes) still meant
+repeated re-processing and a notification for each -- see bridge_run_lock.py.
 """
 import json
 import logging
@@ -25,6 +30,7 @@ from google.cloud import pubsub_v1
 
 from src import config
 from src.logger import logger as app_logger
+from src.services import bridge_run_lock
 from src.services.bigquery_bridge import BigqueryBridge
 from src.services.send_mail import notify_error
 
@@ -47,6 +53,17 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
     group_code = data.get("group_code", "customerpoul")
     method = data.get("method", "manual")
 
+    # Automated (Eventarc-triggered) runs only — a manual "Run Bridge Now" always goes
+    # through. Blocks a new triggered run while one for this group_code is still in
+    # progress, and for COOLDOWN (5 min) after the last one started — see
+    # bridge_run_lock.py for why. The debounce-collapsed message this skips is dropped
+    # outright (ack), not redelivered: the next genuinely new upstream event schedules
+    # its own later run anyway, and BigQuery's watermark means nothing is lost by
+    # waiting for it.
+    if method == "triggered" and not bridge_run_lock.try_start(group_code):
+        message.ack()
+        return
+
     try:
         bridge = BigqueryBridge(app_logger, method=method, group_code=group_code)
         result = bridge.main()
@@ -67,6 +84,9 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             context=f"group_code={group_code} method={method}",
         )
         message.nack()  # let Pub/Sub redeliver for a transient BigQuery/MSSQL error
+    finally:
+        if method == "triggered":
+            bridge_run_lock.finish(group_code)
 
 
 def start() -> pubsub_v1.subscriber.futures.StreamingPullFuture:

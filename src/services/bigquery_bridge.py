@@ -553,8 +553,21 @@ class BigqueryBridge(object):
             bq_table = self.__get_bigquery_data('int_online_sales_data')
             header_table, detail_table = self.__format_onlinesalespo_data(bq_table)
 
-        header_empty = not isinstance(header_table, pandas.DataFrame) or header_table.empty
-        detail_empty = not isinstance(detail_table, pandas.DataFrame) or detail_table.empty
+        # __get_bigquery_data returns {"status": "error", ...} (having already called
+        # __notify("ERROR") itself) instead of raising on a BigQuery fetch failure --
+        # if only ONE of header/detail fails, the other is still a real, non-empty
+        # DataFrame, so the old "both empty" early-return below never triggered and
+        # this sailed into __rename_columns with a dict, crashing on
+        # df.drop(...)/df.drop_duplicates(...) with an opaque "'dict' object has no
+        # attribute 'drop'" -- a second, more confusing alert for a fetch failure
+        # already reported once. Confirmed live 2026-10-28 (group_code=customerpoul,
+        # method=triggered). Bail out immediately instead, with the fetch's own error.
+        for table in (header_table, detail_table):
+            if not isinstance(table, pandas.DataFrame):
+                return table if isinstance(table, dict) else {"status": "error", "message": "BigQuery fetch failed"}
+
+        header_empty = header_table.empty
+        detail_empty = detail_table.empty
         if header_empty and detail_empty:
             self.__log("No data fetched from BigQuery. Exiting process.", level="info")
             return {"status": "success", "message": "No new data to process."}
