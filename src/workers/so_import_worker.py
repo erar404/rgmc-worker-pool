@@ -74,6 +74,7 @@ from google.cloud import pubsub_v1
 
 from src import config
 from src.services import bc_client, gcp_api_client, sbic_db, shipto_fix_history, shipto_fixes, so_buffer, so_buffer_history, so_buffer_overrides, reprocess_status
+from src.services.bridge_handoff_history import update_bc_status
 from src.services.send_mail import notify_error, notify_success, notify_warning
 from src.services import bot_notify
 
@@ -1968,6 +1969,7 @@ def _run_batch(
                     result["so_number"], result["order_locked_reason"],
                     buf_id, notify, run_id,
                 )
+                update_bc_status(po_ref, "error", so_number=result["so_number"], error=result["order_locked_reason"])
                 continue
             dropped_note = (
                 f" ({result['dropped_inactive_count']} line(s) excluded — marked inactive on /reconcile, never retried)"
@@ -1990,10 +1992,12 @@ def _run_batch(
                     so_number=result["so_number"],
                 )
                 outcome = "still_buffered"
+                update_bc_status(po_ref, "buffered", so_number=result["so_number"])
             else:
                 if buf_id:
                     so_buffer.delete_buffered_order(buf_id)
                 outcome = "resolved"
+                update_bc_status(po_ref, "created", so_number=result["so_number"])
             if record_history:
                 so_buffer_history.record_reconciliation(
                     header, lines, company, outcome, notify,
@@ -2010,6 +2014,7 @@ def _run_batch(
                 header, lines, company, src_company, err_str, so_number=so_number
             )
             errors.append({"po_ref": po_ref, "error": err_str, "attempt_count": attempt_count})
+            update_bc_status(po_ref, "error", so_number=so_number, error=err_str)
             if record_history:
                 so_buffer_history.record_reconciliation(
                     header, lines, company, "failed", notify,

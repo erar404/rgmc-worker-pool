@@ -1,9 +1,12 @@
-"""Lightweight Firestore history of each BigQuery-bridge handoff (the BigQuery ->
-MSSQL insert step in bigquery_bridge.py's __insert_dataframes). Only PO ref number
-lists per target MSSQL table ("collection") are stored, never full header/detail
-rows — BigQuery and MSSQL already hold the full data, so a PO ref is all that's
-needed to look either back up. Exists so /trigger can show "what ran, when, how
-many POs, did it succeed" without re-querying BigQuery or MSSQL on every page load.
+"""Firestore history of each BigQuery-bridge handoff (the BigQuery -> MSSQL insert
+step in bigquery_bridge.py's __insert_dataframes), one document per PO ref, so both
+halves of a PO's journey -- did it land in MSSQL, did the BC Sales Order that follows
+actually get created -- show up side by side. Only PO ref numbers are stored, never
+full header/detail rows (BigQuery and MSSQL already hold those).
+
+rgmc-bc-api's record_manual_handoff writes into this same collection for the Upload
+Dashboard's manual "Retrigger Handoff (MSSQL)" button, so a manual per-PO retrigger
+shows up in the same history as an automated bridge run.
 
 Same lazy-singleton-client pattern as so_buffer_history.py — each service file in
 this repo keeps its own Firestore client rather than sharing one.
@@ -30,50 +33,95 @@ def _client():
 def record_handoff(
     group_code: str,
     method: str,
-    status: str,
-    tables: dict[str, dict[str, list[str]]],
-    duplicate_po_refs: dict[str, list[str]] | None = None,
+    mssql_status: str,
+    po_refs_by_file: dict[str, list[str]],
     error: str | None = None,
 ) -> None:
-    """Record one handoff attempt. tables maps a target MSSQL table name (e.g.
-    "CustomerPOULBQ", "CustomerPOULDetailBQ") to a {filename: [po_ref_numbers]}
-    grouping of the PO refs actually inserted for it this run — grouped by the
-    source document (BigQuery's fileName column) so the history reads as "these POs
-    came from this upload" instead of one flat, unordered list. A table whose rows
-    have no fileName available (e.g. detail tables that don't carry it, or a
-    group_code whose source columns were never renamed) groups everything under the
-    single key "(unknown file)" rather than failing.
+    """Record one document per PO ref handed off by the BigQuery bridge this run.
+    mssql_status is "inserted" (freshly written to CustomerPOULBQ/CustomerRABQ this
+    run) or "error" (the insert attempt raised for every po_ref still pending at that
+    point). A po_ref already in MSSQL from an earlier run (a duplicate-key skip) is
+    never re-recorded here — re-writing one every time BigQuery re-serves an
+    already-ingested row (see handoff.md's known upstream-watermark limitation) would
+    spam the history forever with nothing new to report.
 
-    status is "success" or "error" — a duplicate-only run (nothing new to insert) is
-    still "success", just with empty po_ref lists; duplicate_po_refs/error are extra
-    context, not replacements for a full record, kept minimal on purpose.
+    bc_status starts "pending" for an "inserted" po_ref — so_import_worker.py's
+    update_bc_status patches it once the SO-import attempt that follows resolves one
+    way or another — or "not_attempted" for an "error" po_ref, since a failed MSSQL
+    insert means __trigger_so_import never ran for it this round.
 
-    Never raises — a Firestore write failure here must not break the real bridge
-    run it's only recording.
+    Never raises — a Firestore write failure here must not break the real bridge run
+    it's only recording.
     """
     now = datetime.now(timezone.utc)
-    payload: dict = {
-        "date": now.strftime("%Y-%m-%d"),
-        "time": now.strftime("%H:%M:%S"),
-        "timestamp": now,
-        "group_code": group_code,
-        "method": method,
-        "status": status,
-        "tables": {
-            name: {
-                "by_file": by_file,
-                "count": sum(len(refs) for refs in by_file.values()),
-            }
-            for name, by_file in tables.items()
-        },
-    }
-    if duplicate_po_refs:
-        payload["duplicate_po_refs"] = {
-            name: refs for name, refs in duplicate_po_refs.items() if refs
-        }
-    if error:
-        payload["error"] = error
+    bc_status = "pending" if mssql_status == "inserted" else "not_attempted"
     try:
-        _client().collection(_COLLECTION).add(payload)
+        db = _client()
+        collection = db.collection(_COLLECTION)
+        batch = db.batch()
+        for file_name, po_refs in po_refs_by_file.items():
+            for po_ref in po_refs:
+                batch.set(collection.document(), {
+                    "po_ref_number": po_ref,
+                    "file_name": file_name,
+                    "group_code": group_code,
+                    "method": method,
+                    "mssql_status": mssql_status,
+                    "mssql_error": error,
+                    "bc_status": bc_status,
+                    "bc_order_no": None,
+                    "bc_error": None,
+                    "bc_updated_at": None,
+                    "date": now.strftime("%Y-%m-%d"),
+                    "time": now.strftime("%H:%M:%S"),
+                    "timestamp": now,
+                })
+        batch.commit()
     except Exception as e:
         logger.warning(f"record_handoff: failed to write history ({group_code}/{method}): {e}")
+
+
+def update_bc_status(
+    po_ref_number: str,
+    bc_status: str,
+    so_number: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Patches the bc_status (+ bc_order_no/bc_error) of whichever handoff record(s)
+    for this po_ref are still "pending", once the SO-import attempt that followed its
+    MSSQL insert has resolved. bc_status is "created" (header + all lines landed),
+    "buffered" (header created, lines still incomplete), or "error" (the attempt
+    raised, or BC locked the order against further changes).
+
+    Matches on po_ref_number + bc_status=="pending" rather than a stored doc id,
+    since callers (_run_batch, for both fresh inbound orders and buffered retries)
+    only ever have the po_ref — normally at most one doc is ever "pending" for a
+    given po_ref (see record_handoff's duplicate-skip above). A po_ref with no
+    matching pending record (e.g. one that was never bridge-handed-off, just added
+    straight to the buffer) is a silent no-op, not an error.
+
+    Never raises — a Firestore write failure here must not break the real SO-import
+    run it's only recording.
+    """
+    try:
+        from google.cloud.firestore_v1 import FieldFilter
+        db = _client()
+        docs = list(
+            db.collection(_COLLECTION)
+            .where(filter=FieldFilter("po_ref_number", "==", po_ref_number))
+            .where(filter=FieldFilter("bc_status", "==", "pending"))
+            .stream()
+        )
+        if not docs:
+            return
+        batch = db.batch()
+        for doc in docs:
+            batch.update(doc.reference, {
+                "bc_status": bc_status,
+                "bc_order_no": so_number,
+                "bc_error": error,
+                "bc_updated_at": datetime.now(timezone.utc),
+            })
+        batch.commit()
+    except Exception as e:
+        logger.warning(f"update_bc_status: failed to update history for po_ref={po_ref_number!r}: {e}")

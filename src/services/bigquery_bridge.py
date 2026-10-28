@@ -683,18 +683,6 @@ class BigqueryBridge(object):
         full_header_table = header_table
         full_detail_table = detail_table
 
-        # po_ref -> fileName, built once from the full header snapshot — the detail
-        # table never carries fileName itself (see ignore_columns in
-        # mappings_bridge.py), so this is how its handoff-history grouping below
-        # still knows which upload each line came from.
-        po_to_file: dict[str, str] = {}
-        if "fileName" in full_header_table.columns and main_key in full_header_table.columns:
-            for ref, fname in zip(
-                full_header_table[main_key].astype(str),
-                full_header_table["fileName"].fillna("(unknown file)").astype(str),
-            ):
-                po_to_file[ref] = fname.strip() or "(unknown file)"
-
         # Bulk pre-check BEFORE the first insert attempt — detail first, same ordering
         # as the insert itself (see docstring). Replaces discovering duplicates one
         # IntegrityError at a time; the retry loop below still exists as a fallback
@@ -758,10 +746,7 @@ class BigqueryBridge(object):
                     self.__notify("ERROR")
                     record_handoff(
                         self.__group_code, self.__method, "error",
-                        tables={
-                            mssql_header_table_name: self.__group_by_file(header_table, main_key),
-                            mssql_detail_table_name: self.__group_by_file(detail_table, main_key, po_to_file),
-                        },
+                        self.__group_by_file(header_table, main_key),
                         error=str(ie),
                     )
                     return {"status": "error", "message": str(ie)}
@@ -770,10 +755,7 @@ class BigqueryBridge(object):
                 self.__notify("ERROR")
                 record_handoff(
                     self.__group_code, self.__method, "error",
-                    tables={
-                        mssql_header_table_name: self.__group_by_file(header_table, main_key),
-                        mssql_detail_table_name: self.__group_by_file(detail_table, main_key, po_to_file),
-                    },
+                    self.__group_by_file(header_table, main_key),
                     error=str(e),
                 )
                 return {"status": "error", "message": str(e)}
@@ -784,15 +766,8 @@ class BigqueryBridge(object):
         ))
 
         record_handoff(
-            self.__group_code, self.__method, "success",
-            tables={
-                mssql_header_table_name: self.__group_by_file(header_table, main_key),
-                mssql_detail_table_name: self.__group_by_file(detail_table, main_key, po_to_file),
-            },
-            duplicate_po_refs={
-                mssql_header_table_name: sorted(set(self.__dup_header_keys)),
-                mssql_detail_table_name: sorted(set(self.__dup_detail_keys)),
-            },
+            self.__group_code, self.__method, "inserted",
+            self.__group_by_file(header_table, main_key),
         )
 
         total_inserted = len(header_table) + len(detail_table)
