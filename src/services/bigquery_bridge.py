@@ -667,6 +667,45 @@ class BigqueryBridge(object):
             grouped.setdefault(file_name, []).append(ref)
         return grouped
 
+    # Staging table (CustomerPOULBQ/CustomerRABQ) -> the table its own AFTER INSERT
+    # trigger promotes matching rows into. A to_sql() insert into the staging table
+    # only confirms THAT write succeeded -- the trigger runs server-side with no
+    # return value telling this code what it actually did, so a silently-failing or
+    # partially-failing trigger would previously still be reported as a clean
+    # "inserted" handoff. Keyed on the staging table name (not group_code) since
+    # onlinesalespo writes to the same CustomerPOULBQ staging table as customerpoul.
+    _PROMOTED_TABLE_BY_STAGING_TABLE = {
+        "customerpoulbq": "CustomerPOUL",
+        "customerrabq": "CustomerRA",
+    }
+
+    def __verify_trigger_promotion(
+        self, header_table: pandas.DataFrame, mssql_header_table_name: str, main_key: str,
+    ) -> dict[str, bool]:
+        """One bulk SELECT confirming which of header_table's just-inserted po_refs the
+        staging table's AFTER INSERT trigger actually promoted into the real table BC
+        import and everything else reads from — the handoff history's trigger_status.
+
+        Returns {} (meaning "unknown" to every caller) for an unmapped staging table or
+        a verification-query failure — a failed check must never be reported as either
+        a successful or a failed promotion, since neither is actually known.
+        """
+        promoted_table = self._PROMOTED_TABLE_BY_STAGING_TABLE.get(mssql_header_table_name.lower())
+        if not promoted_table or header_table.empty or main_key not in header_table.columns:
+            return {}
+        refs = sorted(set(header_table[main_key].astype(str)))
+        params = {f"v{i}": v for i, v in enumerate(refs)}
+        placeholders = ", ".join(f":{k}" for k in params)
+        query = text(f"SELECT DISTINCT [{main_key}] FROM [{promoted_table}] WHERE [{main_key}] IN ({placeholders})")
+        try:
+            with self.__mssql_engine.connect() as connection:
+                rows = connection.execute(query, params).fetchall()
+        except Exception as e:
+            self.__log(f"Trigger-promotion verification query against {promoted_table} failed: {e}", level="warning")
+            return {}
+        promoted_refs = {str(row[0]) for row in rows}
+        return {ref: (ref in promoted_refs) for ref in refs}
+
     def __insert_dataframes(self, header_table, detail_table, mssql_header_table_name,
                              mssql_detail_table_name, main_key, trigger_so_import=True):
         """Insert header_table/detail_table into their MSSQL staging tables — detail
@@ -781,6 +820,7 @@ class BigqueryBridge(object):
         record_handoff(
             self.__group_code, self.__method, "inserted",
             self.__group_by_file(header_table, main_key),
+            trigger_results=self.__verify_trigger_promotion(header_table, mssql_header_table_name, main_key),
         )
 
         total_inserted = len(header_table) + len(detail_table)

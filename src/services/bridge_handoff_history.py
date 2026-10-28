@@ -36,6 +36,7 @@ def record_handoff(
     mssql_status: str,
     po_refs_by_file: dict[str, list[str]],
     error: str | None = None,
+    trigger_results: dict[str, bool] | None = None,
 ) -> None:
     """Record one document per PO ref handed off by the BigQuery bridge this run.
     mssql_status is "inserted" (freshly written to CustomerPOULBQ/CustomerRABQ this
@@ -44,6 +45,15 @@ def record_handoff(
     never re-recorded here — re-writing one every time BigQuery re-serves an
     already-ingested row (see handoff.md's known upstream-watermark limitation) would
     spam the history forever with nothing new to report.
+
+    trigger_results ({po_ref: bool}, from BigqueryBridge.__verify_trigger_promotion)
+    is the staging table's own AFTER INSERT trigger's ACTUAL result — did this po_ref
+    really land in CustomerPOUL/CustomerRA, not just CustomerPOULBQ/CustomerRABQ — set
+    into trigger_status: "promoted" / "not_promoted" (the insert into the staging
+    table succeeded but the trigger never created the row — a real problem worth
+    surfacing, distinct from mssql_status) / "unknown" (no result available — an
+    "error" mssql_status, where the trigger never had a chance to fire, or the
+    verification query itself failed).
 
     bc_status starts "pending" for an "inserted" po_ref — so_import_worker.py's
     update_bc_status patches it once the SO-import attempt that follows resolves one
@@ -61,6 +71,8 @@ def record_handoff(
         batch = db.batch()
         for file_name, po_refs in po_refs_by_file.items():
             for po_ref in po_refs:
+                promoted = (trigger_results or {}).get(po_ref)
+                trigger_status = "promoted" if promoted is True else "not_promoted" if promoted is False else "unknown"
                 batch.set(collection.document(), {
                     "po_ref_number": po_ref,
                     "file_name": file_name,
@@ -68,6 +80,7 @@ def record_handoff(
                     "method": method,
                     "mssql_status": mssql_status,
                     "mssql_error": error,
+                    "trigger_status": trigger_status,
                     "bc_status": bc_status,
                     "bc_order_no": None,
                     "bc_error": None,
