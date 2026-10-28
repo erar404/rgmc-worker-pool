@@ -663,9 +663,8 @@ def v2_find_sales_order_by_number(number: str, company_name: str) -> dict | None
     url = (
         f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
         f"/companies({company_id})/salesOrders"
-        f"?$filter=number eq '{number_esc}'"
     )
-    resp = _bc_request("get", url, headers=_auth_headers())
+    resp = _bc_request("get", url, headers=_auth_headers(), params={"$filter": f"number eq '{number_esc}'"})
     if not resp.ok:
         return None
     records = _safe_json(resp).get("value", [])
@@ -678,17 +677,29 @@ def v2_find_sales_order_by_external_doc_no(po_ref: str, company_name: str) -> di
 
     Used by the Cloud SQL sync path to find an order whose Firestore buffer doc no
     longer exists (already deleted after the header succeeded) so its lines can still
-    be backfilled from CustomerPOUL/CustomerPOULDetailBQ. Returns the first match
+    be backfilled from CustomerPOULDetailBQ, AND by _create_order's own defensive
+    existing-order check before every header creation. Returns the first match
     ({"id": ..., "number": ..., ...}) or None if no order was ever created for it.
+
+    The $filter is passed via `params`, not hand-interpolated into the URL string —
+    a po_ref containing a literal '#' (e.g. "CSS #320647", a real customer PO number)
+    previously broke this when the filter was embedded directly in the url= string:
+    requests/urllib treats a bare '#' as the start of a URL fragment and silently
+    drops everything after it before the request is even sent, so the filter BC
+    actually received was a truncated, unterminated string literal that matched
+    nothing. v2_find_sales_order_by_external_doc_no always "found" no existing order
+    for that PO, so _create_order kept creating a brand-new header every run —
+    confirmed live: PO ref "CSS #320647" ended up with 30+ duplicate, lineless BC
+    Sales Orders, one per automated batch over several days. `params=` lets requests
+    percent-encode the whole filter value correctly (# -> %23) instead.
     """
     company_id = get_company_id(company_name)
     po_ref_esc = po_ref.replace("'", "''")
     url = (
         f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
         f"/companies({company_id})/salesOrders"
-        f"?$filter=externalDocumentNo eq '{po_ref_esc}'"
     )
-    resp = _bc_request("get", url, headers=_auth_headers())
+    resp = _bc_request("get", url, headers=_auth_headers(), params={"$filter": f"externalDocumentNo eq '{po_ref_esc}'"})
     if not resp.ok:
         return None
     records = _safe_json(resp).get("value", [])
