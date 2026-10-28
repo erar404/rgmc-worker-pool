@@ -1600,13 +1600,6 @@ def _run_backfill_from_cloudsql(
     that company is skipped rather than failing the whole run, since this is an
     on-demand maintenance pass, not something Pub/Sub needs to retry redelivering.
     """
-    extra_recipients = [notify["email"]] if notify and notify.get("email") else None
-    requested_by = (
-        f" requested_by={notify.get('name', '')} <{notify.get('email', '')}> "
-        f"({notify.get('department', '')}, {notify.get('company', '')})"
-        if notify else ""
-    )
-
     location_code: str = config.POUL_SO_DEFAULT_LOCATION
 
     # Overrides aren't scoped per BC company (so_buffer_service.save_override keys
@@ -1620,7 +1613,6 @@ def _run_backfill_from_cloudsql(
     successes: list[dict] = []
     errors: list[dict] = []
     skipped_existing: list[str] = []
-    total_headers_considered = 0
 
     for company in companies:
         try:
@@ -1644,7 +1636,6 @@ def _run_backfill_from_cloudsql(
         company_headers = gcp_api_client.fetch_customerpoul_by_create_by(
             create_by, date_from=date_from, date_to=date_to, company_id=company_id,
         )
-        total_headers_considered += len(company_headers)
         # customerBranchId is already on each CustomerPOUL row fetched above — batch-
         # fetch every unique branch's CustomerBranch row (customerBranchCode) once for
         # the whole company instead of per order (see _create_order's new structured
@@ -1712,38 +1703,14 @@ def _run_backfill_from_cloudsql(
                 attempt_count = so_buffer.save_failed_order(h, lines, company, f"cloudsql-backfill:{company}", err_str)
                 errors.append({"po_ref": po_ref, "error": err_str, "attempt_count": attempt_count})
 
-    _send_batch_notification(
-        successes, errors, "/".join(companies), f"cloudsql-backfill:{create_by}",
-        label="POUL SO Cloud SQL Backfill", notify=notify,
-    )
-    _send_unmatched_items_notification(
-        successes, "/".join(companies), f"cloudsql-backfill:{create_by}",
-        label="POUL SO Cloud SQL Backfill", notify=notify,
-    )
-    bot_notify.notify_po_batch(
-        successes, errors, "/".join(companies), f"cloudsql-backfill:{create_by}",
-        label="POUL SO Cloud SQL Backfill",
-    )
-    bot_notify.notify_po_unmatched(
-        successes, "/".join(companies), f"cloudsql-backfill:{create_by}",
-        label="POUL SO Cloud SQL Backfill",
-    )
-    if skipped_existing:
-        notify_success(module="poul_so_import", 
-            title=f"POUL SO Cloud SQL Backfill — {len(skipped_existing)} PO(s) skipped (already in BC)",
-            detail="\n".join(f"  - {ref}" for ref in skipped_existing),
-            context=f"companies={companies} create_by={create_by!r} date_from={date_from!r} date_to={date_to!r}{requested_by}",
-            extra_recipients=extra_recipients,
-        )
-    if not total_headers_considered:
-        notify_success(module="poul_so_import", 
-            title="POUL SO Cloud SQL Backfill — nothing to backfill",
-            detail=f"No CustomerPOUL rows found with create_by={create_by!r} "
-                   f"date_from={date_from!r} date_to={date_to!r}.",
-            context=f"companies={companies}{requested_by}",
-            extra_recipients=extra_recipients,
-        )
-
+    # No email/IT-bot notifications from this path — this handler is the hourly
+    # customerpoul-backfill-held-back Cloud Scheduler job (every 2h, 7am-8pm
+    # weekdays), which runs whether or not there's anything to do and is safe to run
+    # repeatedly (skips any PO that already has a BC order) by design, so a routine
+    # run's "nothing to backfill"/"N already in BC" result was pure noise next to the
+    # real upload (_run_batch) and bridge-handoff (bigquery_bridge.py's __notify)
+    # notifications, which are untouched. A genuine failure here still isn't silent —
+    # it's buffered via so_buffer.save_failed_order above, visible on /reconcile.
     summary = {
         "orders_created": len(successes),
         "orders_failed": len(errors),
