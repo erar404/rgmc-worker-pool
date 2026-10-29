@@ -149,7 +149,15 @@ class BigqueryBridge(object):
                     return {"status": "error", "message": str(e)}
 
     def __get_bigquery_data(self, table_name):
-        """Get data from BigQuery based on the last run timestamp."""
+        """Get data from BigQuery based on the last run timestamp.
+
+        timeout=120 on every read_gbq_with_timeout call below, not the 60s module
+        default — confirmed live (2026-10-29) that EVERY automated customerpoul bridge
+        run was failing with "BigQuery read timed out after 60s" on this exact call
+        (the header fetch alone routinely took close to a minute), silently stopping
+        all new PO handoffs for hours. A longer ceiling only matters when a read is
+        already this slow — it costs nothing on a fast, successful one.
+        """
         try:
             if table_name == 'DocumentAIBQ':
                 query = "SELECT * FROM `{}.int_document_ai`".format(config.BIGQUERY_DATASET_ID)
@@ -161,6 +169,7 @@ class BigqueryBridge(object):
                     query,
                     project_id=config.BIGQUERY_PROJECT_ID,
                     dialect='standard',
+                    timeout=120,
                 )
                 self.__log(f"Fetched {len(df)} records from BigQuery.", level="info")
                 return df
@@ -174,6 +183,7 @@ class BigqueryBridge(object):
                     query,
                     project_id=config.BIGQUERY_PROJECT_ID,
                     dialect='standard',
+                    timeout=120,
                 )
                 self.__log(f"Fetched {len(df)} records from BigQuery.", level="info")
                 return df
@@ -188,6 +198,7 @@ class BigqueryBridge(object):
                     query,
                     project_id=config.BIGQUERY_PROJECT_ID,
                     dialect='standard',
+                    timeout=120,
                 )
                 self.__log(f"Fetched {len(df)} records from BigQuery.", level="info")
                 return df
@@ -201,6 +212,7 @@ class BigqueryBridge(object):
                     query,
                     project_id=config.BIGQUERY_PROJECT_ID,
                     dialect='standard',
+                    timeout=120,
                 )
                 self.__log(f"Fetched {len(df)} records from BigQuery.", level="info")
                 return df
@@ -214,6 +226,7 @@ class BigqueryBridge(object):
                     query,
                     project_id=config.BIGQUERY_PROJECT_ID,
                     dialect='standard',
+                    timeout=120,
                 )
                 self.__log(f"Fetched {len(df)} records from BigQuery.", level="info")
                 return df
