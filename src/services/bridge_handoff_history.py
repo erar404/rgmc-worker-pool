@@ -94,6 +94,53 @@ def record_handoff(
         logger.warning(f"record_handoff: failed to write history ({group_code}/{method}): {e}")
 
 
+def record_single_handoff(
+    po_ref_number: str,
+    file_name: str | None,
+    group_code: str,
+    method: str,
+    mssql_status: str,
+    trigger_status: str,
+    error: str | None = None,
+) -> None:
+    """Record one bridge_handoff_history_{env} entry for a single PO ref with its own
+    independent mssql_status/trigger_status — used by so_import_worker.py's
+    "poul-so-retrigger-file" handler, where different POs in the same file-scoped batch
+    can each succeed or fail independently (unlike record_handoff above, which assumes
+    one mssql_status for an entire po_refs_by_file batch — an automated bridge run either
+    inserted everything it fetched or raised for everything still pending, never a mix).
+
+    Same document shape as rgmc-bc-api's so_buffer_service.record_manual_handoff (the
+    same Handoff History "Retrigger" button's single-PO path), so both sources display
+    identically in the Upload Dashboard's Handoff History tab.
+
+    Never raises — a Firestore write failure here must not break the retrigger run
+    it's only recording.
+    """
+    now = datetime.now(timezone.utc)
+    bc_status = "pending" if mssql_status == "inserted" else "not_attempted"
+    try:
+        db = _client()
+        db.collection(_COLLECTION).add({
+            "po_ref_number": po_ref_number,
+            "file_name": file_name or "(unknown file)",
+            "group_code": group_code,
+            "method": method,
+            "mssql_status": mssql_status,
+            "mssql_error": error,
+            "trigger_status": trigger_status,
+            "bc_status": bc_status,
+            "bc_order_no": None,
+            "bc_error": None,
+            "bc_updated_at": None,
+            "date": now.strftime("%Y-%m-%d"),
+            "time": now.strftime("%H:%M:%S"),
+            "timestamp": now,
+        })
+    except Exception as e:
+        logger.warning(f"record_single_handoff: failed to write history for po_ref={po_ref_number!r}: {e}")
+
+
 def update_bc_status(
     po_ref_number: str,
     bc_status: str,

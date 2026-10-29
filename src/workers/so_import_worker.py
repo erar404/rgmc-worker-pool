@@ -55,6 +55,17 @@ rgmc-bc-api's POST .../so-buffer/shipto-fixes, with no BC write at that point):
   BC fresh (still Open, still submittedBy "SBIC AI Uploading", shipToCode still blank)
   immediately before PATCHing, and writes the outcome back onto the same doc.
 
+A seventh message type cleans up + re-inserts every PO under one uploaded BigQuery
+file_name (or an explicit po_ref_numbers list) — published by gcp-api's POST
+/customerpoul/retrigger-file (the Upload Dashboard's Handoff History/Search tabs'
+"Retrigger Handoff"/"Retrigger whole file" buttons). Moved off gcp-api's own request
+path because a large file's BigQuery lookups can take several minutes:
+  { "type": "poul-so-retrigger-file", "file_name": "portal/batch/.../x.json" }
+  or: { "type": "poul-so-retrigger-file", "po_ref_numbers": ["PO123", "PO456"] }
+  Calls rgmc-gcp-api's existing cleanup-staging/insert-from-bigquery endpoints per PO
+  (see retrigger_client.py) and records each outcome into bridge_handoff_history_{env}
+  via record_single_handoff, same as sbic-manual-trigger-page's own retrigger routes.
+
 Processing per batch message:
   1. Resolve BC company from the first order's companyName.
   2. Pre-fetch all BC ship-to addresses and item references ONCE for the batch.
@@ -74,7 +85,8 @@ from google.cloud import pubsub_v1
 
 from src import config
 from src.services import bc_client, gcp_api_client, sbic_db, shipto_fix_history, shipto_fixes, so_buffer, so_buffer_history, so_buffer_overrides, reprocess_status
-from src.services.bridge_handoff_history import update_bc_status
+from src.services.bridge_handoff_history import update_bc_status, record_single_handoff
+from src.services import retrigger_client
 from src.services.send_mail import notify_error, notify_success, notify_warning
 from src.services import bot_notify
 
@@ -2003,6 +2015,88 @@ def _run_batch(
     return True, summary
 
 
+def _run_retrigger_file(
+    file_name: str | None, po_ref_numbers: list[str] | None, run_id: str | None = None,
+) -> tuple[bool, dict]:
+    """Handle a poul-so-retrigger-file message: cleanup-staging + re-insert every PO
+    under one BigQuery file_name (or an explicit po_ref_numbers list) into
+    CustomerPOULBQ/CustomerPOULDetailBQ, retrying the AFTER INSERT trigger's promotion
+    for each — same per-PO logic as sbic-manual-trigger-page's own
+    _cleanup_and_reinsert_po/retrigger-mssql-batch route, moved here specifically so a
+    slow, many-PO BigQuery lookup never has to race an HTTP request deadline again
+    (confirmed live, 2026-10-29, that a 100+-PO file can take several minutes).
+
+    Always returns (True, summary) — one PO's failure never fails the whole run, only
+    an unexpected exception (crash, e.g. the BigQuery lookup itself failing) does, via
+    the caller's own except block instead."""
+    if po_ref_numbers:
+        po_refs = sorted(set(po_ref_numbers))
+    else:
+        po_refs = retrigger_client.resolve_po_refs_by_file(file_name or "")
+    if not po_refs:
+        return True, {"total": 0, "ok_count": 0, "error_count": 0, "results": []}
+
+    headers, details = retrigger_client.fetch_headers_and_details(po_refs)
+    headers_by_ref = {h.get("po_ref_number"): h for h in headers if h.get("po_ref_number")}
+
+    results: list[dict] = []
+    for po_ref in po_refs:
+        header = headers_by_ref.get(po_ref)
+        if not header:
+            results.append({
+                "po_ref": po_ref, "status": "error", "trigger_status": None,
+                "detail": "No current BigQuery int_document_ai row found for this PO ref.",
+            })
+            continue
+        po_details = [d for d in details if d.get("po_ref_number") == po_ref]
+        this_file_name = header.get("file_name") or file_name
+
+        try:
+            retrigger_client.cleanup_staging(po_ref)
+        except Exception as exc:
+            results.append({"po_ref": po_ref, "status": "error", "trigger_status": None, "detail": f"Cleanup failed: {exc}"})
+            continue
+
+        try:
+            status_code, body = retrigger_client.insert_from_bigquery(header, po_details, po_ref)
+        except Exception as exc:
+            results.append({"po_ref": po_ref, "status": "error", "trigger_status": None, "detail": f"Insert failed: {exc}"})
+            continue
+
+        mssql_status = "inserted" if status_code == 200 and body.get("status") == "success" else "error"
+        error_detail = None if mssql_status == "inserted" else (body.get("message") or f"HTTP {status_code}")
+        trigger_status = retrigger_client.check_promoted(po_ref) if mssql_status == "inserted" else "unknown"
+
+        record_single_handoff(
+            po_ref_number=po_ref, file_name=this_file_name, group_code="customerpoul",
+            method="worker-retrigger-file", mssql_status=mssql_status,
+            trigger_status=trigger_status, error=error_detail,
+        )
+
+        if mssql_status != "inserted":
+            po_status = "error"
+        elif trigger_status == "not_promoted":
+            po_status = "not_promoted"
+        else:
+            po_status = "success"
+        results.append({
+            "po_ref": po_ref, "status": po_status, "trigger_status": trigger_status,
+            "detail": error_detail or (
+                "Inserted and promoted." if trigger_status == "promoted" else
+                "Inserted — trigger promotion status unknown." if trigger_status == "unknown" else
+                "Re-inserted successfully."
+            ),
+        })
+
+    summary = {
+        "total": len(results),
+        "ok_count": sum(1 for r in results if r["status"] == "success"),
+        "error_count": sum(1 for r in results if r["status"] in ("error", "not_promoted")),
+        "results": results,
+    }
+    return True, summary
+
+
 def _process(message: pubsub_v1.subscriber.message.Message) -> None:
     # ── Parse ─────────────────────────────────────────────────────────────────
     try:
@@ -2124,6 +2218,39 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
                 title=f"POUL SO Cloud SQL Backfill — hard error (run {run_id or 'unknown'})",
                 detail=str(exc),
                 context=f"companies={companies} create_by={create_by!r} date_from={date_from!r} date_to={date_to!r} notify={notify}",
+            )
+            message.nack()
+            return
+        if ok:
+            reprocess_status.finish_run(run_id, status="done", summary=summary)
+            message.ack()
+        else:
+            message.nack()
+        return
+
+    if msg_type == "poul-so-retrigger-file":
+        # Manual trigger (published by gcp-api) — the Upload Dashboard's "Retrigger
+        # Handoff (cleanup & re-insert all)" / "Retrigger whole file" buttons, moved
+        # here off gcp-api's own request path (confirmed live, 2026-10-29, that this
+        # can take several minutes for a large file).
+        file_name = data.get("file_name") or None
+        po_ref_numbers = data.get("po_ref_numbers") or None
+        notify = data.get("notify") or None
+        run_id = data.get("run_id") or None
+        logger.info(
+            f"POUL SO: retrigger-file triggered for file_name={file_name!r} "
+            f"po_ref_numbers={po_ref_numbers or 'n/a'} notify={notify} run_id={run_id!r}"
+        )
+        reprocess_status.start_run(run_id, companies=[], notify=notify)
+        try:
+            ok, summary = _run_retrigger_file(file_name, po_ref_numbers, run_id=run_id)
+        except Exception as exc:
+            logger.error(f"POUL SO: retrigger-file run {run_id!r} crashed: {exc}")
+            reprocess_status.finish_run(run_id, status="error", summary={}, error=str(exc))
+            notify_error(module="poul_so_import",
+                title=f"POUL SO Retrigger File — hard error (run {run_id or 'unknown'})",
+                detail=str(exc),
+                context=f"file_name={file_name!r} po_ref_numbers={po_ref_numbers or 'n/a'} notify={notify}",
             )
             message.nack()
             return
