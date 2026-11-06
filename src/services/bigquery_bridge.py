@@ -599,7 +599,9 @@ class BigqueryBridge(object):
 
         Tie-break, most-preferred first: companyName resolves to a BC-postable company
         (contains SUNCOAST/SBIC — same keyword check __trigger_so_import's own mask
-        uses), has >=1 matching row in detail_table, latest createdAt.
+        uses), has >=1 matching row in detail_table, has a non-blank companyName at
+        all (even if not BC-routable — keeps this tier instead of dropping it when
+        BC-routability was added), latest createdAt.
 
         BC-routability deliberately outranks "has items": confirmed live 2026-11-06
         that a po_ref's duplicate rows can split exactly this way — a BC-routable
@@ -627,7 +629,8 @@ class BigqueryBridge(object):
             company_upper = str(row.get('companyName') or '').upper()
             is_bc_routable = ('SUNCOAST' in company_upper) or ('SBIC' in company_upper)
             has_items = row['poRefNumber'] in detail_refs
-            return (is_bc_routable, has_items, row.get('createdAt'))
+            has_company = bool(company_upper.strip())
+            return (is_bc_routable, has_items, has_company, row.get('createdAt'))
 
         keep_indices = []
         for ref, group in header_table.groupby('poRefNumber', sort=False):

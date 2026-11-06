@@ -250,10 +250,11 @@ def _resolve_valid_lines(
       - resolved: [(line, item_no), ...] for lines with a known SKU, a matching item
         reference, and a positive quantity.
       - skipped: [{"sku", "description", "reason", "line"}, ...] for every line left
-        out that might still become resolvable later — reason is "no_bc_match" (empty
-        SKU or no item reference found in BC) or "non_positive_qty". "line" is the raw
-        original line dict, kept so it can be re-buffered and retried (e.g. once a
-        reconcile-page override resolves its SKU) instead of lost.
+        out that might still become resolvable later — reason is "no_item_reference"
+        (SKU itself is blank), "item_not_matched" (a SKU was given but no BC item
+        reference matches it), or "non_positive_qty". "line" is the raw original line
+        dict, kept so it can be re-buffered and retried (e.g. once a reconcile-page
+        override resolves its SKU) instead of lost.
       - dropped_inactive: [{"sku", "description", "line"}, ...] for every line whose raw
         SKU (or description, if blank) matches a key saved on /reconcile's Inactive
         Items tab. These are deliberately excluded from both resolved AND skipped —
@@ -299,13 +300,13 @@ def _resolve_valid_lines(
                 logger.info(f"PO {po_ref} line {i}: using reconcile-page SKU link → item={item_no!r}")
             elif not sku:
                 logger.warning(f"PO {po_ref} line {i}: empty SKU — invalid")
-                skipped.append({"sku": "", "description": desc, "reason": "no_bc_match", "line": line})
+                skipped.append({"sku": "", "description": desc, "reason": "no_item_reference", "line": line})
                 continue
             else:
                 logger.warning(
                     f"PO {po_ref} line {i}: SKU {sku!r} not found in item references — invalid"
                 )
-                skipped.append({"sku": sku_raw, "description": desc, "reason": "no_bc_match", "line": line})
+                skipped.append({"sku": sku_raw, "description": desc, "reason": "item_not_matched", "line": line})
                 continue
 
         qty = _resolve_line_qty(line)
@@ -743,6 +744,21 @@ def _create_order(
                 )
                 flat_customer_no = (resolved_customer.get("customerNo") or "").strip() or None
 
+                # Distinguishes the two raise sites below for /reconcile and the
+                # buffered-order reason text — both used to say the same generic "No
+                # ship-to address..." regardless of why. Checked in this order because a
+                # blank customer name means there was never anything to look a customer
+                # up against in the first place, which is the more fundamental gap of
+                # the two. When neither condition holds (branch_code is populated but
+                # just isn't registered in BC yet), no prefix is added — that's a real,
+                # distinct 4th state and relabeling it "no lookup code" would be wrong.
+                if not (header.get("customerName") or "").strip():
+                    buffer_reason_prefix = f"Customer has no code on file for branch {branch_name!r} — "
+                elif not branch_code:
+                    buffer_reason_prefix = f"Branch has no lookup code on file for {branch_name!r} — "
+                else:
+                    buffer_reason_prefix = ""
+
                 if ship_to_match:
                     customer_no, ship_to_code = ship_to_match
                     resolution_tier = "automatic_ship_to_match"
@@ -775,7 +791,7 @@ def _create_order(
                     # slipped through before this check existed: an unscoped name-based
                     # link offers nothing to confirm it's correct for THIS branch.
                     raise ValueError(
-                        f"No ship-to address in BC for branch code={branch_code!r} / name={branch_name!r} "
+                        f"{buffer_reason_prefix}No ship-to address in BC for branch code={branch_code!r} / name={branch_name!r} "
                         f"(company={company!r}) — not using the only customer link on file for "
                         f"{header.get('customerName')!r} because it's an unscoped (flat) override, and BC may "
                         f"have more than one Customer record sharing this name. Buffering instead of guessing; "
@@ -783,7 +799,7 @@ def _create_order(
                     )
                 else:
                     raise ValueError(
-                        f"No ship-to address in BC for branch code={branch_code!r} / "
+                        f"{buffer_reason_prefix}No ship-to address in BC for branch code={branch_code!r} / "
                         f"name={branch_name!r} (company={company!r})"
                     )
 
@@ -802,7 +818,10 @@ def _create_order(
     # lines — the invalid lines are reported as skipped rather than blocking the
     # whole PO from ever reaching BC.
     resolved_lines, skipped_lines, dropped_inactive = _resolve_valid_lines(po_ref, lines, ref_map, inactive_skus)
-    unmatched_items: list[dict] = [s for s in skipped_lines if s["reason"] == "no_bc_match"]
+    unmatched_items: list[dict] = [
+        {"sku": s["sku"], "description": s["description"], "reason": s["reason"]}
+        for s in skipped_lines if s["reason"] in ("no_item_reference", "item_not_matched")
+    ]
     if not resolved_lines:
         logger.warning(
             f"PO {po_ref!r}: all {len(lines)} line(s) invalid (missing SKU/item "
@@ -1114,7 +1133,7 @@ def _send_unmatched_items_notification(
         if r["branch_name"]:
             customer_str += f" — {r['branch_name']}"
         item_lines = "\n".join(
-            f"      - {(it['sku'] or '(blank SKU)')}"
+            f"      - {('(no item reference)' if it.get('reason') == 'no_item_reference' else it['sku'])}"
             + (f" — {it['description']}" if it["description"] else "")
             for it in r["unmatched_items"]
         )
@@ -2281,6 +2300,8 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             return
         if ok:
             reprocess_status.finish_run(run_id, status="done", summary=summary)
+            if create_by == "trigger-bc-only":
+                bot_notify.notify_bc_retrigger(companies, po_ref_numbers, summary, notify, label="Retrigger BC only")
             message.ack()
         else:
             message.nack()
@@ -2318,6 +2339,8 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             return
         if ok:
             reprocess_status.finish_run(run_id, status="done", summary=summary)
+            if create_by == "trigger-bc-only":
+                bot_notify.notify_bc_retrigger(companies, po_ref_numbers, summary, notify, label="Retrigger BC only")
             message.ack()
         else:
             message.nack()

@@ -93,7 +93,9 @@ def merge_duplicate_headers(headers: list[dict], details: list[dict]) -> dict[st
 
     Tie-break, most-preferred first: company_name resolves to a BC-postable company
     (contains SUNCOAST/SBIC — same keyword check so_import_worker.py's own
-    __trigger_so_import mask uses), has >=1 matching row in details, latest created_at.
+    __trigger_so_import mask uses), has >=1 matching row in details, has a non-blank
+    company_name at all (even if not BC-routable — keeps this tier instead of dropping
+    it when BC-routability was added), latest created_at.
 
     BC-routability deliberately outranks "has items": confirmed live 2026-11-06 that a
     po_ref's duplicates can split exactly this way — a BC-routable "SUNCOAST BRANDS"
@@ -111,7 +113,8 @@ def merge_duplicate_headers(headers: list[dict], details: list[dict]) -> dict[st
         company_upper = (h.get("company_name") or "").upper()
         is_bc_routable = ("SUNCOAST" in company_upper) or ("SBIC" in company_upper)
         has_items = h.get("po_ref_number") in detail_refs
-        return (is_bc_routable, has_items, h.get("created_at") or "")
+        has_company = bool(company_upper.strip())
+        return (is_bc_routable, has_items, has_company, h.get("created_at") or "")
 
     best_by_ref: dict[str, dict] = {}
     for h in headers:

@@ -79,6 +79,32 @@ def notify_po_batch(
     threading.Thread(target=_post, args=("po-upload-batch", body), daemon=True).start()
 
 
+def notify_bc_retrigger(
+    companies: list[str],
+    po_ref_numbers: list[str] | None,
+    summary: dict,
+    notify: dict | None,
+    label: str = "POUL SO Import",
+) -> None:
+    """Teams notification for a "Retrigger BC only" action (Search/Handoff History
+    tabs' per-PO and per-file buttons) — distinct from notify_po_batch above, which
+    models a full upload run (CREATED/BUFFERED/IMS sections that don't fit "we just
+    re-checked N already-known POs against BC"). summary is whichever of
+    _run_sync_from_cloudsql's or _run_backfill_from_cloudsql's own summary dict was
+    returned — passed through as-is rather than reshaped, so this stays correct if
+    either shape changes.
+    """
+    body = {
+        "event": "bc.retrigger",
+        "label": label,
+        "companies": companies,
+        "po_ref_numbers": po_ref_numbers or [],
+        "summary": summary,
+        "requested_by": notify or {},
+    }
+    threading.Thread(target=_post, args=("bc-retrigger", body), daemon=True).start()
+
+
 def notify_po_unmatched(
     successes: list[dict],
     company: str,

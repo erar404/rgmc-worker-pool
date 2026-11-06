@@ -18,6 +18,9 @@ logger = logging.getLogger("bridge_run_lock")
 _db = None
 _COLLECTION = f"bridge_run_lock_{config.GCP_ENV.lower()}"
 COOLDOWN = timedelta(minutes=5)
+# Generous vs. main()'s own worst case (two sequential BigQuery reads, each with a
+# 300s timeout, plus the MSSQL write) -- see try_start's docstring for why this exists.
+STALE_AFTER = timedelta(minutes=20)
 
 
 def _client():
@@ -34,6 +37,15 @@ def try_start(group_code: str) -> bool:
     False, with no state change, if either is true, meaning the caller should skip
     this trigger entirely rather than run again.
 
+    A "running" lock older than STALE_AFTER (20 minutes) is treated as abandoned and
+    reclaimed rather than blocking forever -- confirmed live 2026-11-05/06: the
+    worker holding this lock died mid-run (crash/restart) before its `finally:
+    finish()` call could clear it, leaving customerpoul stuck "running" for ~23
+    straight hours. Every automated trigger in that window was silently skipped with
+    no alert; the only runs that actually happened were a human manually clicking
+    "Run Bridge Now" (method="manual", which bypasses this lock entirely) several
+    times after noticing uploads weren't flowing through.
+
     Best-effort and fails OPEN: a Firestore read/write failure here must never
     permanently block a real bridge run, so it's treated as "no lock" and returns
     True on any error.
@@ -42,11 +54,18 @@ def try_start(group_code: str) -> bool:
         doc_ref = _client().collection(_COLLECTION).document(group_code)
         data = doc_ref.get().to_dict() or {}
         now = datetime.now(timezone.utc)
-        if data.get("status") == "running":
-            logger.info(f"bridge_run_lock: {group_code!r} already running — skipping this trigger")
-            return False
         started_at = data.get("started_at")
-        if started_at and (now - started_at) < COOLDOWN:
+        if data.get("status") == "running":
+            if started_at and (now - started_at) > STALE_AFTER:
+                logger.warning(
+                    f"bridge_run_lock: {group_code!r} has been 'running' for {now - started_at} "
+                    f"(> {STALE_AFTER}) — treating as an abandoned lock from a crashed/restarted "
+                    f"worker and reclaiming it instead of blocking every future trigger forever"
+                )
+            else:
+                logger.info(f"bridge_run_lock: {group_code!r} already running — skipping this trigger")
+                return False
+        elif started_at and (now - started_at) < COOLDOWN:
             logger.info(f"bridge_run_lock: {group_code!r} last started {now - started_at} ago (< {COOLDOWN}) — skipping this trigger")
             return False
         doc_ref.set({"status": "running", "started_at": now}, merge=True)
