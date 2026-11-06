@@ -19,6 +19,7 @@ in this same repo already reads these exact views the same way. Removing the HTT
 leaves BigQuery's own latency and the Pub/Sub ack deadline (600s, confirmed safe for
 this use) as the only remaining limits.
 """
+import datetime
 import logging
 
 import pandas as pd
@@ -37,22 +38,29 @@ def _escape_sql_literal(value: str) -> str:
     return value.replace("'", "''")
 
 
-def _json_safe(df: pd.DataFrame) -> pd.DataFrame:
-    """Converts every datetime64 column to an ISO string (NaT -> None) in place.
+def _json_safe_scalar(value):
+    if isinstance(value, (pd.Timestamp, datetime.date)):
+        return None if pd.isna(value) else value.isoformat()
+    return value
 
-    BigQuery TIMESTAMP/DATETIME/DATE columns come back from read_gbq_with_timeout as
-    pandas.Timestamp, not plain Python datetimes -- .to_dict(orient="records") keeps
-    them as Timestamp objects, which requests' json= parameter (plain stdlib
-    json.dumps, no datetime support) cannot serialize. Confirmed live 2026-11-06:
-    every retrigger-file insert failed with "Object of type Timestamp is not JSON
-    serializable" once this module started reading BigQuery directly here instead of
-    going through rgmc-gcp-api's FastAPI layer, which serializes datetimes for free.
+
+def _json_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """Converts every pandas.Timestamp/datetime.date/datetime.datetime value to an
+    ISO string (NaT/NaN -> None), checked element-wise rather than by column dtype.
+
+    BigQuery TIMESTAMP/DATETIME columns come back from read_gbq_with_timeout as a
+    proper datetime64 column, but DATE columns (po_date, delivery_date,
+    cancellation_date) come back as plain object-dtype columns holding
+    datetime.date scalars -- a dtype-based check (is_datetime64_any_dtype) misses
+    these entirely. .to_dict(orient="records") keeps whichever of these it finds,
+    which requests' json= parameter (plain stdlib json.dumps, no date/datetime
+    support) cannot serialize. Confirmed live 2026-11-06, in two steps: first
+    "Object of type Timestamp is not JSON serializable" (datetime64 columns, fixed by
+    an earlier dtype-based version of this function), then "Object of type date is
+    not JSON serializable" once that fix still left the DATE columns unconverted --
+    this element-wise version catches both regardless of column dtype.
     """
-    df = df.copy()
-    for col in df.columns:
-        if pd.api.types.is_datetime64_any_dtype(df[col]):
-            df[col] = df[col].apply(lambda v: v.isoformat() if pd.notnull(v) else None)
-    return df
+    return df.map(_json_safe_scalar)
 
 
 def resolve_po_refs_by_file(file_name: str) -> list[str]:
