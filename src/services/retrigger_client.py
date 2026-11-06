@@ -20,6 +20,8 @@ leaves BigQuery's own latency and the Pub/Sub ack deadline (600s, confirmed safe
 this use) as the only remaining limits.
 """
 import datetime
+import decimal
+import json
 import logging
 
 import pandas as pd
@@ -41,6 +43,8 @@ def _escape_sql_literal(value: str) -> str:
 def _json_safe_scalar(value):
     if isinstance(value, (pd.Timestamp, datetime.date)):
         return None if pd.isna(value) else value.isoformat()
+    if isinstance(value, decimal.Decimal):
+        return float(value)
     return value
 
 
@@ -61,6 +65,21 @@ def _json_safe(df: pd.DataFrame) -> pd.DataFrame:
     this element-wise version catches both regardless of column dtype.
     """
     return df.map(_json_safe_scalar)
+
+
+def _json_default(value):
+    """Fallback for json.dumps(default=...) below -- a second line of defense behind
+    _json_safe for whatever type shows up in a BigQuery row that the stdlib json
+    module doesn't know how to serialize. decimal.Decimal (from a NUMERIC/BIGNUMERIC
+    column, e.g. unitAmount/netAmount) is the one confirmed live 2026-11-06, same
+    "not JSON serializable" failure shape as Timestamp/date before it -- converted to
+    float since these are money/quantity fields that still need to be numeric
+    downstream. Anything else unexpected falls back to str() rather than crashing the
+    whole insert outright.
+    """
+    if isinstance(value, decimal.Decimal):
+        return float(value)
+    return str(value)
 
 
 def resolve_po_refs_by_file(file_name: str) -> list[str]:
@@ -173,7 +192,11 @@ def insert_from_bigquery(header: dict, details: list, po_ref: str) -> tuple[int,
     resp = _session.post(
         f"{config.GCP_API_BASE}/customerpoul/insert-from-bigquery",
         params={"groupcode": f"retrigger-{po_ref}"},
-        json={"headers": [header], "details": details},
+        # json=... would re-raise the same "not JSON serializable" failure for
+        # anything _json_safe's dataframe-level pass didn't already catch -- see
+        # _json_default's docstring.
+        data=json.dumps({"headers": [header], "details": details}, default=_json_default),
+        headers={"Content-Type": "application/json"},
         timeout=90,
     )
     try:
