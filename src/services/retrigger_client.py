@@ -1,34 +1,53 @@
-"""HTTP client for rgmc-gcp-api's BigQuery-backed retrigger endpoints, used by
-so_import_worker.py's "poul-so-retrigger-file" handler.
+"""Client for rgmc-gcp-api's retrigger endpoints, used by so_import_worker.py's
+"poul-so-retrigger-file" handler — plus direct BigQuery reads for the two lookups that
+used to go through rgmc-gcp-api's HTTP layer.
 
-Moved off sbic-manual-trigger-page's/rgmc-gcp-api's own request path (confirmed live,
-2026-10-29: resolving + re-fetching every PO under a large uploaded file can take
-several minutes against int_document_ai/int_document_ai_detail's current size — well
-past any reasonable HTTP request deadline). This worker has no such deadline, so these
-calls simply use a generous timeout and let the retrigger run however long it genuinely
-takes; the single-PO calls (cleanup-staging, insert-from-bigquery, the promotion check)
-are already fast and keep their original timeouts.
+The single-PO calls (cleanup-staging, insert-from-bigquery, the promotion check) stay
+as HTTP calls to rgmc-gcp-api, since they're genuinely fast MSSQL writes (already well
+under Cloud Run's own request ceiling) and MSSQL access is owned by that service.
+
+resolve_po_refs_by_file/fetch_headers_and_details read BigQuery DIRECTLY instead
+(confirmed live 2026-11-06: hopping through rgmc-gcp-api's GET /bigquery_routes/*
+endpoints stacked TWO timeout ceilings — this worker's own 600s client timeout, which
+never got the chance to matter, underneath Cloud Run's ~300s request-timeout, which
+fired first and turned a slow-but-eventually-successful BigQuery read into a hard 504.
+That uncaught 504 then nacked the Pub/Sub message, causing an infinite redelivery loop
+hammering the same already-overloaded view every ~2 minutes for 33+ minutes before the
+subscription's dead-letter policy finally discarded it.) This worker already has full
+BigQuery credentials/config and no HTTP request deadline of its own — bigquery_bridge.py
+in this same repo already reads these exact views the same way. Removing the HTTP hop
+leaves BigQuery's own latency and the Pub/Sub ack deadline (600s, confirmed safe for
+this use) as the only remaining limits.
 """
 import logging
 
 import requests
 
 from src import config
+from src.services.bq_read import read_gbq_with_timeout
 
 logger = logging.getLogger("retrigger_client")
 
 _session = requests.Session()
-_BQ_LOOKUP_TIMEOUT = 600  # no HTTP request deadline to race against in this worker
+_BQ_READ_TIMEOUT = 300  # matches bigquery_bridge.py's own stopgap for this same slow view
+
+
+def _escape_sql_literal(value: str) -> str:
+    return value.replace("'", "''")
 
 
 def resolve_po_refs_by_file(file_name: str) -> list[str]:
-    """Every po_ref_number BigQuery's int_document_ai has under this exact file_name."""
-    resp = _session.get(f"{config.GCP_API_BASE}/bigquery_routes/by_table/value", params={
-        "table_name": "int_document_ai", "where_column": "file_name", "where_value": file_name,
-    }, timeout=_BQ_LOOKUP_TIMEOUT)
-    resp.raise_for_status()
-    rows = resp.json().get("data") or []
-    return sorted({r.get("po_ref_number") for r in rows if r.get("po_ref_number")})
+    """Every po_ref_number BigQuery's int_document_ai has under this exact file_name —
+    read directly, see module docstring for why this no longer goes through
+    rgmc-gcp-api's HTTP layer."""
+    query = (
+        f"SELECT DISTINCT po_ref_number FROM `{config.BIGQUERY_DATASET_ID}.int_document_ai` "
+        f"WHERE file_name = '{_escape_sql_literal(file_name)}'"
+    )
+    df = read_gbq_with_timeout(
+        query, project_id=config.BIGQUERY_PROJECT_ID, dialect="standard", timeout=_BQ_READ_TIMEOUT,
+    )
+    return sorted({r for r in df["po_ref_number"].dropna().tolist() if r})
 
 
 def fetch_headers_and_details(po_refs: list[str]) -> tuple[list[dict], list[dict]]:
@@ -36,13 +55,25 @@ def fetch_headers_and_details(po_refs: list[str]) -> tuple[list[dict], list[dict
     re-fetched fresh by po_ref_number rather than reused from the file-scoped lookup
     above, since BigQuery can re-stamp a PO's file_name under a dbt rematerialization
     while this call is still running (the same quirk sbic-manual-trigger-page's own
-    batch route already works around)."""
-    resp = _session.get(f"{config.GCP_API_BASE}/bigquery_routes/document-ai/search", params={
-        "po_ref_number": ",".join(po_refs), "limit": 1000,
-    }, timeout=_BQ_LOOKUP_TIMEOUT)
-    resp.raise_for_status()
-    body = resp.json()
-    return body.get("data") or [], body.get("detail_data") or []
+    batch route already works around). Read directly, see module docstring for why."""
+    if not po_refs:
+        return [], []
+    refs_sql = ", ".join(f"'{_escape_sql_literal(r)}'" for r in po_refs)
+    header_query = (
+        f"SELECT * FROM `{config.BIGQUERY_DATASET_ID}.int_document_ai` "
+        f"WHERE po_ref_number IN ({refs_sql}) ORDER BY created_at DESC"
+    )
+    detail_query = (
+        f"SELECT * FROM `{config.BIGQUERY_DATASET_ID}.int_document_ai_detail` "
+        f"WHERE po_ref_number IN ({refs_sql})"
+    )
+    headers_df = read_gbq_with_timeout(
+        header_query, project_id=config.BIGQUERY_PROJECT_ID, dialect="standard", timeout=_BQ_READ_TIMEOUT,
+    )
+    details_df = read_gbq_with_timeout(
+        detail_query, project_id=config.BIGQUERY_PROJECT_ID, dialect="standard", timeout=_BQ_READ_TIMEOUT,
+    )
+    return headers_df.to_dict(orient="records"), details_df.to_dict(orient="records")
 
 
 def merge_duplicate_headers(headers: list[dict], details: list[dict]) -> dict[str, dict]:
@@ -60,15 +91,27 @@ def merge_duplicate_headers(headers: list[dict], details: list[dict]) -> dict[st
     row with real lines) — picking the older row here would silently re-insert the PO
     under the wrong header on every retrigger.
 
-    Tie-break, most-preferred first: has >=1 matching row in details, has a non-blank
-    company_name, latest created_at.
+    Tie-break, most-preferred first: company_name resolves to a BC-postable company
+    (contains SUNCOAST/SBIC — same keyword check so_import_worker.py's own
+    __trigger_so_import mask uses), has >=1 matching row in details, latest created_at.
+
+    BC-routability deliberately outranks "has items": confirmed live 2026-11-06 that a
+    po_ref's duplicates can split exactly this way — a BC-routable "SUNCOAST BRANDS"
+    header with zero of its own matching detail rows, alongside a "MANILA TASTE
+    CURATORS VENTURES" header (MTC has no BC company configured, so it can never reach
+    BC at all) that DOES have the real detail rows. Picking the BC-routable header here
+    is safe even though it looks item-less: `_run_retrigger_file` matches each po_ref's
+    detail rows from the full `details` list independently of which header this
+    function returns, so the real lines still get re-inserted regardless — this only
+    decides which company_name attribution the resulting MSSQL row gets.
     """
     detail_refs = {d.get("po_ref_number") for d in details if d.get("po_ref_number")}
 
     def _score(h: dict):
+        company_upper = (h.get("company_name") or "").upper()
+        is_bc_routable = ("SUNCOAST" in company_upper) or ("SBIC" in company_upper)
         has_items = h.get("po_ref_number") in detail_refs
-        has_company = bool((h.get("company_name") or "").strip())
-        return (has_items, has_company, h.get("created_at") or "")
+        return (is_bc_routable, has_items, h.get("created_at") or "")
 
     best_by_ref: dict[str, dict] = {}
     for h in headers:

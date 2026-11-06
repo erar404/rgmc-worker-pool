@@ -597,8 +597,20 @@ class BigqueryBridge(object):
         keeps whichever duplicate happens to sort last, which is the OLDEST one given
         that endpoint's `created_at DESC` ordering — the wrong row, not the best one.
 
-        Tie-break, most-preferred first: has >=1 matching row in detail_table, has a
-        non-blank companyName, latest createdAt.
+        Tie-break, most-preferred first: companyName resolves to a BC-postable company
+        (contains SUNCOAST/SBIC — same keyword check __trigger_so_import's own mask
+        uses), has >=1 matching row in detail_table, latest createdAt.
+
+        BC-routability deliberately outranks "has items": confirmed live 2026-11-06
+        that a po_ref's duplicate rows can split exactly this way — a BC-routable
+        "SUNCOAST BRANDS" header with zero of its own matching detail rows, alongside a
+        "MANILA TASTE CURATORS VENTURES" header (MTC has no BC company configured, so
+        it can never reach BC at all) that DOES have the real detail rows. Picking the
+        BC-routable header here is safe even though it looks item-less: detail_table is
+        matched by poRefNumber independently of which header wins (see
+        __trigger_so_import's own detail_mask), so the real lines still attach
+        regardless of which duplicate header is kept — this only decides which
+        companyName/company attribution the resulting order gets.
         """
         if header_table.empty or 'poRefNumber' not in header_table.columns:
             return header_table
@@ -612,9 +624,10 @@ class BigqueryBridge(object):
         )
 
         def _score(row):
+            company_upper = str(row.get('companyName') or '').upper()
+            is_bc_routable = ('SUNCOAST' in company_upper) or ('SBIC' in company_upper)
             has_items = row['poRefNumber'] in detail_refs
-            has_company = bool(str(row.get('companyName') or '').strip())
-            return (has_items, has_company, row.get('createdAt'))
+            return (is_bc_routable, has_items, row.get('createdAt'))
 
         keep_indices = []
         for ref, group in header_table.groupby('poRefNumber', sort=False):

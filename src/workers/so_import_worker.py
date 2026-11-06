@@ -2047,17 +2047,59 @@ def _run_retrigger_file(
     slow, many-PO BigQuery lookup never has to race an HTTP request deadline again
     (confirmed live, 2026-10-29, that a 100+-PO file can take several minutes).
 
-    Always returns (True, summary) — one PO's failure never fails the whole run, only
-    an unexpected exception (crash, e.g. the BigQuery lookup itself failing) does, via
-    the caller's own except block instead."""
+    Always returns (True, summary) — one PO's failure never fails the whole run, AND a
+    failure in the initial BigQuery lookups below (file-to-po_refs resolution, or the
+    header/detail fetch) is also reported and acked here rather than left to crash and
+    nack. Confirmed live 2026-11-06: a BigQuery read that can't finish inside Cloud
+    Run's own request timeout (independent of how slow the underlying dbt view is —
+    see bigquery_bridge.py's __get_bigquery_data docstring) fails the SAME way on every
+    redelivery, so letting it nack previously caused an infinite Pub/Sub redelivery
+    loop (15+ attempts over 33 minutes, one run) hammering that already-overloaded view
+    until the subscription's dead-letter policy finally discarded it five attempts in.
+    Acking with a clear error instead means a human has to re-run it manually, but
+    nothing else in this repo generates an automatic, unattended retry loop against a
+    read that's known not to be transient.
+    """
     if po_ref_numbers:
         po_refs = sorted(set(po_ref_numbers))
     else:
-        po_refs = retrigger_client.resolve_po_refs_by_file(file_name or "")
+        try:
+            po_refs = retrigger_client.resolve_po_refs_by_file(file_name or "")
+        except Exception as exc:
+            logger.error(f"POUL SO retrigger-file: resolve_po_refs_by_file failed for file_name={file_name!r}: {exc}")
+            notify_error(module="poul_so_import",
+                title=f"POUL SO Retrigger File — BigQuery lookup failed (run {run_id or 'unknown'})",
+                detail=f"Could not resolve PO refs for file_name={file_name!r}: {exc}\n\nAcknowledged (not retried) "
+                       f"to avoid an infinite Pub/Sub redelivery loop against a read that will fail the same way "
+                       f"every time — re-run this retrigger manually once rgmc-gcp-api/BigQuery recovers.",
+                context=f"file_name={file_name!r} run_id={run_id!r}",
+            )
+            return True, {"total": 0, "ok_count": 0, "error_count": 1, "results": [
+                {"po_ref": None, "status": "error", "trigger_status": None,
+                 "detail": f"Could not resolve PO refs for this file: {exc}"},
+            ]}
     if not po_refs:
         return True, {"total": 0, "ok_count": 0, "error_count": 0, "results": []}
 
-    headers, details = retrigger_client.fetch_headers_and_details(po_refs)
+    try:
+        headers, details = retrigger_client.fetch_headers_and_details(po_refs)
+    except Exception as exc:
+        logger.error(f"POUL SO retrigger-file: fetch_headers_and_details failed for {len(po_refs)} po_ref(s): {exc}")
+        notify_error(module="poul_so_import",
+            title=f"POUL SO Retrigger File — BigQuery lookup failed (run {run_id or 'unknown'}, {len(po_refs)} PO ref(s))",
+            detail=f"{exc}\n\nAcknowledged (not retried) to avoid an infinite Pub/Sub redelivery loop against a "
+                   f"read that will fail the same way every time — re-run this retrigger manually once "
+                   f"rgmc-gcp-api/BigQuery recovers.",
+            context=f"file_name={file_name!r} po_ref_numbers={po_ref_numbers or 'n/a'} run_id={run_id!r}",
+        )
+        return True, {
+            "total": len(po_refs), "ok_count": 0, "error_count": len(po_refs),
+            "results": [
+                {"po_ref": r, "status": "error", "trigger_status": None,
+                 "detail": f"BigQuery lookup for this batch failed: {exc}"}
+                for r in po_refs
+            ],
+        }
     headers_by_ref = retrigger_client.merge_duplicate_headers(headers, details)
 
     results: list[dict] = []
