@@ -25,6 +25,7 @@ def fetch_customerpoul_by_create_by(
     date_from: str | None = None,
     date_to: str | None = None,
     company_id: int | None = None,
+    po_ref_numbers: list[str] | None = None,
 ) -> list[dict]:
     """GET /customerpoul?create_by=... — every header row inserted via that path.
 
@@ -35,6 +36,10 @@ def fetch_customerpoul_by_create_by(
 
     company_id (optional) scopes to CustomerPOUL.companyId on sbic_prod (SBIC=6,
     MTC=12) — a clean numeric key, unlike companyName free text.
+
+    po_ref_numbers (optional) scopes to an exact list of poRefNumber values — used so a
+    trigger/retrigger run's automatic BC-check follow-up only ever touches the specific
+    refs it just processed, not every create_by/date match.
     """
     params: dict = {"create_by": create_by, "limit": limit}
     if date_from:
@@ -43,6 +48,8 @@ def fetch_customerpoul_by_create_by(
         params["date_to"] = date_to
     if company_id is not None:
         params["company_id"] = company_id
+    if po_ref_numbers:
+        params["po_ref_number"] = ",".join(po_ref_numbers)
     try:
         resp = _session.get(f"{config.GCP_API_BASE}/customerpoul", params=params, timeout=60)
         resp.raise_for_status()

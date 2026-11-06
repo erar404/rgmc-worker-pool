@@ -45,6 +45,42 @@ def fetch_headers_and_details(po_refs: list[str]) -> tuple[list[dict], list[dict
     return body.get("data") or [], body.get("detail_data") or []
 
 
+def merge_duplicate_headers(headers: list[dict], details: list[dict]) -> dict[str, dict]:
+    """Collapses duplicate int_document_ai header rows sharing the same po_ref_number
+    down to one per ref, picking the best candidate instead of a plain
+    `{h["po_ref_number"]: h for h in headers}` dict comprehension, which silently keeps
+    whichever duplicate happens to iterate last.
+
+    headers/details are exactly what fetch_headers_and_details returns above (snake_case
+    BigQuery column names; headers ordered created_at DESC per bigquery_routes.py's own
+    query) — a plain dict comprehension over a DESC-ordered list keeps the LAST-iterated,
+    i.e. the OLDEST duplicate, not the best one. Confirmed live 2026-11-05/06: the same
+    PO can land in int_document_ai more than once under a different company_name (e.g. a
+    "SUNCOAST BRANDS" ghost-tag row with zero matching detail lines, alongside the real
+    row with real lines) — picking the older row here would silently re-insert the PO
+    under the wrong header on every retrigger.
+
+    Tie-break, most-preferred first: has >=1 matching row in details, has a non-blank
+    company_name, latest created_at.
+    """
+    detail_refs = {d.get("po_ref_number") for d in details if d.get("po_ref_number")}
+
+    def _score(h: dict):
+        has_items = h.get("po_ref_number") in detail_refs
+        has_company = bool((h.get("company_name") or "").strip())
+        return (has_items, has_company, h.get("created_at") or "")
+
+    best_by_ref: dict[str, dict] = {}
+    for h in headers:
+        ref = h.get("po_ref_number")
+        if not ref:
+            continue
+        current = best_by_ref.get(ref)
+        if current is None or _score(h) > _score(current):
+            best_by_ref[ref] = h
+    return best_by_ref
+
+
 def cleanup_staging(po_ref: str) -> dict:
     """Deletes po_ref's rows from CustomerPOULBQ/CustomerPOULDetailBQ (staging only) so
     the follow-up insert gets a genuinely fresh INSERT for the trigger to react to."""

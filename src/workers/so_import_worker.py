@@ -1592,6 +1592,7 @@ def _run_backfill_from_cloudsql(
     date_from: str | None = None,
     date_to: str | None = None,
     notify: dict | None = None,
+    po_ref_numbers: list[str] | None = None,
 ) -> tuple[bool, dict]:
     """Handle a poul-so-backfill-from-cloudsql message: for every CustomerPOUL row
     matching create_by (and, if given, within [date_from, date_to] on createDate —
@@ -1647,6 +1648,7 @@ def _run_backfill_from_cloudsql(
             continue
         company_headers = gcp_api_client.fetch_customerpoul_by_create_by(
             create_by, date_from=date_from, date_to=date_to, company_id=company_id,
+            po_ref_numbers=po_ref_numbers,
         )
         # customerBranchId is already on each CustomerPOUL row fetched above — batch-
         # fetch every unique branch's CustomerBranch row (customerBranchCode) once for
@@ -2037,9 +2039,10 @@ def _run_retrigger_file(
         return True, {"total": 0, "ok_count": 0, "error_count": 0, "results": []}
 
     headers, details = retrigger_client.fetch_headers_and_details(po_refs)
-    headers_by_ref = {h.get("po_ref_number"): h for h in headers if h.get("po_ref_number")}
+    headers_by_ref = retrigger_client.merge_duplicate_headers(headers, details)
 
     results: list[dict] = []
+    successful_refs_by_company: dict[str, list[str]] = {}
     for po_ref in po_refs:
         header = headers_by_ref.get(po_ref)
         if not header:
@@ -2087,6 +2090,10 @@ def _run_retrigger_file(
                 "Re-inserted successfully."
             ),
         })
+        if po_status == "success":
+            company = _resolve_bc_company(header.get("company_name"))
+            if company:
+                successful_refs_by_company.setdefault(company, []).append(po_ref)
 
     summary = {
         "total": len(results),
@@ -2094,6 +2101,30 @@ def _run_retrigger_file(
         "error_count": sum(1 for r in results if r["status"] in ("error", "not_promoted")),
         "results": results,
     }
+
+    # Automatic follow-up: now that these refs are correctly in MSSQL, make sure BC
+    # reflects them too, instead of leaving that to a separate human-triggered Cloud SQL
+    # Sync/Backfill click. Reuses the existing, already-correct logic as-is: sync first
+    # (backfills missing lines onto any order that already exists), then backfill
+    # (creates a fresh order for any ref that still has none) — both scoped to exactly
+    # the refs this run just promoted, via po_ref_numbers, never the company's full
+    # create_by='trigger' backlog.
+    for company, refs in successful_refs_by_company.items():
+        try:
+            _run_sync_from_cloudsql([company], create_by="trigger", po_ref_numbers=refs)
+        except Exception as exc:
+            logger.error(
+                f"POUL SO retrigger-file: follow-up sync-from-cloudsql failed "
+                f"(company={company!r}, refs={refs}): {exc}"
+            )
+        try:
+            _run_backfill_from_cloudsql([company], create_by="trigger", po_ref_numbers=refs)
+        except Exception as exc:
+            logger.error(
+                f"POUL SO retrigger-file: follow-up backfill-from-cloudsql failed "
+                f"(company={company!r}, refs={refs}): {exc}"
+            )
+
     return True, summary
 
 
@@ -2201,23 +2232,26 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         create_by = data.get("create_by") or "trigger"
         date_from = data.get("date_from") or None
         date_to = data.get("date_to") or None
+        po_ref_numbers = data.get("po_ref_numbers") or None
         notify = data.get("notify") or None
         run_id = data.get("run_id") or None
         logger.info(
             f"POUL SO: Cloud SQL backfill triggered for companies={companies} "
             f"create_by={create_by!r} date_from={date_from!r} date_to={date_to!r} "
-            f"notify={notify} run_id={run_id!r}"
+            f"po_ref_numbers={po_ref_numbers or 'all'} notify={notify} run_id={run_id!r}"
         )
         reprocess_status.start_run(run_id, companies=companies, notify=notify)
         try:
-            ok, summary = _run_backfill_from_cloudsql(companies, create_by, date_from, date_to, notify=notify)
+            ok, summary = _run_backfill_from_cloudsql(
+                companies, create_by, date_from, date_to, notify=notify, po_ref_numbers=po_ref_numbers,
+            )
         except Exception as exc:
             logger.error(f"POUL SO: Cloud SQL backfill run {run_id!r} crashed: {exc}")
             reprocess_status.finish_run(run_id, status="error", summary={}, error=str(exc))
             notify_error(module="poul_so_import",
                 title=f"POUL SO Cloud SQL Backfill — hard error (run {run_id or 'unknown'})",
                 detail=str(exc),
-                context=f"companies={companies} create_by={create_by!r} date_from={date_from!r} date_to={date_to!r} notify={notify}",
+                context=f"companies={companies} create_by={create_by!r} date_from={date_from!r} date_to={date_to!r} po_ref_numbers={po_ref_numbers or 'all'} notify={notify}",
             )
             message.nack()
             return

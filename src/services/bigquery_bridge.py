@@ -565,6 +565,57 @@ class BigqueryBridge(object):
 
         return header_df, detail_df
 
+    def __merge_duplicate_po_refs(
+        self, header_table: pandas.DataFrame, detail_table: pandas.DataFrame,
+    ) -> pandas.DataFrame:
+        """Collapses multiple header_table rows sharing the same poRefNumber down to one
+        each, so neither the MSSQL insert nor __trigger_so_import ever acts on more than
+        one header per PO ref in a single run.
+
+        Confirmed live 2026-11-05/06: the same PO can land in int_document_ai more than
+        once under a different companyName (a "SUNCOAST BRANDS" ghost-tag row with zero
+        matching detail lines, alongside the real "MANILA TASTE CURATORS VENTURES" row
+        with real lines) — harmless that time only because the ghost had no items to
+        trigger on. so_import_worker.py's own retrigger-file handler was found to have
+        the same unmerged-duplicate exposure, but worse: its po_ref-keyed dict silently
+        keeps whichever duplicate happens to sort last, which is the OLDEST one given
+        that endpoint's `created_at DESC` ordering — the wrong row, not the best one.
+
+        Tie-break, most-preferred first: has >=1 matching row in detail_table, has a
+        non-blank companyName, latest createdAt.
+        """
+        if header_table.empty or 'poRefNumber' not in header_table.columns:
+            return header_table
+        if not header_table['poRefNumber'].duplicated().any():
+            return header_table
+
+        detail_refs = (
+            set(detail_table['poRefNumber'])
+            if not detail_table.empty and 'poRefNumber' in detail_table.columns
+            else set()
+        )
+
+        def _score(row):
+            has_items = row['poRefNumber'] in detail_refs
+            has_company = bool(str(row.get('companyName') or '').strip())
+            return (has_items, has_company, row.get('createdAt'))
+
+        keep_indices = []
+        for ref, group in header_table.groupby('poRefNumber', sort=False):
+            if len(group) == 1:
+                keep_indices.append(group.index[0])
+                continue
+            best_idx = sorted(group.index, key=lambda i: _score(group.loc[i]))[-1]
+            self.__log(
+                f"Merged {len(group)} duplicate header row(s) for poRefNumber={ref!r} "
+                f"(companyName values seen: {sorted(set(group['companyName'].astype(str)))}) "
+                f"-> kept the best match, dropped {len(group) - 1}.",
+                level="warning",
+            )
+            keep_indices.append(best_idx)
+
+        return header_table.loc[sorted(keep_indices)].reset_index(drop=True)
+
     def main(self):
         """Bigquery Bridge Main Function."""
         self.__log("BigQuery to MSSQL Bridge initialized.", level="info")
@@ -611,6 +662,8 @@ class BigqueryBridge(object):
         self.__log("Renaming columns to match MSSQL schema...", level="info")
         header_table = self.__rename_columns(mssql_header_table_name.lower(), header_table)
         detail_table = self.__rename_columns(mssql_detail_table_name.lower(), detail_table)
+
+        header_table = self.__merge_duplicate_po_refs(header_table, detail_table)
 
         return self.__insert_dataframes(
             header_table, detail_table, mssql_header_table_name, mssql_detail_table_name,
