@@ -288,7 +288,10 @@ class BigqueryBridge(object):
 
         return df.rename(columns=column_mapping)
 
-    def __trigger_so_import(self, header_table: pandas.DataFrame, detail_table: pandas.DataFrame):
+    def __trigger_so_import(
+        self, header_table: pandas.DataFrame, detail_table: pandas.DataFrame,
+        mssql_status_by_ref: dict | None = None,
+    ):
         """Publish one Pub/Sub message per POUL order whose companyName contains SUNCOAST or
         SBIC — the only companies this pipeline is allowed to insert into Business Central.
         Any other company (e.g. Manila Taste Curators / MTC, which has no BC company code
@@ -309,6 +312,13 @@ class BigqueryBridge(object):
         genuine "header landed, detail hasn't arrived yet" race is unaffected by this —
         that po_ref still legitimately has zero rows in ANY run's fetch and is still held
         back exactly as before.
+
+        mssql_status_by_ref (optional): {poRefNumber: bool} — whether this run actually
+        has the PO sitting in MSSQL (CustomerPOUL), from __insert_dataframes's own
+        __verify_trigger_promotion result plus its already-existing (duplicate-skip) key
+        list. Carried onto each published order as "mssql_inserted" so the downstream
+        Teams/it-bot notification can report IMS (MSSQL) status separately from the BC
+        outcome instead of only ever showing whether BC accepted the order.
         """
         sep = "-" * 55
 
@@ -377,7 +387,10 @@ class BigqueryBridge(object):
                 held_back_refs.append((po_ref, company_name))
                 continue
 
-            orders.append({"header": header_dict, "lines": lines})
+            orders.append({
+                "header": header_dict, "lines": lines,
+                "mssql_inserted": (mssql_status_by_ref or {}).get(po_ref),
+            })
             published_refs.append((po_ref, company_name))
 
         trigger_lines = [f"\n{sep}", "SO IMPORT TRIGGER", sep]
@@ -424,8 +437,11 @@ class BigqueryBridge(object):
             self.__log_section("\n".join(trigger_lines))
             return
 
-        # Publish ONE batch message containing all orders
-        payload = {"type": "poul-so-import-batch", "orders": orders}
+        # Publish ONE batch message containing all orders. method ("manual"/"triggered")
+        # lets so_import_worker.py's _run_batch suppress the Teams/it-bot notification for
+        # an automated run (method="triggered") while still sending it for a human-
+        # initiated one — email alerts are unaffected either way.
+        payload = {"type": "poul-so-import-batch", "orders": orders, "method": self.__method}
         publisher.publish(topic_path, json.dumps(payload).encode('utf-8'))
 
         trigger_lines += [
@@ -862,8 +878,11 @@ class BigqueryBridge(object):
                     )
                 continue_execution = False
                 self.__log("Data inserted successfully into MSSQL.", level="info")
+                promoted_map = self.__verify_trigger_promotion(header_table, mssql_header_table_name, main_key)
                 if trigger_so_import:
-                    self.__trigger_so_import(full_header_table, full_detail_table)
+                    mssql_status_by_ref = {ref: True for ref in self.__dup_header_keys}
+                    mssql_status_by_ref.update(promoted_map)
+                    self.__trigger_so_import(full_header_table, full_detail_table, mssql_status_by_ref)
                 self.__log("Inserted Records - {}: {}, {}: {}".format(mssql_header_table_name,
                                                                       ul_bq,
                                                                       mssql_detail_table_name,
@@ -909,7 +928,7 @@ class BigqueryBridge(object):
         record_handoff(
             self.__group_code, self.__method, "inserted",
             self.__group_by_file(header_table, main_key),
-            trigger_results=self.__verify_trigger_promotion(header_table, mssql_header_table_name, main_key),
+            trigger_results=promoted_map,
         )
 
         total_inserted = len(header_table) + len(detail_table)

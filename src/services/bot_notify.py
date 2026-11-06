@@ -43,6 +43,10 @@ def _order_result(r: dict) -> dict:
         "lines_skipped": r.get("lines_skipped", 0),
         "from_buffer": bool(r.get("from_buffer")),
         "unmatched_items": r.get("unmatched_items") or [],
+        # Whether this PO actually made it into MSSQL (IMS) this run — None/missing
+        # means unknown (e.g. a buffered retry with no MSSQL-insert data recorded),
+        # reported separately from the BC outcome below rather than conflated with it.
+        "mssql_inserted": r.get("mssql_inserted"),
     }
 
 
@@ -65,7 +69,10 @@ def notify_po_batch(
         "src_company": src_company,
         "successes": [_order_result(r) for r in successes],
         "errors": [
-            {"po_ref": e.get("po_ref", ""), "error": e.get("error", ""), "attempt_count": e.get("attempt_count")}
+            {
+                "po_ref": e.get("po_ref", ""), "error": e.get("error", ""), "attempt_count": e.get("attempt_count"),
+                "mssql_inserted": e.get("mssql_inserted"),
+            }
             for e in errors
         ],
     }

@@ -1791,11 +1791,19 @@ def _run_batch(
     notify: dict | None = None,
     record_history: bool = False,
     run_id: str | None = None,
+    method: str = "manual",
 ) -> tuple[bool, dict]:
     """Process fresh_orders plus anything buffered for `company`.
 
     Used both by normal batch delivery (fresh_orders from the inbound message) and by
     a poul-so-reprocess-buffer trigger (fresh_orders=[], buffer-only retry pass).
+
+    method ("manual" or "triggered", default "manual") is the bridge run's own trigger
+    type — "triggered" means the automated Eventarc-driven run, never a human action.
+    Only the Teams/it-bot notification is suppressed for it (see bot_notify.* calls
+    below); the email alert is unaffected. Every caller except the normal
+    poul-so-import-batch handler is inherently human-initiated (reprocess-buffer,
+    retrigger, sync/backfill) and never passes this, so it defaults to "manual."
 
     label is used verbatim in every email this call can send (pre-fetch failure, empty
     buffer, and the final batch result), so a manual reprocess trigger's outcome is
@@ -1850,7 +1858,10 @@ def _run_batch(
     # so_number carries forward a header already created in BC on a previous pass
     # (see _create_order's existing_so_number) — always None for fresh orders.
     all_orders: list[dict] = [
-        {"header": o.get("header", {}), "lines": o.get("lines", []), "_buf_id": None, "so_number": None}
+        {
+            "header": o.get("header", {}), "lines": o.get("lines", []), "_buf_id": None, "so_number": None,
+            "mssql_inserted": o.get("mssql_inserted"),
+        }
         for o in fresh_orders
     ]
     for buf_doc_id, buf_data in so_buffer.get_buffered_orders(company):
@@ -1939,6 +1950,7 @@ def _run_batch(
                 ship_to_by_legacy_code=ship_to_by_legacy_code, branch_code_by_id=branch_code_by_id,
             )
             result["from_buffer"] = buf_id is not None
+            result["mssql_inserted"] = order_item.get("mssql_inserted")
             successes.append(result)
             if result.get("order_locked_reason"):
                 # The order's own BC status (Released, Invoiced, ...) blocks any
@@ -1994,7 +2006,10 @@ def _run_batch(
             attempt_count = so_buffer.save_failed_order(
                 header, lines, company, src_company, err_str, so_number=so_number
             )
-            errors.append({"po_ref": po_ref, "error": err_str, "attempt_count": attempt_count})
+            errors.append({
+                "po_ref": po_ref, "error": err_str, "attempt_count": attempt_count,
+                "mssql_inserted": order_item.get("mssql_inserted"),
+            })
             update_bc_status(po_ref, "error", so_number=so_number, error=err_str)
             if record_history:
                 so_buffer_history.record_reconciliation(
@@ -2005,8 +2020,12 @@ def _run_batch(
     # ── Send one consolidated email, plus a separate flag for unmatched items ──
     _send_batch_notification(successes, errors, company, src_company, label=label, notify=notify)
     _send_unmatched_items_notification(successes, company, src_company, label=label, notify=notify)
-    bot_notify.notify_po_batch(successes, errors, company, src_company, label=label)
-    bot_notify.notify_po_unmatched(successes, company, src_company, label=label)
+    # Teams/it-bot stays silent for an automated (method="triggered") run — the email
+    # above is still sent either way. Every other caller of _run_batch is inherently
+    # human-initiated and defaults method="manual", so it always notifies.
+    if method != "triggered":
+        bot_notify.notify_po_batch(successes, errors, company, src_company, label=label)
+        bot_notify.notify_po_unmatched(successes, company, src_company, label=label)
     summary = {
         "orders_created": len(successes),
         "orders_failed": len(errors),
@@ -2327,9 +2346,11 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
 
     if msg_type == "poul-so-import-batch":
         orders: list[dict] = data.get("orders", [])
+        method: str = data.get("method", "manual")
     elif msg_type == "poul-so-import" and "header" in data:
         # Legacy single-order format — wrap for uniform handling
         orders = [{"header": data["header"], "lines": data.get("lines", [])}]
+        method = "manual"
     else:
         logger.warning(f"POUL SO worker: unexpected message type {msg_type!r} — dropping")
         message.ack()
@@ -2346,7 +2367,7 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
     company: str = _resolve_bc_company(src_company)
 
     try:
-        ok, _ = _run_batch(company, src_company, orders)
+        ok, _ = _run_batch(company, src_company, orders, method=method)
     except Exception as exc:
         # _run_batch only guards its own BC pre-fetch and each per-PO create
         # individually — anything else (e.g. sbic_db's direct-MSSQL resolution, map
