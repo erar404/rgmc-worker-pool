@@ -21,6 +21,7 @@ this use) as the only remaining limits.
 """
 import logging
 
+import pandas as pd
 import requests
 
 from src import config
@@ -34,6 +35,24 @@ _BQ_READ_TIMEOUT = 300  # matches bigquery_bridge.py's own stopgap for this same
 
 def _escape_sql_literal(value: str) -> str:
     return value.replace("'", "''")
+
+
+def _json_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """Converts every datetime64 column to an ISO string (NaT -> None) in place.
+
+    BigQuery TIMESTAMP/DATETIME/DATE columns come back from read_gbq_with_timeout as
+    pandas.Timestamp, not plain Python datetimes -- .to_dict(orient="records") keeps
+    them as Timestamp objects, which requests' json= parameter (plain stdlib
+    json.dumps, no datetime support) cannot serialize. Confirmed live 2026-11-06:
+    every retrigger-file insert failed with "Object of type Timestamp is not JSON
+    serializable" once this module started reading BigQuery directly here instead of
+    going through rgmc-gcp-api's FastAPI layer, which serializes datetimes for free.
+    """
+    df = df.copy()
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            df[col] = df[col].apply(lambda v: v.isoformat() if pd.notnull(v) else None)
+    return df
 
 
 def resolve_po_refs_by_file(file_name: str) -> list[str]:
@@ -73,6 +92,7 @@ def fetch_headers_and_details(po_refs: list[str]) -> tuple[list[dict], list[dict
     details_df = read_gbq_with_timeout(
         detail_query, project_id=config.BIGQUERY_PROJECT_ID, dialect="standard", timeout=_BQ_READ_TIMEOUT,
     )
+    headers_df, details_df = _json_safe(headers_df), _json_safe(details_df)
     return headers_df.to_dict(orient="records"), details_df.to_dict(orient="records")
 
 
