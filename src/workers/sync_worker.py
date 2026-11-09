@@ -66,6 +66,7 @@ Incremental syncs use the stored lastSyncAt as a lastModifiedDateTime filter.
 import datetime
 import json
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from google.cloud import pubsub_v1
@@ -533,7 +534,27 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
     logger.info(f"[{company}] sync complete")
 
 
+# Set while _process_body is running a large/slow job (e.g. a KW1-sized catalog
+# fetch) so shutdown can drain it instead of killing it mid-write — see _process and
+# main.py's _shutdown. Idle (set) by default.
+_idle = threading.Event()
+_idle.set()
+
+
+def wait_idle(timeout: float) -> bool:
+    """Block until no sync message is in flight, or timeout seconds elapse."""
+    return _idle.wait(timeout)
+
+
 def _process(message: pubsub_v1.subscriber.message.Message) -> None:
+    _idle.clear()
+    try:
+        _process_body(message)
+    finally:
+        _idle.set()
+
+
+def _process_body(message: pubsub_v1.subscriber.message.Message) -> None:
     try:
         data = json.loads(message.data.decode("utf-8"))
     except Exception as e:

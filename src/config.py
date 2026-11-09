@@ -41,6 +41,12 @@ MSSQL_DATABASE = os.getenv("MSSQL_DATABASE", "sbic_prod")
 # Cloud Storage
 GCS_CATALOG_BUCKET = os.getenv("GCS_CATALOG_BUCKET", "")
 
+# Grace period on SIGTERM to let an in-flight sync (e.g. a large KW1-sized catalog
+# fetch) finish and write its GCS blobs instead of being killed mid-write by a deploy.
+# Kept under the subscription's 600s ack deadline so we don't also risk a duplicate
+# redelivery racing the drain.
+SHUTDOWN_DRAIN_SECONDS = int(os.getenv("SHUTDOWN_DRAIN_SECONDS", "540"))
+
 # Pub/Sub subscriptions (pull — worker pool consumes these)
 PUBSUB_ORDER_SUBSCRIPTION = os.getenv("PUBSUB_ORDER_SUBSCRIPTION", "rgmc-orders-worker-sub")
 PUBSUB_SYNC_SUBSCRIPTION = os.getenv("PUBSUB_SYNC_SUBSCRIPTION", "rgmc-sync-worker-sub")

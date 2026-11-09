@@ -43,6 +43,17 @@ def main() -> None:
         sync_future.cancel()
         so_import_future.cancel()
         bridge_future.cancel()
+        # Cancelling the sync subscription stops new pulls but does not stop an
+        # in-flight message's callback thread — a large company (KW1-sized catalog
+        # fetch) can take minutes, so without this wait a deploy landing mid-sync
+        # silently discarded all progress (customers/contacts saved, but the GCS
+        # family blobs — the slow part — never got written). Bounded so we still
+        # exit if the job hangs rather than outlasting Cloud Run's own grace period.
+        if not sync_worker.wait_idle(config.SHUTDOWN_DRAIN_SECONDS):
+            logger.warning(
+                f"Shutdown proceeding after {config.SHUTDOWN_DRAIN_SECONDS}s — "
+                f"a sync job was still in flight and will be redelivered"
+            )
         stop.set()
 
     signal.signal(signal.SIGTERM, _shutdown)
