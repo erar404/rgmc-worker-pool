@@ -25,12 +25,13 @@ repeated re-processing and a notification for each -- see bridge_run_lock.py.
 """
 import json
 import logging
+from datetime import datetime, timezone
 
 from google.cloud import pubsub_v1
 
 from src import config
 from src.logger import logger as app_logger
-from src.services import bridge_run_lock
+from src.services import bridge_run_history, bridge_run_lock
 from src.services.bigquery_bridge import BigqueryBridge
 from src.services.send_mail import notify_error
 
@@ -64,10 +65,17 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
         message.ack()
         return
 
+    started_at = datetime.now(timezone.utc)
     try:
         bridge = BigqueryBridge(app_logger, method=method, group_code=group_code)
         result = bridge.main()
         logger.info(f"Bridge run complete (group_code={group_code!r}, method={method!r}): {result}")
+        bridge_run_history.record_run(
+            group_code, method, result.get("status", "unknown"),
+            {"message": result.get("message"), "details": result.get("details")},
+            result.get("message") if result.get("status") == "error" else None,
+            started_at, datetime.now(timezone.utc),
+        )
         message.ack()
     except Exception as e:
         logger.error(f"Bridge run failed (group_code={group_code!r}, method={method!r}): {e}")
@@ -82,6 +90,9 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
             title=f"BigQuery Bridge — hard error (group_code={group_code!r}, method={method!r})",
             detail=str(e),
             context=f"group_code={group_code} method={method}",
+        )
+        bridge_run_history.record_run(
+            group_code, method, "error", None, str(e), started_at, datetime.now(timezone.utc),
         )
         message.nack()  # let Pub/Sub redeliver for a transient BigQuery/MSSQL error
     finally:
