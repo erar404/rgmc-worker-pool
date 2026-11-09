@@ -475,6 +475,7 @@ def _create_order(
     existing_so_number: str | None = None,
     ship_to_by_legacy_code: dict[str, tuple[str, str]] | None = None,
     branch_code_by_id: dict[int, str] | None = None,
+    ship_to_by_customer: dict[str, list[tuple[str, str]]] | None = None,
 ) -> dict:
     """Create (or resume) one BC Sales Order and return a result summary dict.
 
@@ -489,6 +490,15 @@ def _create_order(
     own customerBranchCode (the sbic_prod "Legacy Code"), pre-fetched by the caller for
     every branch ID in the batch. Both feed the structured CustomerBranch-based match
     tried before everything else below — see that tier's own comment.
+
+    ship_to_by_customer: customer_no → every ship-to address BC has on file for that
+    customer (see _build_ship_to_maps) — used only once a customer_no is already known
+    (via a saved customer override or an automatic ship-to match that still left
+    ship_to_code blank) but no branch/ship-to could be resolved at all, e.g. the
+    uploaded PO's branch is null. When that customer has EXACTLY one ship-to address,
+    there's nothing actually ambiguous left to guess at, so it's used directly instead
+    of buffering — see the "single ship-to" fallback below. Confirmed need: PO
+    4514866, customerBranchName null, customer already linked via a buffer override.
 
     branch_overrides / customer_overrides: so_buffer_overrides.fetch_branch_overrides()
     / fetch_customer_overrides() — every saved reconcile-page branch/customer link,
@@ -707,6 +717,16 @@ def _create_order(
                     f"the saved customer override for {header.get('customerName')!r} on /reconcile's "
                     f"Overrides tab (customerNo={customer_no!r}, shipToCode={ship_to_code!r}{scope_note})"
                 )
+                if not ship_to_code:
+                    # The override itself didn't carry a shipToCode (e.g. a customer-only
+                    # link, never a branch link) — default to BC's one-and-only ship-to
+                    # for this customer, if it has exactly one, instead of posting with no
+                    # ship-to code at all.
+                    single = _single_ship_to(ship_to_by_customer, customer_no)
+                    if single:
+                        ship_to_code, ship_to_name = single
+                        resolution_tier = "customer_override_single_shipto"
+                        resolution_source += f" — no shipToCode on the override; defaulted to this customer's only ship-to ({ship_to_code!r} {ship_to_name!r})"
                 logger.info(f"PO {po_ref}: using reconcile-page customer link{scope_note} → customer={customer_no!r} shipTo={ship_to_code!r}")
             else:
                 # No branch override, and no SCOPED customer override either — resolve
@@ -784,12 +804,35 @@ def _create_order(
                             " (confirms the saved flat customer override)" if flat_customer_no else " (no saved override)"
                         )
                     logger.info(f"PO {po_ref}: using ship-to match → customer={customer_no!r} shipTo={ship_to_code!r}")
+                elif flat_customer_no and _single_ship_to(ship_to_by_customer, flat_customer_no):
+                    # The flat override's own ambiguity concern (BC may have more than
+                    # one Customer record sharing this name) is about the CUSTOMER
+                    # resolution, not the ship-to — once flat_customer_no already picks
+                    # one real BC customer, and THAT customer has only one ship-to
+                    # address on file, there's nothing left to guess: use it. Covers a
+                    # null/unresolvable branch on the uploaded PO once the customer has
+                    # been linked via /reconcile (confirmed need: PO 4514866).
+                    customer_no = flat_customer_no
+                    ship_to_code, ship_to_name = _single_ship_to(ship_to_by_customer, flat_customer_no)
+                    resolution_tier = "customer_override_single_shipto"
+                    resolution_source = (
+                        f"the saved (unscoped) customer override for {header.get('customerName')!r} on "
+                        f"/reconcile's Overrides tab (customerNo={customer_no!r}) — branch/ship-to could not be "
+                        f"resolved, but this customer has only one ship-to address in BC ({ship_to_code!r} "
+                        f"{ship_to_name!r}), so it was used directly"
+                    )
+                    logger.info(
+                        f"PO {po_ref}: branch unresolved, but flat customer override's customer={customer_no!r} "
+                        f"has a single ship-to in BC → shipTo={ship_to_code!r}"
+                    )
                 elif flat_customer_no:
                     # Ship-to couldn't be resolved at all, and the only customer link on
                     # file is an unscoped (flat) override — buffer instead of guessing.
                     # Trusting the flat override here is exactly how a wrong-ship-to order
                     # slipped through before this check existed: an unscoped name-based
-                    # link offers nothing to confirm it's correct for THIS branch.
+                    # link offers nothing to confirm it's correct for THIS branch. (If
+                    # this customer had exactly one ship-to in BC, the branch above
+                    # already used it — reaching here means it has none or more than one.)
                     raise ValueError(
                         f"{buffer_reason_prefix}No ship-to address in BC for branch code={branch_code!r} / name={branch_name!r} "
                         f"(company={company!r}) — not using the only customer link on file for "
@@ -1653,7 +1696,7 @@ def _run_backfill_from_cloudsql(
         except Exception as e:
             logger.error(f"POUL SO backfill: pre-fetch failed (company={company!r}): {e}")
             continue
-        ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code = _build_ship_to_maps(ship_tos)
+        ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code, ship_to_by_customer = _build_ship_to_maps(ship_tos)
         ref_map: dict[str, str] = _build_ref_map(item_refs)
 
         # Scope the CustomerPOUL query itself to this company's companyId (SBIC=6,
@@ -1698,6 +1741,7 @@ def _run_backfill_from_cloudsql(
                     ref_map, location_code, branch_overrides, customer_overrides,
                     inactive_skus=inactive_skus, uom_overrides=uom_overrides, existing_so_number=None,
                     ship_to_by_legacy_code=ship_to_by_legacy_code, branch_code_by_id=branch_code_by_id,
+                    ship_to_by_customer=ship_to_by_customer,
                 )
                 result["from_buffer"] = False
                 successes.append(result)
@@ -1755,7 +1799,7 @@ def _run_backfill_from_cloudsql(
     return True, summary
 
 
-def _build_ship_to_maps(ship_tos: list) -> tuple[dict, dict, dict]:
+def _build_ship_to_maps(ship_tos: list) -> tuple[dict, dict, dict, dict]:
     """ship_to_by_code / ship_to_by_lookup_code / ship_to_by_legacy_code, each mapping
     an upper-cased key to (customer_no, ship_to_code) — shared by every handler that
     resolves a PO's customer branch against BC's ship-to addresses. All three are exact
@@ -1767,15 +1811,24 @@ def _build_ship_to_maps(ship_tos: list) -> tuple[dict, dict, dict]:
       own CustomerBranch.lookUpCode, manually populated in BC).
     ship_to_by_legacy_code: exact upper-cased legacyCode (same tableextension 50458 —
       SBIC's own CustomerBranch.customerBranchCode, also manually populated in BC).
+    ship_to_by_customer: every ship-to address grouped by customerNumber (unfiltered —
+      built from the exact same already-fetched ship_tos list, no extra BC call) — lets
+      _create_order's resolution cascade default to a customer's ONE ship-to address
+      when a PO's branch/ship-to couldn't be resolved at all (e.g. a null branch on the
+      uploaded PO) but the customer itself has already been resolved/linked and BC only
+      has a single ship-to on file for it, so there's nothing genuinely ambiguous left
+      to guess at.
     """
     ship_to_by_code: dict[str, tuple[str, str]] = {}
     ship_to_by_lookup_code: dict[str, tuple[str, str]] = {}
     ship_to_by_legacy_code: dict[str, tuple[str, str]] = {}
+    ship_to_by_customer: dict[str, list[tuple[str, str]]] = {}
     for st in ship_tos:
         cust_no = st.get("customerNumber") or ""
         st_code = (st.get("code") or "").strip()
         st_lookup_code = (st.get("lookupCode") or "").strip()
         st_legacy_code = (st.get("legacyCode") or "").strip()
+        st_name = (st.get("name") or "").strip()
         if not cust_no or not st_code:
             continue
         ship_to_by_code[st_code.upper()] = (cust_no, st_code)
@@ -1783,7 +1836,21 @@ def _build_ship_to_maps(ship_tos: list) -> tuple[dict, dict, dict]:
             ship_to_by_lookup_code[st_lookup_code.upper()] = (cust_no, st_code)
         if st_legacy_code:
             ship_to_by_legacy_code[st_legacy_code.upper()] = (cust_no, st_code)
-    return ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code
+        ship_to_by_customer.setdefault(cust_no, []).append((st_code, st_name))
+    return ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code, ship_to_by_customer
+
+
+def _single_ship_to(ship_to_by_customer: dict[str, list[tuple[str, str]]] | None, customer_no: str) -> tuple[str, str] | None:
+    """(ship_to_code, ship_to_name) if `customer_no` has EXACTLY one ship-to address on
+    file in BC, else None — used by _create_order's resolution cascade as a safe
+    default once a customer is already resolved but no branch/ship-to could be, since
+    there's nothing genuinely ambiguous left to guess at with only one address to pick
+    from. Two-or-more addresses for the same customer still buffers rather than
+    guessing which one — that IS ambiguous."""
+    if not ship_to_by_customer or not customer_no:
+        return None
+    candidates = ship_to_by_customer.get(customer_no) or []
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _build_ref_map(item_refs: list) -> dict[str, str]:
@@ -1868,7 +1935,7 @@ def _run_batch(
         )
         return True, dict(_EMPTY_SUMMARY)
 
-    ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code = _build_ship_to_maps(ship_tos)
+    ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code, ship_to_by_customer = _build_ship_to_maps(ship_tos)
     ref_map: dict[str, str] = _build_ref_map(item_refs)
     location_code: str = config.POUL_SO_DEFAULT_LOCATION
 
@@ -1967,6 +2034,7 @@ def _run_batch(
                 ref_map, location_code, branch_overrides, customer_overrides,
                 inactive_skus=inactive_skus, uom_overrides=uom_overrides, existing_so_number=so_number,
                 ship_to_by_legacy_code=ship_to_by_legacy_code, branch_code_by_id=branch_code_by_id,
+                ship_to_by_customer=ship_to_by_customer,
             )
             result["from_buffer"] = buf_id is not None
             result["mssql_inserted"] = order_item.get("mssql_inserted")
