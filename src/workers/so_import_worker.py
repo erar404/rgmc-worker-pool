@@ -2202,21 +2202,46 @@ def _run_retrigger_file(
         po_details = [d for d in details if d.get("po_ref_number") == po_ref]
         this_file_name = header.get("file_name") or file_name
 
-        try:
-            retrigger_client.cleanup_staging(po_ref)
-        except Exception as exc:
-            results.append({"po_ref": po_ref, "status": "error", "trigger_status": None, "detail": f"Cleanup failed: {exc}"})
-            continue
+        # tr_CustomerPOBQ (the AFTER INSERT trigger that promotes CustomerPOULBQ rows
+        # into CustomerPOUL) scans every poStatus='NEW' row across the whole table, not
+        # just this insert's own row — so a genuinely unrelated, concurrently-inserted
+        # row (the automated bridge isn't locked against a manual retrigger for the same
+        # po_ref — see bridge_run_lock.py's own docstring: "A manual trigger always
+        # bypasses this; only the automated path is gated") hitting the trigger's final
+        # INSERT at the same moment can abort the whole transaction and take a
+        # perfectly valid PO down with it (confirmed live 2026-11-11: PO407026110401891
+        # came back "not_promoted" with a clean re-insert, MSSQL state showed zero rows
+        # in both staging and promoted afterward). A short bounded retry turns that
+        # transient contention into a self-healing no-op instead of a result a human has
+        # to notice and manually re-run.
+        retry_delays_s = (5, 15)
+        cleanup_or_insert_error = None
+        mssql_status = error_detail = trigger_status = None
+        for attempt, delay in enumerate((0,) + retry_delays_s):
+            if delay:
+                time.sleep(delay)
+            try:
+                retrigger_client.cleanup_staging(po_ref)
+            except Exception as exc:
+                cleanup_or_insert_error = f"Cleanup failed: {exc}"
+                break
 
-        try:
-            status_code, body = retrigger_client.insert_from_bigquery(header, po_details, po_ref)
-        except Exception as exc:
-            results.append({"po_ref": po_ref, "status": "error", "trigger_status": None, "detail": f"Insert failed: {exc}"})
-            continue
+            try:
+                status_code, body = retrigger_client.insert_from_bigquery(header, po_details, po_ref)
+            except Exception as exc:
+                cleanup_or_insert_error = f"Insert failed: {exc}"
+                break
 
-        mssql_status = "inserted" if status_code == 200 and body.get("status") == "success" else "error"
-        error_detail = None if mssql_status == "inserted" else (body.get("message") or f"HTTP {status_code}")
-        trigger_status = retrigger_client.check_promoted(po_ref) if mssql_status == "inserted" else "unknown"
+            mssql_status = "inserted" if status_code == 200 and body.get("status") == "success" else "error"
+            error_detail = None if mssql_status == "inserted" else (body.get("message") or f"HTTP {status_code}")
+            trigger_status = retrigger_client.check_promoted(po_ref) if mssql_status == "inserted" else "unknown"
+            if trigger_status != "not_promoted" or attempt == len(retry_delays_s):
+                break
+            logger.warning(f"POUL SO retrigger-file: po_ref={po_ref!r} not_promoted on attempt {attempt + 1}, retrying")
+
+        if cleanup_or_insert_error:
+            results.append({"po_ref": po_ref, "status": "error", "trigger_status": None, "detail": cleanup_or_insert_error})
+            continue
 
         record_single_handoff(
             po_ref_number=po_ref, file_name=this_file_name, group_code="customerpoul",
