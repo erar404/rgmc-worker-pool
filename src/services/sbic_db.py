@@ -32,14 +32,26 @@ from src.db.dbconn import DbConn
 
 logger = logging.getLogger("sbic_db")
 
-_engine = None
-
 
 def _get_engine():
-    global _engine
-    if _engine is None:
-        _engine = DbConn(logger).main()
-    return _engine
+    """A fresh engine (and Cloud SQL Connector) every call — deliberately NOT a
+    cached singleton. This module used to cache one engine for the whole process
+    lifetime, same shape as bigquery_bridge.py's own DbConn except never rebuilt.
+    Confirmed live 2026-11-11: the Connector's background ephemeral-cert-refresh
+    asyncio task can die on a transient network blip (aiohttp
+    ServerDisconnectedError, "Task exception was never retrieved" — nothing in this
+    codebase awaits or restarts that task), and a cached engine has no way to
+    recover once that happens — every so_import_worker batch depending on this
+    module silently stalled for about an hour (the ephemeral cert's own TTL) until
+    the process otherwise restarted. bigquery_bridge_worker.py already builds a
+    brand-new DbConn on every single run (see its own BigqueryBridge(...) call) and
+    was unaffected by the same incident — matching that proven pattern here instead
+    of trying to detect/recover from the dead background task ourselves. Called at
+    most twice per _run_batch (fetch_active_customers, fetch_customer_branches), so
+    the extra Connector setup cost is the same order of magnitude bigquery_bridge.py
+    already pays once per bridge run, not a per-order cost.
+    """
+    return DbConn(logger).main()
 
 
 def _normalize(s: str | None) -> str:

@@ -713,71 +713,122 @@ class BigqueryBridge(object):
             bq_fetch_start=bq_fetch_start,
         )
 
-    def __orphaned_detail_po_refs(
-        self, mssql_detail_table_name: str, mssql_header_table_name: str, main_key: str, main_values: list[str],
-    ) -> list[str]:
-        """Every main_key value, among this run's incoming batch, with at least one
-        EXISTING row in mssql_detail_table_name but zero rows in mssql_header_table_name
-        — a detail-only orphan left behind by some earlier insert whose detail rows
-        landed but whose header row never did (the header-conflict branch in
-        __insert_dataframes's retry loop re-runs the whole connection block, including
-        detail_table.to_sql, without first re-pruning detail_table — a second insert
-        attempt for the same po_ref can leave exactly this shape behind). An orphan like
-        this silently blocks the po_ref from ever promoting: __drop_already_inserted
-        below would see its existing detail rows as "already in MSSQL" and exclude them
-        from every future insert, with no header ever landing to let the trigger
-        promote it — scoped to this batch's own po_refs, never a full-table scan.
+    def __header_key_columns(self, mssql_header_table_name: str) -> list[str]:
+        """The MSSQL column names (resolved via mappings_bridge, same as
+        __drop_already_inserted below — never hardcoded) that identify one row in
+        mssql_header_table_name: (poRefNumber, customerName) for customerpoulbq,
+        (raRefNumber, customerName) for customerrabq, etc. This is exactly the pair
+        tr_CustomerPOBQ's own join uses (Detail.poRefNumber = Header.poRefNumber AND
+        Detail.customerName = Header.customerName) — a po_ref alone is NOT unique
+        across customers (see merge_duplicate_headers's own "ghost-tag" duplicate-
+        header docstring: the same po_ref can legitimately have two unrelated header
+        rows under different customerName values), so matching on po_ref alone both
+        risks misclassifying a genuine orphan and, worse, risks the cleanup below
+        deleting a different customer's still-valid, already-matched detail rows that
+        merely share the same po_ref_number.
         """
-        if not main_values:
+        key_cols_raw = mappings.required_columns[self.__table_version].get(mssql_header_table_name.lower(), [])
+        table_mapping = mappings.table_mappings[self.__table_version].get(mssql_header_table_name.lower(), {})
+        return [table_mapping.get(c, c) for c in key_cols_raw]
+
+    def __orphaned_detail_keys(
+        self, mssql_detail_table_name: str, mssql_header_table_name: str,
+        main_key: str, main_values: list[str], header_key_cols: list[str],
+    ) -> list[tuple[str, ...]]:
+        """Every (header_key_cols) tuple, among this run's incoming batch, with at
+        least one EXISTING row in mssql_detail_table_name but zero rows in
+        mssql_header_table_name matching on ALL of header_key_cols — a detail-only
+        orphan left behind by some earlier insert whose detail rows landed but whose
+        header row never did (the header-conflict branch in __insert_dataframes's
+        retry loop re-runs the whole connection block, including detail_table.to_sql,
+        without first re-pruning detail_table — a second insert attempt for the same
+        po_ref can leave exactly this shape behind). An orphan like this silently
+        blocks the po_ref from ever promoting: __drop_already_inserted below would see
+        its existing detail rows as "already in MSSQL" and exclude them from every
+        future insert, with no header ever landing to let the trigger promote it.
+
+        main_key/main_values only narrow the candidate rows scanned (cheap, bounded to
+        this batch, never a full-table scan) — header_key_cols is what actually decides
+        a match, so a po_ref shared by two different customers is judged correctly.
+        """
+        if not main_values or not header_key_cols:
             return []
         params = {f"v{i}": v for i, v in enumerate(main_values)}
         placeholders = ", ".join(f":{k}" for k in params)
+        select_cols = ", ".join(f"d.[{c}]" for c in header_key_cols)
+        match_cols = " AND ".join(f"h.[{c}] = d.[{c}]" for c in header_key_cols)
         query = text(
-            f"SELECT DISTINCT d.[{main_key}] FROM [{mssql_detail_table_name}] d "
+            f"SELECT DISTINCT {select_cols} FROM [{mssql_detail_table_name}] d "
             f"WHERE d.[{main_key}] IN ({placeholders}) "
-            f"AND NOT EXISTS (SELECT 1 FROM [{mssql_header_table_name}] h WHERE h.[{main_key}] = d.[{main_key}])"
+            f"AND NOT EXISTS (SELECT 1 FROM [{mssql_header_table_name}] h WHERE {match_cols})"
         )
         with self.__mssql_engine.connect() as connection:
             rows = connection.execute(query, params).fetchall()
-        return sorted({str(row[0]) for row in rows if row[0]})
+        return sorted({tuple(str(v) for v in row) for row in rows if all(v is not None for v in row)})
 
     def __cleanup_orphaned_detail_rows(
         self, detail_table: pandas.DataFrame, mssql_detail_table_name: str,
         mssql_header_table_name: str, main_key: str,
     ) -> None:
-        """Deletes mssql_detail_table_name rows for any po_ref in this run's incoming
-        batch that's a detail-only orphan (see __orphaned_detail_po_refs) — clearing
-        them before __drop_already_inserted's own existing-key check runs lets this
-        run's genuinely-new insert for that po_ref go through normally instead of being
-        silently excluded as "already in MSSQL" forever. Logged so a human can see
-        exactly which PO refs needed this.
+        """Deletes mssql_detail_table_name rows for any (poRefNumber, customerName,
+        ...) key in this run's incoming batch that's a detail-only orphan (see
+        __orphaned_detail_keys) — clearing them before __drop_already_inserted's own
+        existing-key check runs lets this run's genuinely-new insert for that po_ref go
+        through normally instead of being silently excluded as "already in MSSQL"
+        forever. The DELETE below matches on the exact same header_key_cols tuple the
+        orphan was found by (never po_ref_number alone), so a different customer's
+        detail rows sharing the same po_ref are never touched. Logged so a human can
+        see exactly which PO refs needed this.
         """
         if detail_table.empty or main_key not in detail_table.columns:
             return
-        main_values = sorted(set(detail_table[main_key].astype(str)))
-        orphan_refs = self.__orphaned_detail_po_refs(
-            mssql_detail_table_name, mssql_header_table_name, main_key, main_values,
-        )
-        if not orphan_refs:
+        full_header_key_cols = self.__header_key_columns(mssql_header_table_name)
+        header_key_cols = [c for c in full_header_key_cols if c in detail_table.columns]
+        # Bail out rather than silently degrade to a po_ref-only match (unsafe — see
+        # __header_key_columns) if any expected header key column is missing from this
+        # run's own detail_table (should never happen in practice; cheap to guard).
+        if main_key not in header_key_cols or len(header_key_cols) != len(full_header_key_cols):
+            if len(full_header_key_cols) > 1:
+                self.__log(
+                    f"__cleanup_orphaned_detail_rows: skipping — expected header key columns "
+                    f"{full_header_key_cols} not fully present in detail_table (have {list(detail_table.columns)})",
+                    level="warning",
+                )
             return
-        params = {f"v{i}": v for i, v in enumerate(orphan_refs)}
-        placeholders = ", ".join(f":{k}" for k in params)
+        main_values = sorted(set(detail_table[main_key].astype(str)))
+        orphan_keys = self.__orphaned_detail_keys(
+            mssql_detail_table_name, mssql_header_table_name, main_key, main_values, header_key_cols,
+        )
+        if not orphan_keys:
+            return
+        where_clauses = []
+        params = {}
+        for i, key_tuple in enumerate(orphan_keys):
+            group_params = {f"{col}_{i}": val for col, val in zip(header_key_cols, key_tuple)}
+            params.update(group_params)
+            where_clauses.append(
+                "(" + " AND ".join(f"[{col}] = :{col}_{i}" for col in header_key_cols) + ")"
+            )
         with self.__mssql_engine.begin() as connection:
             connection.execute(
-                text(f"DELETE FROM [{mssql_detail_table_name}] WHERE [{main_key}] IN ({placeholders})"),
+                text(f"DELETE FROM [{mssql_detail_table_name}] WHERE {' OR '.join(where_clauses)}"),
                 params,
             )
+        po_ref_idx = header_key_cols.index(main_key)
+        cleaned_po_refs = sorted({key_tuple[po_ref_idx] for key_tuple in orphan_keys})
         sep = "-" * 55
         self.__log_section(
             f"\n{sep}\nORPHANED DETAIL CLEANUP\n{sep}\n"
-            f"  Found {len(orphan_refs)} PO ref(s) with existing {mssql_detail_table_name} row(s) "
-            f"but no matching {mssql_header_table_name} row — cleaned up and reprocessing this run:\n"
-            + "\n".join(f"    - {ref}" for ref in orphan_refs)
+            f"  Found {len(orphan_keys)} {header_key_cols} combination(s) with existing "
+            f"{mssql_detail_table_name} row(s) but no matching {mssql_header_table_name} row — "
+            f"cleaned up and reprocessing this run:\n"
+            + "\n".join(f"    - {dict(zip(header_key_cols, key_tuple))}" for key_tuple in orphan_keys)
             + f"\n{sep}"
         )
         self.__log(
-            f"Cleaned up {len(orphan_refs)} orphaned {mssql_detail_table_name} PO ref(s) with no "
-            f"corresponding {mssql_header_table_name} row — reprocessing this run: {orphan_refs}",
+            f"Cleaned up {len(orphan_keys)} orphaned {mssql_detail_table_name} row(s) with no "
+            f"corresponding {mssql_header_table_name} row — reprocessing this run (PO refs: {cleaned_po_refs}): "
+            f"{orphan_keys}",
             level="warning",
         )
 

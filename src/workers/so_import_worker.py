@@ -80,6 +80,7 @@ import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from google.cloud import pubsub_v1
@@ -94,6 +95,12 @@ from src.services import bot_notify
 logger = logging.getLogger("worker.so_import")
 
 _TRANSIENT_SIGNALS = ("429", "502", "503", "timeout", "ConnectionError", "ReadTimeout")
+
+# Bounded concurrency for _run_batch's per-order BC creation loop — 5 matches
+# order_worker.py's own max_messages=5 bound ("to respect BC's semaphore"), the same
+# BC-side concurrency limit already proven safe elsewhere in this repo. Confirmed live
+# 2026-11-11: a 9-order batch's BC creation alone took ~25s processed one at a time.
+_ORDER_CONCURRENCY = 5
 
 # Maps source companyName keywords (upper-case, substring match) → BC company name.
 # Checked in order; first match wins. Falls back to POUL_SO_BC_COMPANY / BC_COMPANY.
@@ -1912,6 +1919,112 @@ def _build_ref_map(item_refs: list) -> dict[str, str]:
     }
 
 
+def _process_one_order(
+    order_item: dict, company: str, src_company: str,
+    ship_to_by_code, ship_to_by_lookup_code, ref_map, location_code,
+    branch_overrides, customer_overrides, inactive_skus, uom_overrides,
+    ship_to_by_legacy_code, branch_code_by_id, ship_to_by_customer,
+    notify: dict | None, run_id: str | None, record_history: bool,
+) -> dict:
+    """One order's full BC-creation + buffer/status/history bookkeeping — factored
+    out of _run_batch's main loop so a ThreadPoolExecutor can run orders concurrently
+    (see _ORDER_CONCURRENCY) instead of one BC round trip at a time, which confirmed
+    live made a 9-order batch's BC creation alone take ~25s processed serially.
+
+    Mirrors the original inline loop's control flow exactly, including appending a
+    locked order's result under "success" before skipping its buffer/status/history
+    steps — an order whose own BC status (Released, Invoiced, ...) blocks any further
+    lines no retry can fix, but still belongs in the batch email's success list the
+    same way it always has.
+
+    Every side effect here (so_buffer save/delete, update_bc_status,
+    so_buffer_history.record_reconciliation) is scoped to this order's own po_ref/
+    buf_id — never touches another order's data, so concurrent calls across orders in
+    the same batch don't race each other.
+    """
+    buf_id: str | None = order_item["_buf_id"]
+    header: dict = order_item["header"]
+    lines: list = order_item["lines"]
+    so_number: str | None = order_item.get("so_number")
+    po_ref: str = header.get("poRefNumber", "unknown")
+    try:
+        result = _create_order(
+            header, lines, company,
+            ship_to_by_code, ship_to_by_lookup_code,
+            ref_map, location_code, branch_overrides, customer_overrides,
+            inactive_skus=inactive_skus, uom_overrides=uom_overrides, existing_so_number=so_number,
+            ship_to_by_legacy_code=ship_to_by_legacy_code, branch_code_by_id=branch_code_by_id,
+            ship_to_by_customer=ship_to_by_customer,
+        )
+        result["from_buffer"] = buf_id is not None
+        result["mssql_inserted"] = order_item.get("mssql_inserted")
+        if result.get("order_locked_reason"):
+            _handle_order_locked(
+                header, lines, result["remaining_lines"], company,
+                result["so_number"], result["order_locked_reason"],
+                buf_id, notify, run_id,
+            )
+            update_bc_status(po_ref, "error", so_number=result["so_number"], error=result["order_locked_reason"])
+            return {"kind": "success", "result": result}
+
+        dropped_note = (
+            f" ({result['dropped_inactive_count']} line(s) excluded — marked inactive on /reconcile, never retried)"
+            if result.get("dropped_inactive_count") else ""
+        )
+        if result["remaining_lines"]:
+            # Header exists in BC but some lines still aren't — keep (or create) the
+            # buffer doc with just those lines and the so_number, so a future pass
+            # resumes this exact order instead of re-creating its header or losing
+            # the unresolved lines. Applies whether this order came from the buffer
+            # or was a fresh inbound PO that partially succeeded.
+            issues_note = (
+                f" — {'; '.join(result['line_issues'])}" if result.get("line_issues") else ""
+            )
+            so_buffer.save_failed_order(
+                header, result["remaining_lines"], company, src_company,
+                f"Header {result['so_number']!r} created — "
+                f"{len(result['remaining_lines'])} line(s) still unresolved "
+                f"(no BC item match or rejected by BC){dropped_note}{issues_note}",
+                so_number=result["so_number"],
+            )
+            outcome = "still_buffered"
+            update_bc_status(po_ref, "buffered", so_number=result["so_number"])
+        else:
+            if buf_id:
+                so_buffer.delete_buffered_order(buf_id)
+            outcome = "resolved"
+            update_bc_status(po_ref, "created", so_number=result["so_number"])
+        if record_history:
+            so_buffer_history.record_reconciliation(
+                header, lines, company, outcome, notify,
+                run_id=run_id, so_number=result.get("so_number"),
+                detail=f"Resolved{dropped_note}" if outcome == "resolved" and dropped_note else None,
+            )
+        return {"kind": "success", "result": result}
+    except Exception as e:
+        err_str = str(e)
+        if isinstance(e, ValueError):
+            logger.error(f"POUL SO permanent failure — PO {po_ref!r}: {e}")
+        else:
+            logger.error(f"POUL SO error — PO {po_ref!r}: {e}")
+        attempt_count = so_buffer.save_failed_order(
+            header, lines, company, src_company, err_str, so_number=so_number
+        )
+        update_bc_status(po_ref, "error", so_number=so_number, error=err_str)
+        if record_history:
+            so_buffer_history.record_reconciliation(
+                header, lines, company, "failed", notify,
+                run_id=run_id, so_number=so_number, detail=err_str,
+            )
+        return {
+            "kind": "error",
+            "error_entry": {
+                "po_ref": po_ref, "error": err_str, "attempt_count": attempt_count,
+                "mssql_inserted": order_item.get("mssql_inserted"),
+            },
+        }
+
+
 def _run_batch(
     company: str,
     src_company: str,
@@ -2063,91 +2176,29 @@ def _run_batch(
         return True, dict(_EMPTY_SUMMARY)
 
     # ── Process every order (fresh + buffered) ─────────────────────────────────
+    # Bounded concurrency (_ORDER_CONCURRENCY), not one BC round trip at a time — see
+    # _process_one_order's own docstring. executor.map preserves all_orders' order in
+    # its returned results even though execution itself is concurrent, so successes/
+    # errors still come out in the same order this loop always produced them in.
     successes: list[dict] = []
     errors: list[dict] = []
 
-    for order_item in all_orders:
-        buf_id: str | None = order_item["_buf_id"]
-        header: dict = order_item["header"]
-        lines: list = order_item["lines"]
-        so_number: str | None = order_item.get("so_number")
-        po_ref: str = header.get("poRefNumber", "unknown")
-        try:
-            result = _create_order(
-                header, lines, company,
-                ship_to_by_code, ship_to_by_lookup_code,
-                ref_map, location_code, branch_overrides, customer_overrides,
-                inactive_skus=inactive_skus, uom_overrides=uom_overrides, existing_so_number=so_number,
-                ship_to_by_legacy_code=ship_to_by_legacy_code, branch_code_by_id=branch_code_by_id,
-                ship_to_by_customer=ship_to_by_customer,
-            )
-            result["from_buffer"] = buf_id is not None
-            result["mssql_inserted"] = order_item.get("mssql_inserted")
-            successes.append(result)
-            if result.get("order_locked_reason"):
-                # The order's own BC status (Released, Invoiced, ...) blocks any
-                # further lines — no retry will ever succeed. Remove it from the
-                # buffer for good and record the whole order to history instead of
-                # re-buffering it forever (see _handle_order_locked).
-                _handle_order_locked(
-                    header, lines, result["remaining_lines"], company,
-                    result["so_number"], result["order_locked_reason"],
-                    buf_id, notify, run_id,
-                )
-                update_bc_status(po_ref, "error", so_number=result["so_number"], error=result["order_locked_reason"])
-                continue
-            dropped_note = (
-                f" ({result['dropped_inactive_count']} line(s) excluded — marked inactive on /reconcile, never retried)"
-                if result.get("dropped_inactive_count") else ""
-            )
-            if result["remaining_lines"]:
-                # Header exists in BC but some lines still aren't — keep (or create)
-                # the buffer doc with just those lines and the so_number, so a future
-                # pass resumes this exact order instead of re-creating its header or
-                # losing the unresolved lines. Applies whether this order came from
-                # the buffer or was a fresh inbound PO that partially succeeded.
-                issues_note = (
-                    f" — {'; '.join(result['line_issues'])}" if result.get("line_issues") else ""
-                )
-                so_buffer.save_failed_order(
-                    header, result["remaining_lines"], company, src_company,
-                    f"Header {result['so_number']!r} created — "
-                    f"{len(result['remaining_lines'])} line(s) still unresolved "
-                    f"(no BC item match or rejected by BC){dropped_note}{issues_note}",
-                    so_number=result["so_number"],
-                )
-                outcome = "still_buffered"
-                update_bc_status(po_ref, "buffered", so_number=result["so_number"])
-            else:
-                if buf_id:
-                    so_buffer.delete_buffered_order(buf_id)
-                outcome = "resolved"
-                update_bc_status(po_ref, "created", so_number=result["so_number"])
-            if record_history:
-                so_buffer_history.record_reconciliation(
-                    header, lines, company, outcome, notify,
-                    run_id=run_id, so_number=result.get("so_number"),
-                    detail=f"Resolved{dropped_note}" if outcome == "resolved" and dropped_note else None,
-                )
-        except Exception as e:
-            err_str = str(e)
-            if isinstance(e, ValueError):
-                logger.error(f"POUL SO permanent failure — PO {po_ref!r}: {e}")
-            else:
-                logger.error(f"POUL SO error — PO {po_ref!r}: {e}")
-            attempt_count = so_buffer.save_failed_order(
-                header, lines, company, src_company, err_str, so_number=so_number
-            )
-            errors.append({
-                "po_ref": po_ref, "error": err_str, "attempt_count": attempt_count,
-                "mssql_inserted": order_item.get("mssql_inserted"),
-            })
-            update_bc_status(po_ref, "error", so_number=so_number, error=err_str)
-            if record_history:
-                so_buffer_history.record_reconciliation(
-                    header, lines, company, "failed", notify,
-                    run_id=run_id, so_number=so_number, detail=err_str,
-                )
+    with ThreadPoolExecutor(max_workers=_ORDER_CONCURRENCY) as executor:
+        outcomes = list(executor.map(
+            lambda order_item: _process_one_order(
+                order_item, company, src_company,
+                ship_to_by_code, ship_to_by_lookup_code, ref_map, location_code,
+                branch_overrides, customer_overrides, inactive_skus, uom_overrides,
+                ship_to_by_legacy_code, branch_code_by_id, ship_to_by_customer,
+                notify, run_id, record_history,
+            ),
+            all_orders,
+        ))
+    for outcome in outcomes:
+        if outcome["kind"] == "success":
+            successes.append(outcome["result"])
+        else:
+            errors.append(outcome["error_entry"])
 
     # ── Send one consolidated email, plus a separate flag for unmatched items ──
     _send_batch_notification(
