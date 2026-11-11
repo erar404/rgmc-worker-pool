@@ -80,6 +80,7 @@ import json
 import logging
 import re
 import time
+from datetime import datetime
 
 from google.cloud import pubsub_v1
 
@@ -1059,6 +1060,37 @@ _RESOLUTION_TIER_LABELS: dict[str | None, str] = {
 }
 
 
+def _format_elapsed(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    minutes, seconds = divmod(seconds, 60)
+    return f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+
+
+def _elapsed_time_rundown(bq_fetch_start: str | None, mssql_handoff_end: str | None) -> str | None:
+    """BigQuery-fetch -> MSSQL-handoff -> BC-handoff elapsed times for this batch, for
+    the bottom of the batch email — bq_fetch_start/mssql_handoff_end come from
+    bigquery_bridge.py's own run (see its __trigger_so_import), carried here on the
+    Pub/Sub payload since that process publishes and moves on before BC creation (this
+    function's own caller) ever happens, so it's the only place that can report all
+    three timings together. None when either timestamp is missing (a manual
+    reprocess-buffer/retrigger call has neither — nothing to report then).
+    """
+    if not bq_fetch_start or not mssql_handoff_end:
+        return None
+    try:
+        fetch_dt = datetime.fromisoformat(bq_fetch_start)
+        mssql_end_dt = datetime.fromisoformat(mssql_handoff_end)
+    except ValueError:
+        return None
+    bc_end_dt = datetime.now()
+    return (
+        "Elapsed Time Rundown\n"
+        f"  BigQuery Fetch Started : {fetch_dt.isoformat(timespec='seconds')}\n"
+        f"  MSSQL Handoff Elapsed  : {_format_elapsed((mssql_end_dt - fetch_dt).total_seconds())}\n"
+        f"  BC Handoff Elapsed     : {_format_elapsed((bc_end_dt - mssql_end_dt).total_seconds())}"
+    )
+
+
 def _send_batch_notification(
     successes: list[dict],
     errors: list[dict],
@@ -1066,6 +1098,8 @@ def _send_batch_notification(
     src_company: str,
     label: str = "POUL SO Import",
     notify: dict | None = None,
+    bq_fetch_start: str | None = None,
+    mssql_handoff_end: str | None = None,
 ) -> None:
     """Send one consolidated email covering all orders in the batch.
 
@@ -1073,7 +1107,12 @@ def _send_batch_notification(
     from a normal inbound-PO batch ("POUL SO Import") in the email subject/title, so the
     two are easy to tell apart in an inbox. notify (optional) is the employee who
     triggered a manual reprocess — also CC'd on this email when set.
+
+    bq_fetch_start/mssql_handoff_end (optional, only set for a normal inbound-PO batch —
+    see _run_batch) add an "Elapsed Time Rundown" to the bottom of the email — see
+    _elapsed_time_rundown.
     """
+    rundown = _elapsed_time_rundown(bq_fetch_start, mssql_handoff_end)
     extra_recipients = [notify["email"]] if notify and notify.get("email") else None
     context = f"company={company} src_company={src_company}"
     if notify:
@@ -1125,6 +1164,8 @@ def _send_batch_notification(
             detail += f"\n\nFailed Orders   : {len(errors)}\n"
             for e in errors:
                 detail += f"  - {e['po_ref']}: {e['error']}{_buffer_status_note(e.get('attempt_count'))}\n"
+        if rundown:
+            detail += f"\n\n{rundown}"
 
         title = f"{label} — {count} order{'s' if count != 1 else ''} created"
         if errors:
@@ -1136,7 +1177,9 @@ def _send_batch_notification(
             f"  - {e['po_ref']}: {e['error']}{_buffer_status_note(e.get('attempt_count'))}"
             for e in errors
         )
-        notify_error(module="poul_so_import", 
+        if rundown:
+            detail += f"\n\n{rundown}"
+        notify_error(module="poul_so_import",
             title=f"{label} Failed — {len(errors)} order{'s' if len(errors) != 1 else ''}",
             detail=detail,
             context=context,
@@ -1878,6 +1921,8 @@ def _run_batch(
     record_history: bool = False,
     run_id: str | None = None,
     method: str = "manual",
+    bq_fetch_start: str | None = None,
+    mssql_handoff_end: str | None = None,
 ) -> tuple[bool, dict]:
     """Process fresh_orders plus anything buffered for `company`.
 
@@ -2105,7 +2150,10 @@ def _run_batch(
                 )
 
     # ── Send one consolidated email, plus a separate flag for unmatched items ──
-    _send_batch_notification(successes, errors, company, src_company, label=label, notify=notify)
+    _send_batch_notification(
+        successes, errors, company, src_company, label=label, notify=notify,
+        bq_fetch_start=bq_fetch_start, mssql_handoff_end=mssql_handoff_end,
+    )
     _send_unmatched_items_notification(successes, company, src_company, label=label, notify=notify)
     # Teams/it-bot stays silent for an automated (method="triggered") run — the email
     # above is still sent either way. Every other caller of _run_batch is inherently
@@ -2505,10 +2553,13 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
     if msg_type == "poul-so-import-batch":
         orders: list[dict] = data.get("orders", [])
         method: str = data.get("method", "manual")
+        bq_fetch_start = data.get("bq_fetch_start")
+        mssql_handoff_end = data.get("mssql_handoff_end")
     elif msg_type == "poul-so-import" and "header" in data:
         # Legacy single-order format — wrap for uniform handling
         orders = [{"header": data["header"], "lines": data.get("lines", [])}]
         method = "manual"
+        bq_fetch_start = mssql_handoff_end = None
     else:
         logger.warning(f"POUL SO worker: unexpected message type {msg_type!r} — dropping")
         message.ack()
@@ -2525,7 +2576,10 @@ def _process(message: pubsub_v1.subscriber.message.Message) -> None:
     company: str = _resolve_bc_company(src_company)
 
     try:
-        ok, _ = _run_batch(company, src_company, orders, method=method)
+        ok, _ = _run_batch(
+            company, src_company, orders, method=method,
+            bq_fetch_start=bq_fetch_start, mssql_handoff_end=mssql_handoff_end,
+        )
     except Exception as exc:
         # _run_batch only guards its own BC pre-fetch and each per-PO create
         # individually — anything else (e.g. sbic_db's direct-MSSQL resolution, map

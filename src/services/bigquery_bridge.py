@@ -291,6 +291,7 @@ class BigqueryBridge(object):
     def __trigger_so_import(
         self, header_table: pandas.DataFrame, detail_table: pandas.DataFrame,
         mssql_status_by_ref: dict | None = None,
+        bq_fetch_start: datetime | None = None, mssql_handoff_end: datetime | None = None,
     ):
         """Publish one Pub/Sub message per POUL order whose companyName contains SUNCOAST or
         SBIC — the only companies this pipeline is allowed to insert into Business Central.
@@ -441,7 +442,15 @@ class BigqueryBridge(object):
         # lets so_import_worker.py's _run_batch suppress the Teams/it-bot notification for
         # an automated run (method="triggered") while still sending it for a human-
         # initiated one — email alerts are unaffected either way.
-        payload = {"type": "poul-so-import-batch", "orders": orders, "method": self.__method}
+        # bq_fetch_start/mssql_handoff_end let so_import_worker.py report the full
+        # BigQuery-fetch -> MSSQL-handoff -> BC-handoff elapsed-time rundown once BC
+        # creation finishes (this process never sees that — it only publishes and
+        # moves on) — see so_import_worker.py's _send_batch_notification.
+        payload = {
+            "type": "poul-so-import-batch", "orders": orders, "method": self.__method,
+            "bq_fetch_start": bq_fetch_start.isoformat() if bq_fetch_start else None,
+            "mssql_handoff_end": mssql_handoff_end.isoformat() if mssql_handoff_end else None,
+        }
         publisher.publish(topic_path, json.dumps(payload).encode('utf-8'))
 
         trigger_lines += [
@@ -655,6 +664,7 @@ class BigqueryBridge(object):
         self.__log(f"Last run timestamp obtained: {self.__last_run_timestamp}", level="info")
 
         self.__log("Fetching data from BigQuery...", level="info")
+        bq_fetch_start = datetime.now()
         variable_mapping = mappings.variable_mappings[self.__table_version].get(self.__group_code, {})
         bq_header_table_name = variable_mapping.get('bq_header_name', 'DocumentAIBQ')
         bq_detail_table_name = variable_mapping.get('bq_detail_name', 'DocumentAIDetailBQ')
@@ -700,6 +710,75 @@ class BigqueryBridge(object):
         return self.__insert_dataframes(
             header_table, detail_table, mssql_header_table_name, mssql_detail_table_name,
             main_key, trigger_so_import=(self.__group_code == 'customerpoul'),
+            bq_fetch_start=bq_fetch_start,
+        )
+
+    def __orphaned_detail_po_refs(
+        self, mssql_detail_table_name: str, mssql_header_table_name: str, main_key: str, main_values: list[str],
+    ) -> list[str]:
+        """Every main_key value, among this run's incoming batch, with at least one
+        EXISTING row in mssql_detail_table_name but zero rows in mssql_header_table_name
+        — a detail-only orphan left behind by some earlier insert whose detail rows
+        landed but whose header row never did (the header-conflict branch in
+        __insert_dataframes's retry loop re-runs the whole connection block, including
+        detail_table.to_sql, without first re-pruning detail_table — a second insert
+        attempt for the same po_ref can leave exactly this shape behind). An orphan like
+        this silently blocks the po_ref from ever promoting: __drop_already_inserted
+        below would see its existing detail rows as "already in MSSQL" and exclude them
+        from every future insert, with no header ever landing to let the trigger
+        promote it — scoped to this batch's own po_refs, never a full-table scan.
+        """
+        if not main_values:
+            return []
+        params = {f"v{i}": v for i, v in enumerate(main_values)}
+        placeholders = ", ".join(f":{k}" for k in params)
+        query = text(
+            f"SELECT DISTINCT d.[{main_key}] FROM [{mssql_detail_table_name}] d "
+            f"WHERE d.[{main_key}] IN ({placeholders}) "
+            f"AND NOT EXISTS (SELECT 1 FROM [{mssql_header_table_name}] h WHERE h.[{main_key}] = d.[{main_key}])"
+        )
+        with self.__mssql_engine.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return sorted({str(row[0]) for row in rows if row[0]})
+
+    def __cleanup_orphaned_detail_rows(
+        self, detail_table: pandas.DataFrame, mssql_detail_table_name: str,
+        mssql_header_table_name: str, main_key: str,
+    ) -> None:
+        """Deletes mssql_detail_table_name rows for any po_ref in this run's incoming
+        batch that's a detail-only orphan (see __orphaned_detail_po_refs) — clearing
+        them before __drop_already_inserted's own existing-key check runs lets this
+        run's genuinely-new insert for that po_ref go through normally instead of being
+        silently excluded as "already in MSSQL" forever. Logged so a human can see
+        exactly which PO refs needed this.
+        """
+        if detail_table.empty or main_key not in detail_table.columns:
+            return
+        main_values = sorted(set(detail_table[main_key].astype(str)))
+        orphan_refs = self.__orphaned_detail_po_refs(
+            mssql_detail_table_name, mssql_header_table_name, main_key, main_values,
+        )
+        if not orphan_refs:
+            return
+        params = {f"v{i}": v for i, v in enumerate(orphan_refs)}
+        placeholders = ", ".join(f":{k}" for k in params)
+        with self.__mssql_engine.begin() as connection:
+            connection.execute(
+                text(f"DELETE FROM [{mssql_detail_table_name}] WHERE [{main_key}] IN ({placeholders})"),
+                params,
+            )
+        sep = "-" * 55
+        self.__log_section(
+            f"\n{sep}\nORPHANED DETAIL CLEANUP\n{sep}\n"
+            f"  Found {len(orphan_refs)} PO ref(s) with existing {mssql_detail_table_name} row(s) "
+            f"but no matching {mssql_header_table_name} row — cleaned up and reprocessing this run:\n"
+            + "\n".join(f"    - {ref}" for ref in orphan_refs)
+            + f"\n{sep}"
+        )
+        self.__log(
+            f"Cleaned up {len(orphan_refs)} orphaned {mssql_detail_table_name} PO ref(s) with no "
+            f"corresponding {mssql_header_table_name} row — reprocessing this run: {orphan_refs}",
+            level="warning",
         )
 
     def __existing_key_rows(
@@ -828,7 +907,8 @@ class BigqueryBridge(object):
         return {ref: (ref in promoted_refs) for ref in refs}
 
     def __insert_dataframes(self, header_table, detail_table, mssql_header_table_name,
-                             mssql_detail_table_name, main_key, trigger_so_import=True):
+                             mssql_detail_table_name, main_key, trigger_so_import=True,
+                             bq_fetch_start=None):
         """Insert header_table/detail_table into their MSSQL staging tables — detail
         FIRST, header SECOND (an AFTER INSERT trigger on the header table promotes
         matching rows into CustomerPOUL/CustomerPOULDetail, so the detail rows it joins
@@ -855,6 +935,12 @@ class BigqueryBridge(object):
         """
         full_header_table = header_table
         full_detail_table = detail_table
+
+        # Clean up any detail-only orphan for a po_ref in this batch BEFORE the
+        # existing-key check below — otherwise it would see the orphan's stale detail
+        # rows as "already in MSSQL" and exclude this run's genuinely-new ones too,
+        # leaving the po_ref stuck with no header forever.
+        self.__cleanup_orphaned_detail_rows(detail_table, mssql_detail_table_name, mssql_header_table_name, main_key)
 
         # Bulk pre-check BEFORE the first insert attempt — detail first, same ordering
         # as the insert itself (see docstring). Replaces discovering duplicates one
@@ -895,10 +981,14 @@ class BigqueryBridge(object):
                 continue_execution = False
                 self.__log("Data inserted successfully into MSSQL.", level="info")
                 promoted_map = self.__verify_trigger_promotion(header_table, mssql_header_table_name, main_key)
+                mssql_handoff_end = datetime.now()
                 if trigger_so_import:
                     mssql_status_by_ref = {ref: True for ref in self.__dup_header_keys}
                     mssql_status_by_ref.update(promoted_map)
-                    self.__trigger_so_import(full_header_table, full_detail_table, mssql_status_by_ref)
+                    self.__trigger_so_import(
+                        full_header_table, full_detail_table, mssql_status_by_ref,
+                        bq_fetch_start=bq_fetch_start, mssql_handoff_end=mssql_handoff_end,
+                    )
                 self.__log("Inserted Records - {}: {}, {}: {}".format(mssql_header_table_name,
                                                                       ul_bq,
                                                                       mssql_detail_table_name,
