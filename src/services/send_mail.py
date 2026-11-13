@@ -10,6 +10,7 @@ modules both repos share (BigQuery Bridge) so an email looks the same regardless
 which service actually sent it.
 """
 import logging
+import re
 import smtplib
 import ssl
 import threading
@@ -40,8 +41,15 @@ _SEVERITIES: dict[str, tuple[str, str, str]] = {
 }
 
 
+def _format_elapsed(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    minutes, seconds = divmod(seconds, 60)
+    return f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+
+
 def notify_error(
     title: str, detail: str, context: str = "", extra_recipients: list[str] | None = None, module: str = "",
+    elapsed_seconds: float | None = None,
 ) -> None:
     """Send a developer alert email for a worker error.
 
@@ -50,6 +58,8 @@ def notify_error(
     sends with a generic "Worker Pool" identity rather than failing.
     extra_recipients are added alongside DEVELOPER_EMAIL (e.g. the employee who
     triggered a manual reprocess, so they see the outcome too).
+    elapsed_seconds, when given, adds an "Elapsed" row to the info table (e.g. time
+    since a run's own fetch started) — omitted entirely when None, never a blank row.
     Silently skips if DEVELOPER_EMAIL or SMTP credentials are not configured.
     Must be called from a daemon thread or directly — never blocks the Pub/Sub callback.
     """
@@ -57,13 +67,14 @@ def notify_error(
         return
     threading.Thread(
         target=_send_email,
-        args=("error", module, title, detail, context, extra_recipients),
+        args=("error", module, title, detail, context, extra_recipients, elapsed_seconds),
         daemon=True,
     ).start()
 
 
 def notify_success(
     title: str, detail: str, context: str = "", extra_recipients: list[str] | None = None, module: str = "",
+    elapsed_seconds: float | None = None,
 ) -> None:
     """Send a developer notification email for a successful sync operation.
 
@@ -72,6 +83,8 @@ def notify_success(
     sends with a generic "Worker Pool" identity rather than failing.
     extra_recipients are added alongside DEVELOPER_EMAIL (e.g. the employee who
     triggered a manual reprocess, so they see the outcome too).
+    elapsed_seconds, when given, adds an "Elapsed" row to the info table (e.g. time
+    since a run's own fetch started) — omitted entirely when None, never a blank row.
     Silently skips if DEVELOPER_EMAIL or SMTP credentials are not configured.
     Fires in a daemon thread — never blocks the Pub/Sub callback.
     """
@@ -79,13 +92,14 @@ def notify_success(
         return
     threading.Thread(
         target=_send_email,
-        args=("success", module, title, detail, context, extra_recipients),
+        args=("success", module, title, detail, context, extra_recipients, elapsed_seconds),
         daemon=True,
     ).start()
 
 
 def notify_warning(
     title: str, detail: str, context: str = "", extra_recipients: list[str] | None = None, module: str = "",
+    elapsed_seconds: float | None = None,
 ) -> None:
     """Send a developer notification email for a partial/needs-attention outcome
     (e.g. an order was inserted into BC but some lines were left out).
@@ -95,6 +109,8 @@ def notify_warning(
     sends with a generic "Worker Pool" identity rather than failing.
     extra_recipients are added alongside DEVELOPER_EMAIL (e.g. the employee who
     triggered a manual reprocess, so they see the outcome too).
+    elapsed_seconds, when given, adds an "Elapsed" row to the info table (e.g. time
+    since a run's own fetch started) — omitted entirely when None, never a blank row.
     Silently skips if DEVELOPER_EMAIL or SMTP credentials are not configured.
     Fires in a daemon thread — never blocks the Pub/Sub callback.
     """
@@ -102,7 +118,7 @@ def notify_warning(
         return
     threading.Thread(
         target=_send_email,
-        args=("warning", module, title, detail, context, extra_recipients),
+        args=("warning", module, title, detail, context, extra_recipients, elapsed_seconds),
         daemon=True,
     ).start()
 
@@ -133,6 +149,58 @@ def _escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _escape_br(text: str) -> str:
+    return _escape(text).replace("\r\n", "\n").replace("\n", "<br>")
+
+
+# A line of 5+ dashes marks a section boundary in bigquery_bridge.py's __log_section
+# blocks (e.g. "SO IMPORT TRIGGER", "INSERT SUMMARY", "DUPLICATES SKIPPED" — see that
+# module). Pattern: -----\n<TITLE>\n-----\n<content>\n-----. Rendered as its own
+# bordered card with a title bar instead of disappearing into one giant <pre> blob,
+# which is the actual, literal reason those sections were hard to tell apart.
+_SECTION_RE = re.compile(r"-{5,}\r?\n([^\r\n]+)\r?\n-{5,}\r?\n(.*?)(?=\r?\n-{5,}\r?\n|\Z)", re.DOTALL)
+
+
+def _render_detail(detail: str, accent_color: str) -> str:
+    """detail_html for the email body -- plain text outside any dash-bracketed
+    section stays in the original <pre> block; each recognized section becomes its
+    own labeled card so distinct phases of a run are visually separable at a glance."""
+    sections = list(_SECTION_RE.finditer(detail))
+    if not sections:
+        return (
+            f"""<pre style="background:#f8f8f8;padding:16px;border-radius:4px;overflow:auto;font-size:12px;
+                        font-family:'Courier New',monospace;white-space:pre-wrap;word-break:break-all;
+                        border-left:3px solid {accent_color};">{_escape_br(detail)}</pre>"""
+        )
+
+    parts: list[str] = []
+    cursor = 0
+    for match in sections:
+        preamble = detail[cursor:match.start()].strip("\r\n")
+        if preamble:
+            parts.append(
+                f"""<pre style="background:#f8f8f8;padding:16px;border-radius:4px;overflow:auto;font-size:12px;
+                            font-family:'Courier New',monospace;white-space:pre-wrap;word-break:break-all;
+                            border-left:3px solid {accent_color};margin-bottom:12px;">{_escape_br(preamble)}</pre>"""
+            )
+        title, body = match.group(1).strip(), match.group(2).strip("\r\n")
+        parts.append(f"""<div style="border:1px solid #e5e7eb;border-radius:6px;overflow:hidden;margin-bottom:12px;">
+            <div style="background:{accent_color};color:white;font-size:11px;font-weight:bold;
+                        letter-spacing:.05em;text-transform:uppercase;padding:6px 12px;">{_escape(title)}</div>
+            <pre style="background:#f8f8f8;margin:0;padding:12px;overflow:auto;font-size:12px;
+                        font-family:'Courier New',monospace;white-space:pre-wrap;word-break:break-all;">{_escape_br(body)}</pre>
+        </div>""")
+        cursor = match.end()
+    tail = detail[cursor:].strip("\r\n")
+    if tail and not re.fullmatch(r"-{3,}", tail.strip()):
+        parts.append(
+            f"""<pre style="background:#f8f8f8;padding:16px;border-radius:4px;overflow:auto;font-size:12px;
+                        font-family:'Courier New',monospace;white-space:pre-wrap;word-break:break-all;
+                        border-left:3px solid {accent_color};">{_escape_br(tail)}</pre>"""
+        )
+    return "\n".join(parts)
+
+
 def _send_email(
     severity: str,
     module: str,
@@ -140,6 +208,7 @@ def _send_email(
     detail: str,
     context: str,
     extra_recipients: list[str] | None = None,
+    elapsed_seconds: float | None = None,
 ) -> None:
     """Build and send one notification email. Shared by notify_error/success/warning —
     severity picks the body's status badge, module picks the header's color/icon/label
@@ -151,8 +220,12 @@ def _send_email(
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     subject = f"[RGMC Worker Pool · {module_label}] {title}"
 
-    detail_html = _escape(detail).replace("\n", "<br>")
+    detail_html = _render_detail(detail, module_color)
     context_html = _escape(context)
+    elapsed_row = (
+        f'<tr><td style="color:#777;">Elapsed</td><td><strong>{_format_elapsed(elapsed_seconds)}</strong></td></tr>'
+        if elapsed_seconds is not None else ""
+    )
 
     html_content = f"""
     <!DOCTYPE html>
@@ -181,14 +254,13 @@ def _send_email(
                         <tr><td style="color:#777;width:120px;">Timestamp</td><td><strong>{timestamp}</strong></td></tr>
                         <tr><td style="color:#777;">Title</td><td><strong>{_escape(title)}</strong></td></tr>
                         <tr><td style="color:#777;">Context</td><td>{context_html or "&mdash;"}</td></tr>
+                        {elapsed_row}
                     </table>
                     <hr style="margin:20px 0;border:none;border-top:1px solid #eeeeee;">
                     <p style="margin:0 0 8px;color:#777;font-size:12px;text-transform:uppercase;letter-spacing:.05em;">
                         {"Error Detail" if severity == "error" else "Summary"}
                     </p>
-                    <pre style="background:#f8f8f8;padding:16px;border-radius:4px;overflow:auto;font-size:12px;
-                                font-family:'Courier New',monospace;white-space:pre-wrap;word-break:break-all;
-                                border-left:3px solid {module_color};">{detail_html}</pre>
+                    {detail_html}
                 </td>
             </tr>
             <tr>
@@ -208,8 +280,9 @@ def _send_email(
     if cc_addr:
         msg["Cc"] = cc_addr
     msg["Subject"] = subject
+    elapsed_line = f"\nElapsed: {_format_elapsed(elapsed_seconds)}" if elapsed_seconds is not None else ""
     msg.set_content(
-        f"[{timestamp}] [{module_label} — {badge_text}] {title}\n\nContext: {context or '-'}\n\n{detail}"
+        f"[{timestamp}] [{module_label} — {badge_text}] {title}\n\nContext: {context or '-'}{elapsed_line}\n\n{detail}"
     )
     msg.add_alternative(html_content, subtype="html", charset="utf-8")
 

@@ -55,6 +55,7 @@ class BigqueryBridge(object):
         self.__table_version = config.BQ_TABLE_VERSION
         self.__method = method
         self.__log_body = "BigQuery Bridge Execution Log ({} Run): {}".format(self.__method, datetime.now().isoformat())
+        self.__bq_fetch_start: datetime | None = None
         self.__group_code = group_code
         self.__dup_header_keys: list[str] = []
         self.__dup_detail_keys: list[str] = []
@@ -78,10 +79,19 @@ class BigqueryBridge(object):
     def __notify(self, category: str) -> None:
         title = f"BigQuery Bridge {'Error' if category == 'ERROR' else 'Complete'} — {self.__group_code}"
         context = f"method={self.__method}"
+        elapsed_seconds = (
+            (datetime.now() - self.__bq_fetch_start).total_seconds() if self.__bq_fetch_start else None
+        )
         if category == "ERROR":
-            notify_error(module="bigquery_bridge", title=title, detail=self.__log_body, context=context)
+            notify_error(
+                module="bigquery_bridge", title=title, detail=self.__log_body, context=context,
+                elapsed_seconds=elapsed_seconds,
+            )
         else:
-            notify_success(module="bigquery_bridge", title=title, detail=self.__log_body, context=context)
+            notify_success(
+                module="bigquery_bridge", title=title, detail=self.__log_body, context=context,
+                elapsed_seconds=elapsed_seconds,
+            )
 
     def __get_last_run_timestamp(self):
         """Get the last run timestamp from MSSQL table."""
@@ -680,7 +690,7 @@ class BigqueryBridge(object):
         self.__log(f"Last run timestamp obtained: {self.__last_run_timestamp}", level="info")
 
         self.__log("Fetching data from BigQuery...", level="info")
-        bq_fetch_start = datetime.now()
+        self.__bq_fetch_start = bq_fetch_start = datetime.now()
         variable_mapping = mappings.variable_mappings[self.__table_version].get(self.__group_code, {})
         bq_header_table_name = variable_mapping.get('bq_header_name', 'DocumentAIBQ')
         bq_detail_table_name = variable_mapping.get('bq_detail_name', 'DocumentAIDetailBQ')
