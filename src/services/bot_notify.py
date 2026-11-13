@@ -118,18 +118,23 @@ def notify_bridge_run(
     numbers an automated run has no other visibility for outside this app's own logs.
     A manual "Run Bridge Now" is already visible to whoever clicked it, so this is
     scoped to the automated path only -- see bigquery_bridge.py's own call site.
+
+    Subscribe in Teams with `subscribe po-upload-trigger` (same "po-upload-*" naming
+    as notify_po_batch's po-upload-batch / notify_po_unmatched's po-upload-unmatched
+    above) -- rgmc-it-bot's own /api/notify/po-upload-trigger handler still needs to
+    be built in that separate repo to actually render this.
     """
     if not po_refs:
         return
     body = {
-        "event": "bridge.run",
+        "event": "po.trigger",
         "group_code": group_code,
         "po_refs": po_refs,
         "elapsed_seconds": round(elapsed_seconds, 1),
         "held_back_count": held_back_count,
         "excluded_count": excluded_count,
     }
-    threading.Thread(target=_post, args=("bridge-run", body), daemon=True).start()
+    threading.Thread(target=_post, args=("po-upload-trigger", body), daemon=True).start()
 
 
 def notify_po_unmatched(
