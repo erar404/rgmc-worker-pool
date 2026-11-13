@@ -105,6 +105,33 @@ def notify_bc_retrigger(
     threading.Thread(target=_post, args=("bc-retrigger", body), daemon=True).start()
 
 
+def notify_bridge_run(
+    group_code: str,
+    po_refs: list[str],
+    elapsed_seconds: float,
+    held_back_count: int = 0,
+    excluded_count: int = 0,
+) -> None:
+    """Teams notification for an automated (method="triggered") BigQuery-bridge run
+    that actually handed at least one PO off toward BC -- lists the PO refs affected
+    and the total elapsed time (BigQuery fetch start -> this publish), the same two
+    numbers an automated run has no other visibility for outside this app's own logs.
+    A manual "Run Bridge Now" is already visible to whoever clicked it, so this is
+    scoped to the automated path only -- see bigquery_bridge.py's own call site.
+    """
+    if not po_refs:
+        return
+    body = {
+        "event": "bridge.run",
+        "group_code": group_code,
+        "po_refs": po_refs,
+        "elapsed_seconds": round(elapsed_seconds, 1),
+        "held_back_count": held_back_count,
+        "excluded_count": excluded_count,
+    }
+    threading.Thread(target=_post, args=("bridge-run", body), daemon=True).start()
+
+
 def notify_po_unmatched(
     successes: list[dict],
     company: str,

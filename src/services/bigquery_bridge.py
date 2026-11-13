@@ -39,6 +39,7 @@ from sqlalchemy.exc import IntegrityError
 import src.mappings_bridge as mappings
 from src import config
 from src.db.dbconn import DbConn
+from src.services.bc_direct_handoff import run_direct_bc_handoff, is_bc_valid_company
 from src.services.bq_read import read_gbq_with_timeout
 from src.services.send_mail import notify_error, notify_success, notify_warning
 from src.services.bridge_handoff_history import record_handoff
@@ -453,6 +454,21 @@ class BigqueryBridge(object):
         }
         publisher.publish(topic_path, json.dumps(payload).encode('utf-8'))
 
+        # IT-bot (Teams) notification for this automated run specifically -- the POs
+        # it just handed off and how long the whole BigQuery-fetch -> this publish
+        # pass took. Scoped to method="triggered" only: a manual "Run Bridge Now" is
+        # already visible to whoever clicked it in the manual-trigger page, so this
+        # fills the gap that's otherwise visible only in this app's own logs.
+        if self.__method == 'triggered' and bq_fetch_start:
+            from src.services import bot_notify
+            bot_notify.notify_bridge_run(
+                self.__group_code,
+                [po_ref for po_ref, _ in published_refs],
+                (datetime.now() - bq_fetch_start).total_seconds(),
+                held_back_count=len(held_back_refs),
+                excluded_count=len(excluded),
+            )
+
         trigger_lines += [
             f"  Status : TRIGGERED",
             f"  Topic  : {topic}",
@@ -706,6 +722,48 @@ class BigqueryBridge(object):
         detail_table = self.__rename_columns(mssql_detail_table_name.lower(), detail_table)
 
         header_table = self.__merge_duplicate_po_refs(header_table, detail_table)
+
+        # Direct BigQuery -> CustomerPOUL/BC handoff, independent of CustomerPOULBQ and
+        # its tr_CustomerPOBQ trigger -- see bc_direct_handoff.py's own module docstring
+        # for why this exists. Runs on the SAME fetched-and-cleaned header_table/
+        # detail_table, on the SAME connection as the CustomerPOULBQ insert below, right
+        # before that insert (so a PO can reach BC even if the trigger-based path that
+        # follows rolls back or stalls on an unrelated row). customerpoul only -- the
+        # other group_codes (customerra, onlinesalespo) don't have a BC-postable
+        # equivalent of this path. Caught here, not left to propagate: a failure in this
+        # still-new path must never block __insert_dataframes's own, separately-working
+        # CustomerPOULBQ path from running.
+        if self.__group_code == 'customerpoul':
+            try:
+                direct_handoff_result = run_direct_bc_handoff(self.__mssql_engine, header_table, detail_table)
+                self.__log(f"Direct BC handoff: {direct_handoff_result}", level="info")
+            except Exception as e:
+                self.__log(f"Direct BC handoff failed (non-fatal — CustomerPOULBQ insert still proceeds): {e}", level="error")
+                self.__notify("ERROR")
+
+            # Exclude every BC-valid company (config.BC_HANDOFF_COMPANY_MAP's
+            # bc_valid=True entries, e.g. SUNCOAST/SBIC) from the CustomerPOULBQ/
+            # tr_CustomerPOBQ path below entirely -- run_direct_bc_handoff above
+            # already fully owns these rows (promote + send to BC), regardless of
+            # whether that run just succeeded or failed. The old, trigger-dependent
+            # path is left to handle only the companies that still rely on it (e.g.
+            # MTC), shrinking tr_CustomerPOBQ's own table-wide rescan blast radius and
+            # stopping it from ever touching rows the direct path already owns.
+            bc_valid_mask = header_table['companyName'].astype(str).apply(is_bc_valid_company)
+            if bc_valid_mask.any():
+                excluded_keys = set(zip(
+                    header_table.loc[bc_valid_mask, 'poRefNumber'].astype(str),
+                    header_table.loc[bc_valid_mask, 'customerName'].astype(str),
+                ))
+                self.__log(
+                    f"Excluding {int(bc_valid_mask.sum())} BC-valid-company header row(s) from the "
+                    f"CustomerPOULBQ path (already handled by the direct BC handoff above): "
+                    f"{sorted(k[0] for k in excluded_keys)}",
+                    level="info",
+                )
+                header_table = header_table[~bc_valid_mask]
+                detail_keys = list(zip(detail_table['poRefNumber'].astype(str), detail_table['customerName'].astype(str)))
+                detail_table = detail_table[[key not in excluded_keys for key in detail_keys]]
 
         return self.__insert_dataframes(
             header_table, detail_table, mssql_header_table_name, mssql_detail_table_name,

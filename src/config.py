@@ -15,6 +15,23 @@ BC_ENVIRONMENT = os.getenv("BC_ENVIRONMENT", "UAT")
 BC_COMPANY = os.getenv("BC_COMPANY", "RGMC")
 BC_COMPANIES = os.getenv("BC_COMPANIES", "")
 
+# Company-name keyword -> (companyId, bc_valid) for the direct BigQuery->BC handoff
+# (src/services/bigquery_bridge.py calls src/services/bc_direct_handoff.py's
+# run_direct_bc_handoff with this). Matched against each PO header's companyName via
+# substring search, same convention tr_CustomerPOBQ itself uses (CHARINDEX) and
+# so_import_worker.py's own SUNCOAST/SBIC keyword mask. bc_valid=False means the
+# companyId still gets resolved (so CustomerPOUL/CustomerPOULDetail can hold a complete,
+# correct record) but the PO is never handed to Business Central for it -- e.g. Manila
+# Taste Curators (MTC) has no company configured in BC Production at all. Add a new
+# company here (or flip bc_valid once BC is actually configured for one) without
+# touching any handoff code.
+BC_HANDOFF_COMPANY_MAP = {
+    "SUNCOAST": {"company_id": 6, "bc_valid": True},
+    "SBIC": {"company_id": 6, "bc_valid": True},
+    "MANILA": {"company_id": 12, "bc_valid": False},
+    "MTC": {"company_id": 12, "bc_valid": False},
+}
+
 # GCP
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
 GCP_ENV = os.getenv("GCP_ENV", "Staging")      # "Production" or "Staging"
