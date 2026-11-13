@@ -543,6 +543,26 @@ class BigqueryBridge(object):
         lines.append(sep)
         return "\n".join(lines)
 
+    def __build_direct_handoff_summary(self, result: dict) -> str:
+        """Same dash-bracketed section format __build_summary's INSERT SUMMARY/
+        DUPLICATES SKIPPED use, for run_direct_bc_handoff's own result -- separates
+        "landed in CustomerPOUL (MSSQL)" from "actually reached Business Central"
+        instead of dumping the raw {"status", "message", "inserted", "sent_to_bc"}
+        dict as one unreadable line (send_mail.py's own section renderer then turns
+        this into a labeled card, same as every other section here)."""
+        sep = "-" * 55
+        inserted = result.get("inserted", [])
+        sent_to_bc = result.get("sent_to_bc", [])
+        lines = [f"\n{sep}", "DIRECT BC HANDOFF", sep]
+        lines.append(f"  Inserted into CustomerPOUL (MSSQL) : {len(inserted)}")
+        for ref in inserted:
+            lines.append(f"    - {ref}")
+        lines.append(f"  Sent to Business Central (BC)      : {len(sent_to_bc)}")
+        for ref in sent_to_bc:
+            lines.append(f"    - {ref}")
+        lines.append(sep)
+        return "\n".join(lines)
+
     def __format_onlinesalespo_data(self, df):
         """Format Online Sales PO data to match MSSQL schema."""
         detail_dict = df.to_dict(orient='records')
@@ -746,7 +766,7 @@ class BigqueryBridge(object):
         if self.__group_code == 'customerpoul':
             try:
                 direct_handoff_result = run_direct_bc_handoff(self.__mssql_engine, header_table, detail_table)
-                self.__log(f"Direct BC handoff: {direct_handoff_result}", level="info")
+                self.__log_section(self.__build_direct_handoff_summary(direct_handoff_result))
             except Exception as e:
                 self.__log(f"Direct BC handoff failed (non-fatal — CustomerPOULBQ insert still proceeds): {e}", level="error")
                 self.__notify("ERROR")

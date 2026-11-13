@@ -293,6 +293,51 @@ def _insert(connection, headers: list[dict], details_by_ref: dict[str, list[dict
                     "net": d["netPrice"] or d.get("unitPricePcs") or 0,
                 },
             )
+            # CustomerPOULDetailBQ too (detail-only, no matching CustomerPOULBQ header
+            # row -- tr_CustomerPOBQ fires on CustomerPOULBQ INSERTs only, never on this
+            # table, so this can never trigger the promotion logic this module exists to
+            # avoid). Required because _run_backfill_from_cloudsql (called below to
+            # actually create the BC order) fetches its line items via
+            # gcp_api_client.fetch_customerpouldetailbq -- i.e. from THIS table, not
+            # CustomerPOULDetail above. Confirmed live 2026-11-13: every BC order this
+            # module had sent so far has 0 lines, because this table was never
+            # populated. Same raw (unresolved) fields the trigger's own staging insert
+            # uses -- already present on d/h since both dataframes are post-
+            # __rename_columns by the time bigquery_bridge.py hands them to this module.
+            connection.execute(
+                text(
+                    "INSERT INTO CustomerPOULDetailBQ("
+                    "poRefNumber, customerName, customerBranchName, poDate, deliveryDate, "
+                    "lineIndex, customerSKUCode, customerSKUDesc, poQty, poQtyPcs, "
+                    "unitOfMeasurement, unitPrice, unitPricePcs, unitAmount, netAmount, "
+                    "netPrice, netPricePcs, discountPercent, createdAt) "
+                    "VALUES (:poRefNumber, :customerName, :customerBranchName, :poDate, :deliveryDate, "
+                    ":lineIndex, :skuCode, :skuDesc, :poQty, :poQtyPcs, "
+                    ":uom, :unitPrice, :unitPricePcs, :unitAmount, :netAmount, "
+                    ":netPrice, :netPricePcs, :discountPercent, :createdAt)"
+                ),
+                {
+                    "poRefNumber": po_ref,
+                    "customerName": (h.get("customerName") or "").strip().upper(),
+                    "customerBranchName": (h.get("customerBranchName") or "").strip().upper(),
+                    "poDate": h["poDate"],
+                    "deliveryDate": h["deliveryDate"] or h["poDate"],
+                    "lineIndex": d.get("lineIndex") or 0,
+                    "skuCode": (d.get("customerSKUCode") or "").strip().upper(),
+                    "skuDesc": (d.get("customerSKUDesc") or "").strip().upper(),
+                    "poQty": d.get("poQty") or 0,
+                    "poQtyPcs": d.get("poQtyPcs") or 0,
+                    "uom": d.get("unitOfMeasurement") or "",
+                    "unitPrice": d.get("unitPrice") or 0,
+                    "unitPricePcs": d.get("unitPricePcs") or 0,
+                    "unitAmount": d.get("unitAmount") or 0,
+                    "netAmount": d.get("netAmount") or 0,
+                    "netPrice": d.get("netPrice") or 0,
+                    "netPricePcs": d.get("netPricePcs") or 0,
+                    "discountPercent": d.get("discountPercent") or 0,
+                    "createdAt": d.get("createdAt") or h["poDate"],
+                },
+            )
         inserted_refs.append(po_ref)
     return inserted_refs
 
