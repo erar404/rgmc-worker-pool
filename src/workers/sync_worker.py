@@ -415,13 +415,18 @@ def _assemble_catalog(
     return families
 
 
-def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
+def _sync_company(company: str, on_date: str, page_size: int = 500, force_full: bool = False) -> None:
     """Sync all datasets for a single company.
 
     Stages 1 (price lists), 2 (v3 catalog fetch + Firestore), 3 (item ledger entries) and
     4 (customers/contacts/categories → GCS) run in parallel. Stage 5 then bakes the price
     overlay from stage 1 into the catalog from stage 2 and rebuilds the GCS blobs, and
     stage 6 patches Firestore item_prices with the best-price map.
+
+    force_full=True ignores the stored item_prices sync cursor and re-fetches every
+    record from BC — the only way to recover an item whose lastModifiedDateTime is
+    older than the cursor but that never made it into Firestore/GCS on an earlier run
+    (an incremental fetch's `since` filter would otherwise skip it forever).
     """
     logger.info(f"[{company}] sync started — on_date={on_date!r}")
 
@@ -442,6 +447,9 @@ def _sync_company(company: str, on_date: str, page_size: int = 500) -> None:
     def _stage_v3_catalog() -> None:
         try:
             since_prices = get_sync_state(company, "item_prices")
+            if force_full and since_prices is not None:
+                logger.info(f"[{company}] force_full requested — ignoring stored cursor ({since_prices!r})")
+                since_prices = None
             # The collection being empty despite a stored state means the previous run's
             # writes were lost — force a full fetch so it actually gets populated.
             if since_prices is not None and not prices_exist_in_firestore(company):
@@ -587,10 +595,11 @@ def _process_body(message: pubsub_v1.subscriber.message.Message) -> None:
 
         elif msg_type == "sync-item-prices":
             company = data.get("company") or config.BC_COMPANY
-            _sync_company(company, on_date, page_size)
-            notify_success(module="sync_worker", 
+            force_full = bool(data.get("force", False))
+            _sync_company(company, on_date, page_size, force_full=force_full)
+            notify_success(module="sync_worker",
                 title=f"Item Prices Sync Complete — {company}",
-                detail=f"Company: {company}",
+                detail=f"Company: {company}" + (" (full resync)" if force_full else ""),
                 context=f"on_date={on_date}",
             )
 
