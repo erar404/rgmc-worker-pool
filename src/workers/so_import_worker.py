@@ -1773,16 +1773,22 @@ def _run_backfill_from_cloudsql(
         }
         for h in company_headers:
             po_ref = h.get("poRefNumber", "unknown")
+            # Fetched before the existence check (not after, as before) so a failure in
+            # that check can still buffer this order with real lines attached -- a
+            # transient BC blip here used to drop the PO silently (no buffer, no BC
+            # order, no automatic retry path, since this function is the only thing
+            # that ever attempts a bc_direct_handoff-inserted row).
+            lines = gcp_api_client.fetch_customerpouldetailbq(po_ref)
             try:
                 if bc_client.v2_find_sales_order_by_external_doc_no(po_ref, company):
                     skipped_existing.append(po_ref)
                     continue
             except Exception as e:
                 logger.error(f"POUL SO backfill: existence check failed for PO {po_ref!r}: {e}")
-                errors.append({"po_ref": po_ref, "error": str(e)})  # never buffered — the check itself failed
+                attempt_count = so_buffer.save_failed_order(h, lines, company, f"cloudsql-backfill:{company}", str(e))
+                errors.append({"po_ref": po_ref, "error": str(e), "attempt_count": attempt_count})
                 continue
 
-            lines = gcp_api_client.fetch_customerpouldetailbq(po_ref)
             _apply_sku_overrides(lines, sku_overrides)
             try:
                 result = _create_order(
