@@ -339,7 +339,14 @@ def backfill_ile_columns_in_firestore(records: Iterable[dict], company: str, fie
 
 
 def apply_best_prices_to_firestore(best: dict[str, dict], company: str) -> int:
-    """Patch unitPriceIncVAT + priceListCode on item_prices_{env} from a best-price map (merge)."""
+    """Patch unitPriceIncVAT + priceListCode on item_prices_{env} from a best-price map (merge).
+
+    Always includes productNo, even though the doc id already encodes it: a price list can
+    reference a product the full catalog sync has never written yet, and without productNo
+    in the body that first write is a stub no reader can recognise as an item — the API's
+    single-item lookup returns it, but the webapp (and its live BC search) both require
+    productNo on a row and silently drop anything missing it.
+    """
     if not best:
         return 0
     collection = _prices_collection()
@@ -349,7 +356,11 @@ def apply_best_prices_to_firestore(best: dict[str, dict], company: str) -> int:
         for product_no, price_data in best.items():
             writer.set(
                 db.collection(collection).document(f"{doc_company}_{product_no}"),
-                {"unitPriceIncVAT": price_data["unitPriceIncVAT"], "priceListCode": price_data["priceListCode"]},
+                {
+                    "productNo": product_no,
+                    "unitPriceIncVAT": price_data["unitPriceIncVAT"],
+                    "priceListCode": price_data["priceListCode"],
+                },
                 merge=True,
             )
     return writer.written
