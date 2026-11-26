@@ -54,6 +54,16 @@ def main() -> None:
                 f"Shutdown proceeding after {config.SHUTDOWN_DRAIN_SECONDS}s — "
                 f"a sync job was still in flight and will be redelivered"
             )
+            # The message is already safely nack()'d for redelivery (no data lost) —
+            # but letting main() return here still races the straggling sync thread
+            # against concurrent.futures' own atexit hook: once Python starts its
+            # normal interpreter-shutdown sequence, that thread's next executor.submit()
+            # call (sync_worker._sync_company's nested ThreadPoolExecutors) raises
+            # "cannot schedule new futures after interpreter shutdown" (confirmed live
+            # 2026-11-25, on_date=2026-11-18 — a KW1-sized catalog fetch that outran the
+            # drain window). Hard-exiting the whole process here instead of returning
+            # normally skips that atexit sequence entirely, so the race can't happen.
+            os._exit(1)
         stop.set()
 
     signal.signal(signal.SIGTERM, _shutdown)
