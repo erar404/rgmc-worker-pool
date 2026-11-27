@@ -1975,11 +1975,12 @@ def _build_ref_map(item_refs: list) -> dict[str, str]:
 
 
 def _normalize_lookup_text(value: str | None) -> str:
-    """Upper-cased, all-whitespace-stripped — the same space-insensitive comparison
-    convention bc_direct_handoff.py's own non-numeric branch match already uses
-    (REPLACE(..., ' ', '')), applied here so an AI Lookup Branch Name keyword matches
-    regardless of how either side happens to be spaced."""
-    return re.sub(r"\s+", "", (value or "").strip().upper())
+    """Upper-cased, with literal space characters stripped — the EXACT same
+    comparison bc_direct_handoff.py's own non-numeric CustomerBranch.lookUpCode match
+    uses (REPLACE(:code, ' ', '') LIKE '%' + REPLACE(lookUpCode, ' ', '') + '%'), so an
+    AI Lookup Branch Name keyword is matched with the identical search logic — not a
+    separately-invented one — just applied to a different (BC-side) field."""
+    return (value or "").strip().upper().replace(" ", "")
 
 
 def _build_ai_lookup_name_map(ai_lookup_names: list) -> dict[str, str]:
