@@ -607,6 +607,25 @@ def fetch_ship_to_addresses(company_name: str) -> list:
     return _fetch_all_pages(url)
 
 
+def fetch_ai_lookup_names(company_name: str) -> list:
+    """Fetch all AI Lookup Names from the RGMC custom API v2.0 (Pag50302).
+
+    Uses the RGMC custom endpoint rather than the standard BC API v2.0 because the
+    standard entity isn't exposed on this BC instance (same pattern as
+    fetch_ship_to_addresses/fetch_item_references above). Each record has: id,
+    customerNumber, code, name — `name` holds the customer name as it appears on
+    uploaded PO documents (int_document_ai's customerName), used to match a PO straight
+    to a BC customer without an MSSQL Customer-table lookup.
+    """
+    company_id = get_company_id(company_name)
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}"
+        f"/companies({company_id})/aiLookupNames"
+    )
+    logger.info(f"fetch_ai_lookup_names — company={company_name!r}")
+    return _fetch_all_pages(url)
+
+
 def fetch_item_references(company_name: str) -> list:
     """Fetch all item references from the RGMC custom API v2.0 (Pag50349).
 

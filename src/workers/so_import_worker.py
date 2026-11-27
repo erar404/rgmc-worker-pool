@@ -484,14 +484,26 @@ def _create_order(
     ship_to_by_legacy_code: dict[str, tuple[str, str]] | None = None,
     branch_code_by_id: dict[int, str] | None = None,
     ship_to_by_customer: dict[str, list[tuple[str, str]]] | None = None,
+    ai_lookup_name_map: dict[str, str] | None = None,
+    ai_lookup_branch_map: dict[str, list[tuple[str, str]]] | None = None,
 ) -> dict:
     """Create (or resume) one BC Sales Order and return a result summary dict.
 
     ship_to_by_code / ship_to_by_lookup_code map upper-cased branch code / lookup code
     → (customer_no, ship_to_code) — both exact matches. ref_map is pre-fetched by the
     caller for the whole batch. There is deliberately no name-similarity/fuzzy fallback
-    here — see the ship-to resolution cascade below for why (a 2026-10-22 production
-    incident where fuzzy matching crossed two unrelated customers).
+    across the WHOLE customer base here — see the ship-to resolution cascade below for
+    why (a 2026-10-22 production incident where fuzzy matching crossed two unrelated
+    customers). ai_lookup_branch_map's fuzzy match (below, tried first) is narrower and
+    safe from that failure mode specifically because it's scoped to ONE already-exact-
+    matched customer's own ship-to list, never compared across customers.
+
+    ai_lookup_name_map / ai_lookup_branch_map: see _build_ai_lookup_name_map /
+    _build_ai_lookup_branch_map — pre-fetched by the caller for the whole batch, same
+    as ref_map. Lets a PO whose customer/branch resolve via BC's own AI Lookup data
+    skip the MSSQL Customer/CustomerBranch lookup entirely (bc_direct_handoff.py's
+    _resolve_header) — tried FIRST, before the structured CustomerBranch-based match
+    below, since it's the fastest/most direct path when it resolves.
 
     ship_to_by_legacy_code: upper-cased ship-to legacyCode → (customer_no, ship_to_code)
     — see _build_ship_to_maps. branch_code_by_id: customerBranchId → CustomerBranch's
@@ -598,6 +610,28 @@ def _create_order(
         # (CustomerPOULDetail, int_document_ai_detail, or anywhere else).
         existing_item_nos = {l.get("number") for l in existing_lines if l.get("number")}
     else:
+        # ── NEW: AI Lookup Names + AI Lookup Branch Name fast path, tried FIRST ──
+        # Needs no MSSQL-resolved field on `header` at all (not even customerBranchId)
+        # — only the raw int_document_ai text. Exact match on customer name against
+        # BC's AI Lookup Names table; once that resolves a single customer, fuzzy
+        # (substring, space-insensitive) match of customerBranchName against that
+        # SAME customer's own ship-to aiLookupBranchName keywords. Scoping the fuzzy
+        # match to one already-exact-matched customer is what keeps this safe from the
+        # 2026-10-22 cross-customer incident documented below — it can never compare
+        # branch text across two different customers' ship-tos. Zero or more-than-one
+        # branch match here falls through to the rest of the cascade unchanged (not
+        # buffered directly) — same treatment as never having matched at all.
+        ai_lookup_match: tuple[str, str] | None = None
+        ai_customer_no = (ai_lookup_name_map or {}).get((header.get("customerName") or "").strip().upper())
+        if ai_customer_no:
+            branch_text_norm = _normalize_lookup_text(header.get("customerBranchName"))
+            branch_matches = [
+                (code, name) for code, name in (ai_lookup_branch_map or {}).get(ai_customer_no, [])
+                if branch_text_norm and _normalize_lookup_text(name) in branch_text_norm
+            ]
+            if len(branch_matches) == 1:
+                ai_lookup_match = (ai_customer_no, branch_matches[0][0])
+
         # ── NEW: structured CustomerBranch-based match, tried first ────────────
         # Independent of any saved override: resolves this branch's CustomerBranch row
         # (sbic_prod, via customerBranchId — pre-fetched by the caller as
@@ -615,7 +649,18 @@ def _create_order(
             (ship_to_by_lookup_code or {}).get(lookup_code_for_branch) if lookup_code_for_branch else None
         )
 
-        if structured_match:
+        if ai_lookup_match:
+            customer_no, ship_to_code = ai_lookup_match
+            resolution_tier = "ai_lookup_names"
+            resolution_source = (
+                f"AI Lookup Names exact match for customer {header.get('customerName')!r} "
+                f"(customerNo={customer_no!r}) + AI Lookup Branch Name fuzzy match for branch "
+                f"{header.get('customerBranchName')!r} (shipTo={ship_to_code!r})"
+            )
+            logger.info(
+                f"PO {po_ref}: using AI Lookup Names/Branch match → customer={customer_no!r} shipTo={ship_to_code!r}"
+            )
+        elif structured_match:
             customer_no, ship_to_code = structured_match
             resolution_tier = "customer_branch_match"
             resolution_source = (
@@ -1743,11 +1788,14 @@ def _run_backfill_from_cloudsql(
         try:
             ship_tos = bc_client.fetch_ship_to_addresses(company)
             item_refs = bc_client.fetch_item_references(company)
+            ai_lookup_names = bc_client.fetch_ai_lookup_names(company)
         except Exception as e:
             logger.error(f"POUL SO backfill: pre-fetch failed (company={company!r}): {e}")
             continue
         ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code, ship_to_by_customer = _build_ship_to_maps(ship_tos)
         ref_map: dict[str, str] = _build_ref_map(item_refs)
+        ai_lookup_name_map = _build_ai_lookup_name_map(ai_lookup_names)
+        ai_lookup_branch_map = _build_ai_lookup_branch_map(ship_tos)
 
         # Scope the CustomerPOUL query itself to this company's companyId (SBIC=6,
         # MTC=12 on sbic_prod) rather than fetching every createBy row once and
@@ -1798,6 +1846,7 @@ def _run_backfill_from_cloudsql(
                     inactive_skus=inactive_skus, uom_overrides=uom_overrides, existing_so_number=None,
                     ship_to_by_legacy_code=ship_to_by_legacy_code, branch_code_by_id=branch_code_by_id,
                     ship_to_by_customer=ship_to_by_customer,
+                    ai_lookup_name_map=ai_lookup_name_map, ai_lookup_branch_map=ai_lookup_branch_map,
                 )
                 result["from_buffer"] = False
                 successes.append(result)
@@ -1925,12 +1974,56 @@ def _build_ref_map(item_refs: list) -> dict[str, str]:
     }
 
 
+def _normalize_lookup_text(value: str | None) -> str:
+    """Upper-cased, all-whitespace-stripped — the same space-insensitive comparison
+    convention bc_direct_handoff.py's own non-numeric branch match already uses
+    (REPLACE(..., ' ', '')), applied here so an AI Lookup Branch Name keyword matches
+    regardless of how either side happens to be spaced."""
+    return re.sub(r"\s+", "", (value or "").strip().upper())
+
+
+def _build_ai_lookup_name_map(ai_lookup_names: list) -> dict[str, str]:
+    """Upper-cased exact customer name → customerNumber, used for the AI Lookup Names
+    fast-path tier in _create_order (tried before any MSSQL-resolved branch/customer
+    data is needed at all).
+
+    A name that maps to more than one DISTINCT customerNumber is dropped from the map
+    entirely rather than picking one arbitrarily — same "don't guess, fall through
+    instead" philosophy _build_ship_to_maps and the rest of this module's resolution
+    cascade already apply to every other ambiguous case."""
+    by_name: dict[str, set[str]] = {}
+    for r in ai_lookup_names:
+        name = (r.get("name") or "").strip().upper()
+        customer_no = (r.get("customerNumber") or "").strip()
+        if name and customer_no:
+            by_name.setdefault(name, set()).add(customer_no)
+    return {name: next(iter(nos)) for name, nos in by_name.items() if len(nos) == 1}
+
+
+def _build_ai_lookup_branch_map(ship_tos: list) -> dict[str, list[tuple[str, str]]]:
+    """customerNumber → [(shipToCode, aiLookupBranchName), ...] for every ship-to
+    address that has a non-blank aiLookupBranchName (tableextension adding this column
+    directly to Ship-to Address — see rgmc_ai_lookup_branch_name_v2_routes.py's own
+    2026-11-11 note that the old separate AI Lookup Branch Name table is no longer
+    written to). Scoped per-customer so the fuzzy match below it never compares branch
+    text across two different customers' ship-tos."""
+    by_customer: dict[str, list[tuple[str, str]]] = {}
+    for st in ship_tos:
+        cust_no = (st.get("customerNumber") or "").strip()
+        st_code = (st.get("code") or "").strip()
+        ai_branch_name = (st.get("aiLookupBranchName") or "").strip()
+        if cust_no and st_code and ai_branch_name:
+            by_customer.setdefault(cust_no, []).append((st_code, ai_branch_name))
+    return by_customer
+
+
 def _process_one_order(
     order_item: dict, company: str, src_company: str,
     ship_to_by_code, ship_to_by_lookup_code, ref_map, location_code,
     branch_overrides, customer_overrides, inactive_skus, uom_overrides,
     ship_to_by_legacy_code, branch_code_by_id, ship_to_by_customer,
     notify: dict | None, run_id: str | None, record_history: bool,
+    ai_lookup_name_map=None, ai_lookup_branch_map=None,
 ) -> dict:
     """One order's full BC-creation + buffer/status/history bookkeeping — factored
     out of _run_batch's main loop so a ThreadPoolExecutor can run orders concurrently
@@ -1961,6 +2054,7 @@ def _process_one_order(
             inactive_skus=inactive_skus, uom_overrides=uom_overrides, existing_so_number=so_number,
             ship_to_by_legacy_code=ship_to_by_legacy_code, branch_code_by_id=branch_code_by_id,
             ship_to_by_customer=ship_to_by_customer,
+            ai_lookup_name_map=ai_lookup_name_map, ai_lookup_branch_map=ai_lookup_branch_map,
         )
         result["from_buffer"] = buf_id is not None
         result["mssql_inserted"] = order_item.get("mssql_inserted")
@@ -2086,12 +2180,13 @@ def _run_batch(
     try:
         ship_tos = bc_client.fetch_ship_to_addresses(company)
         item_refs = bc_client.fetch_item_references(company)
+        ai_lookup_names = bc_client.fetch_ai_lookup_names(company)
     except Exception as e:
         err_str = str(e)
         logger.error(f"POUL SO pre-fetch failed (company={company!r}): {e}")
         if any(sig in err_str for sig in _TRANSIENT_SIGNALS):
             return False, dict(_EMPTY_SUMMARY)
-        notify_error(module="poul_so_import", 
+        notify_error(module="poul_so_import",
             title=f"{label} Error — BC pre-fetch failed",
             detail=err_str,
             context=f"company={company} src_company={src_company}{requested_by}",
@@ -2101,6 +2196,8 @@ def _run_batch(
 
     ship_to_by_code, ship_to_by_lookup_code, ship_to_by_legacy_code, ship_to_by_customer = _build_ship_to_maps(ship_tos)
     ref_map: dict[str, str] = _build_ref_map(item_refs)
+    ai_lookup_name_map = _build_ai_lookup_name_map(ai_lookup_names)
+    ai_lookup_branch_map = _build_ai_lookup_branch_map(ship_tos)
     location_code: str = config.POUL_SO_DEFAULT_LOCATION
 
     # ── Merge fresh orders with any previously buffered (failed) orders ───────
@@ -2197,6 +2294,7 @@ def _run_batch(
                 branch_overrides, customer_overrides, inactive_skus, uom_overrides,
                 ship_to_by_legacy_code, branch_code_by_id, ship_to_by_customer,
                 notify, run_id, record_history,
+                ai_lookup_name_map, ai_lookup_branch_map,
             ),
             all_orders,
         ))
