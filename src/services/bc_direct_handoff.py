@@ -37,6 +37,7 @@ the map resolves to companyId=-1 (same sentinel tr_CustomerPOBQ itself defaults 
 is never sent to BC, same as an unrecognized company always was.
 """
 import logging
+import re
 from datetime import date, timedelta
 
 import pandas
@@ -133,10 +134,19 @@ def _resolve_header(connection, h: dict) -> dict:
     customer_name = (h.get("customerName") or "").strip().upper()
     branch_name = (h.get("customerBranchName") or "").strip()
 
-    is_numeric_branch = branch_name[:1].isdigit()
+    # Document AI sometimes extracts the branch code wrapped in stray leading noise
+    # -- e.g. "[0757] SSM ETON (SUPER SHOPPING MARKET, INC. - SUNCOAST BRANDS)" where
+    # BC's own lookUpCode is just "757" -- so the numeric-code check below looks past
+    # a leading run of brackets/hashes/whitespace instead of only the raw first
+    # character. Confirmed live: without this, "[0757] SSM ETON..." fails
+    # is_numeric_branch (first char is "[") and falls into the free-text fuzzy-match
+    # branch below instead, which can mismatch or miss entirely.
+    branch_name_for_digit_check = re.sub(r"^[\[\]#\s]+", "", branch_name)
+
+    is_numeric_branch = branch_name_for_digit_check[:1].isdigit()
     if is_numeric_branch:
         digits = ""
-        for ch in branch_name:
+        for ch in branch_name_for_digit_check:
             if ch.isdigit():
                 digits += ch
             elif digits:
@@ -158,10 +168,15 @@ def _resolve_header(connection, h: dict) -> dict:
     branch_id = -1
     if customer_id != -1 and branch_lookup_code:
         if is_numeric_branch:
+            # Numeric-value compare, not string-equality: the extracted digits keep
+            # any leading zeros from the source document ("0757"), but BC's own
+            # lookUpCode is often stored without them ("757") -- TRY_CAST treats both
+            # the same way an exact string match never would.
             branch_row = connection.execute(
                 text(
                     "SELECT TOP 1 customerBranchId FROM CustomerBranch "
-                    "WHERE customerId = :cid AND lookUpCode = :code AND lookUpCode <> ''"
+                    "WHERE customerId = :cid AND lookUpCode <> '' "
+                    "AND TRY_CAST(lookUpCode AS INT) = TRY_CAST(:code AS INT)"
                 ),
                 {"cid": customer_id, "code": branch_lookup_code},
             ).fetchone()
